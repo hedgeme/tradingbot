@@ -72,7 +72,44 @@ Main module & files:
 | `alert.py`                         | Telegram alerts: deposits, trades, errors, IP changes.                    |
 | `main.py`                          | Entrypoint: runs each bot loop.                                           |
 
+## 📦 Project Folder Structure
 
+```text
+tradingbot/
+├── config.py
+├── .env
+├── price_feed.py
+├── db.py
+├── cooldown_manager.py
+├── monitor.py
+├── alert.py
+├── trade_executor.py
+├── wallet.py
+├── strategy_1_eth_arbitrage.py
+├── strategy_2_wone_takeprofit.py
+├── strategy_3_usdc_buy_dips.py
+├── strategy_4_tec_pool_arbitrage.py
+├── main.py
+├── SwapRouter02_minimal.json
+├── requirements.txt
+├── BOT_ARCHITECTURE.md
+├── README.md
+└── verified_info.md
+
+🧰 Tools / Libraries to Prepare
+Python 3.9+
+
+web3 (for JSON-RPC & contracts)
+
+requests or aiohttp (for Coinbase API)
+
+sqlite3 or sqlalchemy
+
+python-dotenv (load .env)
+
+python-telegram-bot or simple webhook calls
+
+schedule / asyncio or similar (for loops & timing)
 
 
 Database design (one.db per bot)
@@ -107,12 +144,15 @@ Database design (one.db per bot)
 
 - Telegram alerts: deposits, trades, errors, IP change.
 
+
+
 | Service                                                            | Purpose                            |
 | ------------------------------------------------------------------ | ---------------------------------- |
 | Harmony RPC ([https://api.s0.t.hmny.io](https://api.s0.t.hmny.io)) | Node to send TXs, get gas price.   |
 | Coinbase API                                                       | Fetch ETH price.                   |
 | Telegram Bot API                                                   | Alerts & notifications.            |
 | Harmony `hmy` CLI                                                  | Wallets & TXs (if used on server). |
+
 
 | Task                                    | Purpose                                     | Priority |
 | --------------------------------------- | ------------------------------------------- | -------- |
