@@ -165,20 +165,66 @@ Database design (one.db per bot)
 | Trade executor                          | Use SwapRouter02 & apply gas/slippage logic | High     |
 | Error handling                          | Retry failed TXs; alert on error            | High     |
 
-📋 Next steps
-- Confirm language & framework.
 
-- Create folder structure & empty modules.
+Step 1
+| File / Module | Purpose                                                          | Needed Before | Dependencies    |
+| ------------- | ---------------------------------------------------------------- | ------------- | --------------- |
+| `.env`        | Store secrets: private key(s), RPC, Telegram token, Coinbase key | Everything    | `python-dotenv` |
+| `config.py`   | Load env vars; define constants (slippage, gas cap, RPC URLs)    | Everything    | `os`, `dotenv`  |
 
-- Add config & secrets.
 
-- Start with price feeds & DB logging.
+Step 2
+| File / Module | Purpose                                                          | Needed Before      | Dependencies                   |
+| ------------- | ---------------------------------------------------------------- | ------------------ | ------------------------------ |
+| `wallet.py`   | Load private key or use Harmony CLI; get balances; sign/send txs | trade\_executor.py | `web3`, `subprocess` (for CLI) |
 
-- Build & test each strategy independently.
+Step 3
+| File / Module   | Purpose                                                     | Needed Before        | Dependencies       |
+| --------------- | ----------------------------------------------------------- | -------------------- | ------------------ |
+| `price_feed.py` | Read on-chain prices (via Web3) & Coinbase price (via REST) | strategy\_1, 2, 3, 4 | `web3`, `requests` |
 
-- Add monitors & alerts.
+Step 4
+| File / Module       | Purpose                                        | Needed Before         | Dependencies |
+| ------------------- | ---------------------------------------------- | --------------------- | ------------ |
+| `trade_executor.py` | Build & send swap txs; apply slippage, gas cap | After wallet & config | `web3`       |
 
-- Final end-to-end test.
+Step 5
+| File / Module                      | Purpose                                          | Needed Before                   | Dependencies |
+| ---------------------------------- | ------------------------------------------------ | ------------------------------- | ------------ |
+| `strategy_1_eth_arbitrage.py`      | Compare Harmony vs Coinbase ETH; buy             | trade\_executor.py, price\_feed | `web3`       |
+| `strategy_2_wone_takeprofit.py`    | Sell wONE after price rise; reinvest on dip      | trade\_executor.py, price\_feed |              |
+| `strategy_3_usdc_buy_dips.py`      | Buy ETH/TEC on dips after USDC deposit; reinvest | trade\_executor.py, price\_feed |              |
+| `strategy_4_tec_pool_arbitrage.py` | Arbitrage TEC price between pools                | trade\_executor.py, price\_feed |              |
+
+Step 6
+| File / Module         | Purpose                                                 | Needed Before | Dependencies |
+| --------------------- | ------------------------------------------------------- | ------------- | ------------ |
+| `cooldown_manager.py` | Track cooldowns per bot; in-memory or lightweight store | strategies    |              |
+
+Step 7
+| File / Module | Purpose                                       | Needed Before                | Dependencies       |
+| ------------- | --------------------------------------------- | ---------------------------- | ------------------ |
+| `db.py`       | SQLite logging: deposits, trades, profit/loss | strategies & trade\_executor | `sqlite3`          |
+| `monitor.py`  | Node health, IP monitor, withdraw detection   | optional but recommended     | `requests`, `web3` |
+
+Step 8
+| File / Module | Purpose                                          | Needed Before | Dependencies                        |
+| ------------- | ------------------------------------------------ | ------------- | ----------------------------------- |
+| `alert.py`    | Send Telegram alerts: trades, errors, IP changes | strategies    | `requests` or `python-telegram-bot` |
+
+Step 9
+| File / Module | Purpose                                         | Needed Before     | Dependencies            |
+| ------------- | ----------------------------------------------- | ----------------- | ----------------------- |
+| `main.py`     | Orchestrate loops, run strategies, catch errors | after all modules | `schedule` or `asyncio` |
+
+Dependences:
+python-dotenv
+web3
+requests
+sqlite3  # built-in with Python
+schedule  # or use asyncio / APScheduler
+python-telegram-bot
+
 
 
 
