@@ -22,6 +22,7 @@ It acts as the main project management document to coordinate development effort
 - Telegram alert design for trades, errors, IP changes, idle states
 - SwapRouter02 ABI (minimal) verified for use
 - Node & backup RPC endpoints set and verified
+- Key & Wallet Management     | Secure storage for private keys & tx signing                            
 
 ---
 
@@ -39,7 +40,6 @@ It acts as the main project management document to coordinate development effort
 | **Gas Price Management**         | Dynamic gas read with cap at 150 gwei; halt trades if above                                   | High     |
 | **Database Integration**         | SQLite DB per bot; record deposits, trades, profits                                           | High     |
 | **Reporting Dashboard**          | CLI or web dashboard to view SQLite data                                                      | Medium   |
-| **Key & Wallet Management**      | Secure storage for private keys & tx signing                                                  | High     |
 | **Telegram Alerts Integration** | For trades, errors, withdrawals, IP change, idle                                              | High     |
 | **Withdrawal Detection Logic**   | Pause trading on manual withdrawal; resume on new deposits if above min balance               | Medium   |
 | **Bot Deployment Plan**          | Setup live deployment (systemd, Docker, etc.)                                                 | Medium   |
