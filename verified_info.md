@@ -80,18 +80,6 @@ The full ABI exists separately if needed (not used by bot directly).
 | Database             | One SQLite `.db` per bot strategy; keeps detailed trade logs |
 
 ---
-## 🌐 BOT Wallet information
-> - tecbot_eth:        one1dlmu8azm5ujhzh828ufgm75mvmrsum7qp7d8w8 
-> - tecbot_sdai:      one1z5tgar3skdwmvk8puf2p0w9nav4utaf94jfhjs  
-> - tecbot_tec:        one1n60pjk3y2c4wrlcezhtsxyxj2hpuymufgqjnd3 
-> - tecbot_usdc:    one1shsrvmepp2pllgjsxxaqqf4kgrvgazpu6lg9ww 
-
- 
-
-
-
-
-
 
 
 ✅ **This file keeps track of all verified contracts, addresses, pools, ABIs, and bot settings**  
