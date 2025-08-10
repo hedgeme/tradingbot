@@ -13,7 +13,7 @@ mkdir -p /home/tecviva/.secrets
 chmod 700 /home/tecviva/.secrets
 
 Create Key
-echo "desirefirequeenrise" | gpg --armor --encrypt --recipient tecy > /home/tecviva/.secrets/tecbot_sdai.pass.gpg
+echo "XXXXX" | gpg --armor --encrypt --recipient tecy > /home/tecviva/.secrets/tecbot_sdai.pass.gpg
 chmod 600 /home/tecviva/.secrets/tecbot_sdai.pass.gpg
 
 ___________________
