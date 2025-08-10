@@ -22,7 +22,8 @@ It acts as the main project management document to coordinate development effort
 - Telegram alert design for trades, errors, IP changes, idle states
 - SwapRouter02 ABI (minimal) verified for use
 - Node & backup RPC endpoints set and verified
-- Key & Wallet Management     | Secure storage for private keys & tx signing                            
+- Key & Wallet Management     | Secure storage for private keys & tx signing
+- Updated GitHub Repo to Private     | ChatGPT has connector access | Completed 8/10/2025                       
 
 ---
 
@@ -43,6 +44,7 @@ It acts as the main project management document to coordinate development effort
 | **Telegram Alerts Integration** | For trades, errors, withdrawals, IP change, idle                                              | High     |
 | **Withdrawal Detection Logic**   | Pause trading on manual withdrawal; resume on new deposits if above min balance               | Medium   |
 | **Bot Deployment Plan**          | Setup live deployment (systemd, Docker, etc.)                                                 | Medium   |
+
 
 ---
 
