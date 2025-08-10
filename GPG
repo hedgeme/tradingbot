@@ -1,0 +1,32 @@
+*Create GPG keypair:
+
+gpg --full-generate-key
+  - select:  (1) RSA and RSA
+  - What keysize do you want? : 4096
+  - 0 = key does not expire
+
+
+_________________
+Steps to implementing GPG- create file
+
+mkdir -p /home/tecviva/.secrets
+chmod 700 /home/tecviva/.secrets
+
+Create Key
+echo "desirefirequeenrise" | gpg --armor --encrypt --recipient tecy > /home/tecviva/.secrets/tecbot_sdai.pass.gpg
+chmod 600 /home/tecviva/.secrets/tecbot_sdai.pass.gpg
+
+___________________
+Update Cache, so login info does not reset:
+
+Cache limits to the GPG Password: 1 year
+nano ~/.gnupg/gpg-agent.conf
+
+default-cache-ttl 31536000
+max-cache-ttl 31536000
+
+
+Restart:
+
+gpgconf --kill gpg-agent
+gpgconf --launch gpg-agent
