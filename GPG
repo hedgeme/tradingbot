@@ -7,7 +7,7 @@ gpg --full-generate-key
 
 
 _________________
-Steps to implementing GPG- create file
+*Steps to implementing GPG- create file
 
 mkdir -p /home/tecviva/.secrets
 chmod 700 /home/tecviva/.secrets
@@ -17,7 +17,7 @@ echo "desirefirequeenrise" | gpg --armor --encrypt --recipient tecy > /home/tecv
 chmod 600 /home/tecviva/.secrets/tecbot_sdai.pass.gpg
 
 ___________________
-Update Cache, so login info does not reset:
+*Update Cache, so login info does not reset:
 
 Cache limits to the GPG Password: 1 year
 nano ~/.gnupg/gpg-agent.conf
@@ -30,3 +30,18 @@ Restart:
 
 gpgconf --kill gpg-agent
 gpgconf --launch gpg-agent
+
+
+_________________________
+*Check to see if GPG is unlocked:
+gpg --quiet --batch --decrypt /home/tecviva/.secrets/tecbot_eth.pass.gpg > /dev/null
+
+*If no prompt and exit code = 0 → unlocked.
+*If prompt for passphrase → locked.
+
+*Created script for easier view:
+echo 'export GPG_TTY=$(tty)' >> ~/.bashrc
+echo "alias gpgcheck='gpg --quiet --batch --decrypt /home/tecviva/.secrets/tecbot_eth.pass.gpg > /dev/null && echo \"✅ GPG unlocked\" || echo \"🔒 GPG locked\"'" >> ~/.bashrc
+
+*Use this command:
+gpgcheck
