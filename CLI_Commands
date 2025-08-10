@@ -1,0 +1,4 @@
+hmy keys add (name) --passphrase
+hmy keys export-private-key (name) --passphrase
+hmy keys list
+hmy keys remove "name"
