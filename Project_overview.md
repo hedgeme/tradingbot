@@ -162,7 +162,14 @@ cooldown_manager per bot
 
 Data model notes: explicit fields for total trade cost, realized profit, and external transfers (external_wallet, hash, amount, reason).
 
-📋 Pending Development Tasks (next up)
+
+
+
+
+
+
+
+**📋 Pending Development Tasks (next up)**
 High Priority
 Finish Telegram alerts (alert.py) using .env (TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
 
