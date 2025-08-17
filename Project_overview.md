@@ -27,27 +27,6 @@ It acts as the main project management document to coordinate development effort
 
 ---
 
-## ⚙️ Pending Development Tasks
-
-| Task                             | Description                                                                                   | Priority |
-|---------------------------------|-----------------------------------------------------------------------------------------------|----------|
-| **Bot Architecture Draft**       | Document and finalize modular architecture, flow, components                                   | High     |
-| **Trade Execution Logic**        | Implement swaps via SwapRouter02 ABI, multi-hop support                                       | High     |
-| **Price Feeds Integration**      | On-chain price reading + Coinbase ETH price API for comparison                                | High     |
-| **Cooldown Management**          | Implement cooldown timers to prevent rapid retriggers                                         | Medium   |
-| **Error Handling & Retry Logic** | Robust handling for RPC/tx failures; up to 5 retries + Telegram alerts                        | High     |
-| **Node Health Monitor**          | Monitor RPC health; alert on errors, retry if node fails                                      | High     |
-| **IP Change Monitor**            | Hourly IP check, alert if changed                                                              | Medium   |
-| **Gas Price Management**         | Dynamic gas read with cap at 150 gwei; halt trades if above                                   | High     |
-| **Database Integration**         | SQLite DB per bot; record deposits, trades, profits                                           | High     |
-| **Reporting Dashboard**          | CLI or web dashboard to view SQLite data                                                      | Medium   |
-| **Telegram Alerts Integration** | For trades, errors, withdrawals, IP change, idle                                              | High     |
-| **Withdrawal Detection Logic**   | Pause trading on manual withdrawal; resume on new deposits if above min balance               | Medium   |
-| **Bot Deployment Plan**          | Setup live deployment (systemd, Docker, etc.)                                                 | Medium   |
-
-
----
-
 ## 🏗️ Bot Architecture Overview (Draft)
 
 All four bots run separately but share common infrastructure:
@@ -99,6 +78,194 @@ All four bots run separately but share common infrastructure:
 - [`verified_info.md`](https://github.com/hedgeme/tradingbot/blob/main/verified_info.md)
 
 *Last updated: 2025-07-31*
+
+Project Manager Overview — Harmony Trading Bot Suite (Status: 2025-08-17)
+Repo: hedgeme/tradingbot
+Chain: Harmony ONE (Chain ID 1666600000)
+Primary RPC: https://api.s0.t.hmny.io (backup: https://api.harmony.one)
+Router (Sushi/UniswapV2-compatible): 0x85495f44768ccbb584d9380Cc29149fDAA445F69
+
+✅ Completed / Verified
+Infrastructure & Security
+Server: Lenovo ThinkCentre M920 • Ubuntu • 32GB RAM • 1TB NVMe
+Partitions: / (~100GB), /bot (~50GB), /monero (~800GB reserved)
+
+Firewall / SSH: UFW configured, SSH on non-default port; key-only login.
+
+Harmony CLI: hmy installed at /usr/local/bin/hmy.
+
+Wallets (CLI Keystore): 4 encrypted wallets created and tested
+
+tecbot_eth → one1gntquz9lvm9mh3aedgx7dsqsshkzarg83mjxph
+
+tecbot_sdai → one1z5tgar3skdwmvk8puf2p0w9nav4utaf94jfhjs
+
+tecbot_tec → one1n60pjk3y2c4wrlcezhtsxyxj2hpuymufgqjnd3
+
+tecbot_usdc → one1shsrvmepp2pllgjsxxaqqf4kgrvgazpu6lg9ww
+
+Key protection: Each wallet passphrase stored as GPG-encrypted file in /home/tecviva/.secrets/
+(*.pass.gpg, chmod 600).
+
+GPG agent: Long-TTL configured (1 year) for non-interactive runtime; helpers added to .bashrc:
+
+export GPG_TTY=$(tty)
+
+gpgunlock function to unlock all bot wallets on login.
+
+Runtime dirs: /bot/logs and /bot/db created (chmod 700), owned by tecviva.
+
+Code & Config
+.env (server-only, not in git) created at /home/tecviva/.env with:
+RPC/chain params, wallet names + ONE addresses, paths, gas cap, Telegram token + chat ID.
+
+wallet.py (added):
+
+Loads .env and validates runtime directories.
+
+Preflight GPG: clean exit with instructions if GPG locked.
+
+Passphrase decrypt with gpg --decrypt (uses gpg-agent, keeps secret in memory briefly).
+
+ETH→ONE conversion (hmy utility bech32) for any CLI transfer target.
+
+Native ONE transfer via hmy transfer with shard/chain/node flags.
+
+Minimal, masked logging; per-wallet locking to avoid races.
+
+Verified on-chain addresses (ETH-format) present in repo (tokens/pools/router) for EVM/web3 use.
+
+Operational Tests
+.env loading verified with python-dotenv (installed via apt).
+
+wallet.py preflight passes:
+
+csharp
+Copy
+[wallet] Preflight OK. Ready.
+🧭 Scope & Architecture (recap)
+Bots (4 processes/strategies): Arbitrage, dip-buy, reinvest variants for 1ETH, TEC, 1USDC, 1sDAI; each with isolated wallet & SQLite DB.
+
+Shared components:
+
+price_feed.py (Coinbase ETH; add Harmony DEX/aggregator fallback)
+
+trade_executor.py (web3 + router ABI; slippage, gas cap, retries)
+
+db.py (SQLite: trades, deposits, withdrawals, PnL, external transfers)
+
+monitor.py (node health, public IP change, withdrawal detection -> pause)
+
+alert.py (Telegram)
+
+cooldown_manager per bot
+
+Data model notes: explicit fields for total trade cost, realized profit, and external transfers (external_wallet, hash, amount, reason).
+
+📋 Pending Development Tasks (next up)
+High Priority
+Finish Telegram alerts (alert.py) using .env (TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
+
+Send on: preflight failure, trade success/fail, withdrawal detection, low balance.
+
+trade_executor.py
+
+Load router ABI (SwapRouter02_minimal.json).
+
+Swap functions (amountOutMin protection, slippage), gas cap (≤ 150 gwei), nonce handling.
+
+Structured receipts; retry/backoff on transient RPC errors.
+
+price_feed.py
+
+Coinbase ETH baseline + Harmony DEX price (WONE pairs) for cross-check.
+
+Optional TWAP per pool.
+
+db.py
+
+Finalize schema, migrations, and write helpers (log_trade, log_deposit, log_withdrawal, log_external_transfer).
+
+monitor.py
+
+RPC heartbeat, IP change check (hourly), withdraw detection (if any outgoing tx not initiated by bot → set trading pause flag).
+
+Medium Priority
+Strategy modules (4 files) wired to trade_executor.py, price_feed.py, db.py.
+
+Cooldown manager policy and persistence.
+
+Systemd services for each bot with autorestart + journal rotation.
+
+Basic CLI tooling (send dust, check balances, toggle pause).
+
+Prometheus-style metrics or lightweight dashboard later.
+
+🔧 Deployment / Ops Checklist
+Server one-time setup (done): hmy, GPG, .env, /bot/logs, /bot/db.
+
+Per-update deployment:
+
+Pull/rsync repo changes to server (or copy files listed below).
+
+Ensure .env on server is correct (never commit to git).
+
+Unlock GPG once per long run:
+
+nginx
+Copy
+gpgunlock
+Preflight:
+
+bash
+Copy
+python3 /bot/wallet.py
+Start bots (systemd or screen/tmux).
+
+📦 Files that must be on the server (runtime)
+Copy or git pull these into your working dir (e.g., /bot/src or keep in repo path).
+Bold = already mentioned / essential now.
+
+wallet.py (you added)
+
+SwapRouter02_minimal.json (router ABI)
+
+verified_info.md (addresses used by code—ETH format)
+
+trade_executor.py (calls router; builds/sends swaps via web3/hmy)
+
+price_feed.py (Coinbase + DEX fallback)
+
+db.py (SQLite helpers + migrations)
+
+monitor.py (RPC/IP/withdraw detection)
+
+alert.py (Telegram alerts)
+
+Strategy files (4): e.g., strategy_eth.py, strategy_sdai.py, strategy_tec.py, strategy_usdc.py
+
+config.py (shared constants; gas cap, slippage defaults, cooldown settings)
+
+README.md (optional but helpful)
+
+Server-only (never in git):
+
+/home/tecviva/.env
+
+/home/tecviva/.secrets/*.pass.gpg (4 wallet passphrase files)
+
+If you prefer a “single app folder” layout, use /bot/app/ and place all code there, keeping /bot/db and /bot/logs separate.
+
+Optional but recommended
+requirements.txt (pin versions: web3, requests, python-dotenv, etc.)
+
+start_bot.sh / stop_bot.sh helper scripts
+
+systemd unit files (one per strategy), e.g., /etc/systemd/system/tecbot-eth.service
+
+logging.conf (if using Python logging config)
+
+Healthcheck script (returns non-zero if preflight fails → systemd restart)
 
 ---
 
