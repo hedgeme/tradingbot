@@ -2,6 +2,9 @@
 
 ## 📦 Assets used by the Harmony trading bot
 
+This document lists verified contracts used by TECBot on Harmony (Shard 0).  
+Keep this file updated when adding or upgrading contracts.
+
 | Asset        | Symbol | Contract Address                                      |
 | ------------ | ------ | ---------------------------------------------------- |
 | Wrapped ONE  | WONE   | `0xcF664087a5bB0237a0BAd6742852ec6c8d69A27a`         |
@@ -27,12 +30,15 @@
 ## 🛠️ Verified Core & Periphery Contracts
 
 These are **official Uniswap V3 contracts**, deployed on Harmony:
-| Contract                        | Address                                                                                                     | Explorer Link |
-| ------------------------------- | ----------------------------------------------------------------------------------------------------------- | ------------- |
-| FactoryV3                       | `0x12d21f5d0Ab768c312E19653Bf3f89917866B8e8`                                                                | [View](https://explorer.harmony.one/address/0x12d21f5d0Ab768c312E19653Bf3f89917866B8e8) |
-| TickLens                        | `0x2D7B3ae07fE5E1d9da7c2C79F953339D0450a017`                                                                | [View](https://explorer.harmony.one/address/0x2d7b3ae07fe5e1d9da7c2c79f953339d0450a017) |
-| NonfungiblePositionManager      | `0xE4E259BE9c84260FDC7C9a3629A0410b1Fb3C114`                                                                | [View](https://explorer.harmony.one/address/0xE4E259BE9c84260FDC7C9a3629A0410b1Fb3C114) |
-| SwapRouter02 (used by the bot)  | `0x85495f44768ccbb584d9380Cc29149fDAA445F69`                                                                | [View](https://explorer.harmony.one/address/0x85495f44768ccbb584d9380Cc29149fDAA445F69) |
+
+| Contract | Address | Notes |
+|----------|---------|-------|
+| Factory V3 | `0x12d21f5d0Ab768c312E19653Bf3f89917866B8e8` | Pool factory |
+| SwapRouter02 | `0x85495f44768ccbb584d9380Cc29149fDAA445F69` | Primary router |
+| TickLens | `0x2D7B3ae07fE5E1d9da7c2C79F953339D0450a017` | Tick data helper |
+| NonfungiblePositionManager | `0xE4E259BE9c84260FDC7C9a3629A0410b1Fb3C114` | LP NFT positions |
+| **QuoterV2** | `0x314456E8F5efaa3dD1F036eD5900508da8A3B382` | Used for on-chain quoting |
+
 
 **Official contract repositories** (for verification & upgrades):
 - [Uniswap v3-core](https://github.com/Uniswap/v3-core)
@@ -40,6 +46,13 @@ These are **official Uniswap V3 contracts**, deployed on Harmony:
 - [Uniswap swap-router-contracts](https://github.com/Uniswap/swap-router-contracts)
 
 Contracts were deployed **without modification** to official Uniswap code.
+
+## Notes
+
+- All addresses are checksummed (`Web3.toChecksumAddress`).
+- TECBot uses **QuoterV2** for quoting V3 swaps (single and multi-hop).
+- Keep this file in sync with deployed contracts — mismatches here will cause failed trades.
+- When adding a new token, ensure decimals are verified on-chain and update fallback mapping in `/bot/app/trade_executor.py`.
 
 ---
 
