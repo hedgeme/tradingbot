@@ -20,7 +20,18 @@ import subprocess
 from typing import Dict, Any, Iterable, Tuple, List
 
 from web3 import Web3
-from web3.middleware import geth_poa_middleware
+
+# web3.py v5 vs v6 PoA middleware compatibility
+try:
+    # v6 alias
+    from web3.middleware import ExtraDataToPOAMiddleware as _POA_MIDDLEWARE
+except Exception:
+    try:
+        # v5 name
+        from web3.middleware import geth_poa_middleware as _POA_MIDDLEWARE
+    except Exception:
+        _POA_MIDDLEWARE = None
+
 from decimal import Decimal
 
 # Telegram
@@ -70,14 +81,17 @@ ERC20_MIN_ABI = [
 def _get_w3() -> Web3:
     """Use wallet.get_w3() if available; otherwise build one from config.RPC_URL."""
     if hasattr(wallet, "get_w3"):
-        return wallet.get_w3()
-    rpc = getattr(config, "RPC_URL", "https://api.harmony.one")
-    w3 = Web3(Web3.HTTPProvider(rpc))
-    # Harmony uses Clique; adding POA middleware can't hurt if using S0
-    try:
-        w3.middleware_onion.inject(geth_poa_middleware, layer=0)
-    except Exception:
-        pass
+        w3 = wallet.get_w3()
+    else:
+        rpc = getattr(config, "RPC_URL", "https://api.harmony.one")
+        w3 = Web3(Web3.HTTPProvider(rpc))
+
+    # Inject PoA middleware if available (safe on Harmony)
+    if _POA_MIDDLEWARE:
+        try:
+            w3.middleware_onion.inject(_POA_MIDDLEWARE, layer=0)
+        except Exception:
+            pass
     return w3
 
 def _checksum(w3: Web3, addr: str) -> str:
@@ -109,11 +123,10 @@ def _iter_wallet_groups_from_config(cfg) -> Iterable[Tuple[str, str, List[str]]]
             addr = val
             disp = defaults.get(name, ["ONE"])
         elif isinstance(val, dict):
-            addr = val.get("address") or ""
+            addr = (val.get("address") or "").strip()
             disp = val.get("display") or defaults.get(name, ["ONE"])
         else:
             continue
-        addr = (addr or "").strip()
         if addr:
             yield name, addr, disp
 
@@ -136,7 +149,6 @@ async def _reply(update: Update, text: str):
         await update.message.reply_text(text)
 
 def _get_token_address(symbol: str) -> str | None:
-    # prefer config.TOKENS map
     tokens = getattr(config, "TOKENS", {})
     return tokens.get(symbol)
 
@@ -180,7 +192,7 @@ async def cmd_balances(update: Update, context: ContextTypes.DEFAULT_TYPE):
             lines.append(f"{name}")
             # ONE balance always included
             one_bal = _get_one_balance(w3, cs_addr)
-            lines.append(f"  ONE  {_fmt_qty(one_bal, 4)}")
+            lines.append(f"  ONE   {_fmt_qty(one_bal, 4)}")
 
             for sym in display:
                 if sym == "ONE":
@@ -224,7 +236,7 @@ async def cmd_prices(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append("ETH: Harmony LP vs Coinbase")
         lines.append(f"  LP:       {_fmt_usd(lp)}")
         lines.append(f"  Coinbase: {_fmt_usd(cb)}")
-        lines.append(f"  Diff:     {('%.2f' % df) + '%' if df == df else '—'}")  # df==df to catch NaN
+        lines.append(f"  Diff:     {('%.2f' % df) + '%' if df == df else '—'}")  # NaN-safe
 
         if err:
             lines.append("")
