@@ -1,48 +1,90 @@
 # /bot/app/preflight.py
-# Provides run_sanity() used by /sanity command
+# Self-contained sanity checker for TECBot.
+# Uses low-level wallet helpers (no dependency on a missing get_all_wallet_balances()).
 
 from decimal import Decimal
-from typing import Dict, Any
+from typing import Dict, Any, Optional
+import os
 
-# ----- IMPORT YOUR BALANCES HELPER FROM wallet.py -----
-# Try common names; change ONE LINE below if your function is named differently.
+# ---- Import low-level helpers that EXIST in wallet.py
+from app.wallet import (
+    get_w3,
+    get_native_balance_wei,
+    get_erc20_balance_wei,
+)
+
+# ---- Try to get addresses from config.py (preferred), else fall back to env
+WALLETS: Dict[str, Optional[str]] = {}
+ERC20_ADDR: Dict[str, Optional[str]] = {}
+
 try:
-    # Preferred name in this project
-    from app.wallet import get_all_wallet_balances as _get_balances
+    # If your config exposes these, great:
+    # - WALLETS like {"tecbot_eth": "0x...", "tecbot_usdc": "0x...", ...}
+    # - TOKENS  like {"USDC": "0x...", "TEC": "0x...", "sDAI": "0x..."}
+    from app.config import WALLETS as CFG_WALLETS  # type: ignore
+    from app.config import TOKENS as CFG_TOKENS    # type: ignore
+    if isinstance(CFG_WALLETS, dict):
+        WALLETS.update(CFG_WALLETS)
+    if isinstance(CFG_TOKENS, dict):
+        ERC20_ADDR.update(CFG_TOKENS)
 except Exception:
-    # Fallbacks (uncomment the one that exists in your wallet.py)
-    # from app.wallet import get_balances as _get_balances
-    # from app.wallet import balances as _get_balances
-    _get_balances = None
+    # config.py might not expose those dicts; we’ll fall back to env
+    pass
 
-# ----- THRESHOLDS (edit if your policy differs)
-THRESHOLDS = {
-    "tecbot_eth": {"ONE": Decimal("200")},
+# Fallback to env var names if config not set
+WALLETS.setdefault("tecbot_eth", os.environ.get("WALLET_TECBOT_ETH"))
+WALLETS.setdefault("tecbot_usdc", os.environ.get("WALLET_TECBOT_USDC"))
+WALLETS.setdefault("tecbot_sdai", os.environ.get("WALLET_TECBOT_SDAI"))
+WALLETS.setdefault("tecbot_tec",  os.environ.get("WALLET_TECBOT_TEC"))
+
+# Token contract addresses (Harmony mainnet or your network)
+ERC20_ADDR.setdefault("USDC", os.environ.get("TOKEN_USDC"))
+ERC20_ADDR.setdefault("TEC",  os.environ.get("TOKEN_TEC"))
+ERC20_ADDR.setdefault("sDAI", os.environ.get("TOKEN_SDAI"))
+
+# ---- Threshold policy (tune as you like)
+THRESHOLDS: Dict[str, Dict[str, Decimal]] = {
+    "tecbot_eth": {"ONE": Decimal("200")},   # native ONE on Harmony
     "tecbot_usdc": {"ONE": Decimal("200")},
-    "tecbot_sdai": {"USDC": Decimal("5")},  # If your symbol is "1USDC", see ALIASES below
+    "tecbot_sdai": {"USDC": Decimal("5")},
     "tecbot_tec": {"TEC": Decimal("10")},
 }
 
-# If your /balances uses aliases like "1USDC" or "1sDAI", normalize them here:
-ALIASES = {
-    "1USDC": "USDC",
-    "1sDAI": "sDAI",
-    "ONE": "ONE",
-    "TEC": "TEC",
-    "USDC": "USDC",
-    "sDAI": "sDAI",
+ONE_DECIMALS = Decimal(10) ** 18  # Harmony ONE uses 18 decimals
+ERC20_DECIMALS = {
+    # If you want exact on-chain decimals, you can add a call; for sanity we hardcode common ones:
+    "USDC": Decimal(10) ** 6,
+    "TEC":  Decimal(10) ** 18,
+    "sDAI": Decimal(10) ** 18,
 }
 
-def _norm_symbol(sym: str) -> str:
-    return ALIASES.get(str(sym).strip(), str(sym).strip())
-
-def _to_decimal(x) -> Decimal:
+def _d(x) -> Decimal:
     if isinstance(x, Decimal):
         return x
     try:
         return Decimal(str(x))
     except Exception:
-        return Decimal("0")
+        return Decimal(0)
+
+def _fmt(x: Decimal) -> str:
+    try:
+        return f"{x.normalize()}"
+    except Exception:
+        return str(x)
+
+def _need_addr(kind: str, val: Optional[str]) -> str:
+    if not val:
+        raise RuntimeError(f"Missing address for {kind}. Provide it via app.config or env.")
+    return val
+
+def _get_one_balance(addr: str) -> Decimal:
+    wei = get_native_balance_wei(addr)
+    return _d(wei) / ONE_DECIMALS
+
+def _get_erc20_balance(token_addr: str, wallet_addr: str, symbol: str) -> Decimal:
+    raw = get_erc20_balance_wei(token_addr, wallet_addr)
+    decs = ERC20_DECIMALS.get(symbol, Decimal(10) ** 18)
+    return _d(raw) / decs
 
 def run_sanity() -> Dict[str, Any]:
     """
@@ -50,53 +92,51 @@ def run_sanity() -> Dict[str, Any]:
       {
         "ok": bool,
         "items": [
-          {"wallet":"tecbot_eth",
-           "checks":[{"asset":"ONE","have":"250","need":"200","ok":True}],
-           "status":"ok"},
+          {
+            "wallet": "tecbot_eth",
+            "checks": [{"asset":"ONE","have":"250","need":"200","ok":True}],
+            "status": "ok"
+          },
           ...
         ]
       }
     """
-    if _get_balances is None:
-        raise RuntimeError("wallet balances helper not found. Point preflight.py to your wallet function.")
+    # Ensure web3 is constructed (and RPC reachable). Raises if RPC is down.
+    _ = get_w3()
 
-    # Expect: {wallet: {SYMBOL: amount, ...}, ...}
-    balances = _get_balances()
     items = []
     overall_ok = True
 
-    # Normalize symbols in balances (handle 1USDC -> USDC, etc.)
-    norm_balances: Dict[str, Dict[str, Decimal]] = {}
-    for wallet, assets in (balances or {}).items():
-        norm_balances[wallet] = {}
-        for sym, amt in (assets or {}).items():
-            norm_sym = _norm_symbol(sym)
-            norm_balances[wallet][norm_sym] = _to_decimal(amt)
-
-    for wallet, reqs in THRESHOLDS.items():
-        checks = []
+    for wallet_name, reqs in THRESHOLDS.items():
+        wallet_addr = _need_addr(wallet_name, WALLETS.get(wallet_name))
         this_ok = True
-        wallet_bal = norm_balances.get(wallet, {})
+        checks = []
 
         for asset, need in reqs.items():
-            need_dec = _to_decimal(need)
-            have_dec = _to_decimal(wallet_bal.get(asset, 0))
-            ok = have_dec >= need_dec
+            need_d = _d(need)
+
+            if asset == "ONE":
+                have_d = _get_one_balance(wallet_addr)
+            else:
+                token_addr = _need_addr(asset, ERC20_ADDR.get(asset))
+                have_d = _get_erc20_balance(token_addr, wallet_addr, asset)
+
+            ok = have_d >= need_d
             if not ok:
                 this_ok = False
                 overall_ok = False
+
             checks.append({
                 "asset": asset,
-                "have": f"{have_dec.normalize()}",
-                "need": f"{need_dec.normalize()}",
-                "ok": ok
+                "have": _fmt(have_d),
+                "need": _fmt(need_d),
+                "ok": ok,
             })
 
         items.append({
-            "wallet": wallet,
+            "wallet": wallet_name,
             "checks": checks,
-            "status": "ok" if this_ok else "low"
+            "status": "ok" if this_ok else "low",
         })
 
     return {"ok": overall_ok, "items": items}
-
