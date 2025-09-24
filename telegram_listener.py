@@ -1,7 +1,7 @@
 # telegram_listener.py
 # -*- coding: utf-8 -*-
 """
-TECBot Telegram Listener
+TECBot Telegram Listener (python-telegram-bot v13-compatible)
 
 Commands:
   /start, /help, /ping
@@ -14,11 +14,11 @@ Commands:
 from __future__ import annotations
 import os
 import logging
-import asyncio
 import math
 import subprocess
 from typing import Dict, Any, Iterable, Tuple, List
 
+from decimal import Decimal
 from web3 import Web3
 
 # web3.py v5 vs v6 PoA middleware compatibility
@@ -32,11 +32,9 @@ except Exception:
     except Exception:
         _POA_MIDDLEWARE = None
 
-from decimal import Decimal
-
-# Telegram
+# Telegram (pre-v20)
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import Updater, CommandHandler, CallbackContext
 
 # ------- local imports (support both flat and app.* package styles) ----------
 def _imp(modname: str):
@@ -144,9 +142,9 @@ def _fmt_qty(v: Decimal | float | int | None, decimals: int = 4) -> str:
         return f"{v:.{decimals}f}"
     return f"{float(v):.{decimals}f}"
 
-async def _reply(update: Update, text: str):
+def _reply(update: Update, text: str):
     if update and update.message:
-        await update.message.reply_text(text)
+        update.message.reply_text(text)
 
 def _get_token_address(symbol: str) -> str | None:
     tokens = getattr(config, "TOKENS", {})
@@ -165,22 +163,22 @@ def _get_erc20_balance(w3: Web3, token_addr: str, holder: str, decimals: int) ->
     bal = c.functions.balanceOf(_checksum(w3, holder)).call()
     return Decimal(bal) / Decimal(10**decimals)
 
-# ---------------------------- command handlers --------------------------------
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await _reply(update, "TECBot online. Try /balances, /prices, /sanity, /version")
+# ---------------------------- command handlers (sync) -------------------------
+def cmd_start(update: Update, context: CallbackContext):
+    _reply(update, "TECBot online. Try /balances, /prices, /sanity, /version")
 
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await _reply(update, "/start /help /ping /balances /prices /sanity /version")
+def cmd_help(update: Update, context: CallbackContext):
+    _reply(update, "/start /help /ping /balances /prices /sanity /version")
 
-async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await _reply(update, "pong")
+def cmd_ping(update: Update, context: CallbackContext):
+    _reply(update, "pong")
 
-async def cmd_balances(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def cmd_balances(update: Update, context: CallbackContext):
     try:
         w3 = _get_w3()
         groups = list(_iter_wallet_groups_from_config(config))
         if not groups:
-            await _reply(update, "No wallet groups configured.")
+            _reply(update, "No wallet groups configured.")
             return
 
         # Symbol -> token address
@@ -206,13 +204,13 @@ async def cmd_balances(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             lines.append("")  # spacer
 
-        await _reply(update, "\n".join(lines).rstrip())
+        _reply(update, "\n".join(lines).rstrip())
 
     except Exception as e:
         log.exception("/balances error")
-        await _reply(update, f"/balances error: {e}")
+        _reply(update, f"/balances error: {e}")
 
-async def cmd_prices(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def cmd_prices(update: Update, context: CallbackContext):
     try:
         if not price_feed or not hasattr(price_feed, "get_prices"):
             raise RuntimeError("price_feed.get_prices() not available (ensure Quoter-backed get_prices exists).")
@@ -244,13 +242,13 @@ async def cmd_prices(update: Update, context: ContextTypes.DEFAULT_TYPE):
             for m in err:
                 lines.append(f"  - {m}")
 
-        await _reply(update, "\n".join(lines))
+        _reply(update, "\n".join(lines))
 
     except Exception as e:
         log.exception("/prices error")
-        await _reply(update, f"/prices error: {e}")
+        _reply(update, f"/prices error: {e}")
 
-async def cmd_sanity(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def cmd_sanity(update: Update, context: CallbackContext):
     try:
         if not preflight or not hasattr(preflight, "run_sanity"):
             raise RuntimeError("preflight.run_sanity() not available")
@@ -261,10 +259,10 @@ async def cmd_sanity(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg = f"Sanity: {'OK' if ok else 'FAILED'}\n{summary}"
         if details:
             msg += "\n\nDetails:\n" + "\n".join(f"- {d}" for d in details)
-        await _reply(update, msg)
+        _reply(update, msg)
     except Exception as e:
         log.exception("/sanity error")
-        await _reply(update, f"/sanity error: {e}")
+        _reply(update, f"/sanity error: {e}")
 
 def _git(cmd: list[str]) -> str:
     try:
@@ -273,14 +271,14 @@ def _git(cmd: list[str]) -> str:
         out = ""
     return out
 
-async def cmd_version(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def cmd_version(update: Update, context: CallbackContext):
     # Show tag (if any), short hash, dirty marker
     tag = _git(["git", "describe", "--tags", "--abbrev=0"])
     rev = _git(["git", "rev-parse", "--short", "HEAD"])
     dirty = _git(["git", "status", "--porcelain"])
     marker = "" if not dirty else " (dirty)"
     text = f"Version: {tag or 'no-tag'} @ {rev or 'unknown'}{marker}"
-    await _reply(update, text)
+    _reply(update, text)
 
 # ---------------------------- main bootstrap ----------------------------------
 def main():
@@ -288,18 +286,20 @@ def main():
     if not token:
         raise SystemExit("TELEGRAM_BOT_TOKEN not set")
 
-    app = Application.builder().token(token).build()
+    updater = Updater(token=token, use_context=True)
+    dp = updater.dispatcher
 
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("ping", cmd_ping))
-    app.add_handler(CommandHandler("balances", cmd_balances))
-    app.add_handler(CommandHandler("prices", cmd_prices))
-    app.add_handler(CommandHandler("sanity", cmd_sanity))
-    app.add_handler(CommandHandler("version", cmd_version))
+    dp.add_handler(CommandHandler("start", cmd_start))
+    dp.add_handler(CommandHandler("help", cmd_help))
+    dp.add_handler(CommandHandler("ping", cmd_ping))
+    dp.add_handler(CommandHandler("balances", cmd_balances))
+    dp.add_handler(CommandHandler("prices", cmd_prices))
+    dp.add_handler(CommandHandler("sanity", cmd_sanity))
+    dp.add_handler(CommandHandler("version", cmd_version))
 
     log.info("Telegram bot started")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    updater.start_polling()
+    updater.idle()
 
 if __name__ == "__main__":
     main()
