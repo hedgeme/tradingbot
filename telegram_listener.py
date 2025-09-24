@@ -1,449 +1,293 @@
-# /bot/app/telegram_listener.py
-# Only differences from the last version: /prices now prints ETH comparison (Harmony vs Coinbase)
+# telegram_listener.py
+# -*- coding: utf-8 -*-
+"""
+TECBot Telegram Listener
 
+Commands:
+  /start, /help, /ping
+  /balances        - grouped balances by strategy (tecbot_eth, tecbot_usdc, ...)
+  /prices          - LP prices + ETH Coinbase comparison
+  /sanity          - run preflight checks
+  /version         - show deployed git version
+"""
+
+from __future__ import annotations
 import os
-import sys
-import time
 import logging
-import hashlib
+import asyncio
+import math
+import subprocess
+from typing import Dict, Any, Iterable, Tuple, List
+
+from web3 import Web3
+from web3.middleware import geth_poa_middleware
 from decimal import Decimal
-from pathlib import Path
 
-from telegram import ParseMode, InlineKeyboardMarkup, InlineKeyboardButton
-from telegram.ext import Updater, CommandHandler, CallbackQueryHandler, Filters
+# Telegram
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes
 
-BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN") or os.environ.get("BOT_TOKEN") or ""
-if not BOT_TOKEN:
-    print("ERROR: TELEGRAM_BOT_TOKEN not set", file=sys.stderr)
+# ------- local imports (support both flat and app.* package styles) ----------
+def _imp(modname: str):
+    try:
+        return __import__(modname, fromlist=['*'])
+    except Exception:
+        return __import__(f"app.{modname}", fromlist=['*'])
+
+config = _imp("config")
+wallet = _imp("wallet")
+
+# Optional modules; handlers will degrade gracefully if missing
+try:
+    price_feed = _imp("price_feed")
+except Exception:
+    price_feed = None
 
 try:
-    from app.config import ADMIN_CHAT_IDS as CFG_ADMINS
-    ADMIN_CHAT_IDS = set(CFG_ADMINS) if isinstance(CFG_ADMINS, (set, list, tuple)) else {1539031664}
+    preflight = _imp("preflight")
 except Exception:
-    ADMIN_CHAT_IDS = {1539031664}
+    preflight = None
 
-REPO_ROOT = Path("/bot")
-VERSION_FILE = REPO_ROOT / "VERSION"
-CHECKSUM_FILES = [
-    REPO_ROOT / "app" / "telegram_listener.py",
-    REPO_ROOT / "app" / "preflight.py",
-    REPO_ROOT / "app" / "wallet.py",
-    REPO_ROOT / "app" / "price_feed.py",
-    REPO_ROOT / "app" / "config.py",
+# ---------------------------- logging ----------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s:%(name)s:%(message)s"
+)
+log = logging.getLogger("telegram_listener")
+
+# ---------------------------- ERC20 ABI (minimal) ----------------------------
+ERC20_MIN_ABI = [
+    {"constant": True, "inputs": [{"name": "owner", "type": "address"}],
+     "name": "balanceOf", "outputs": [{"name": "balance", "type": "uint256"}],
+     "type": "function"},
+    {"constant": True, "inputs": [], "name": "decimals",
+     "outputs": [{"name": "", "type": "uint8"}], "type": "function"},
+    {"constant": True, "inputs": [], "name": "symbol",
+     "outputs": [{"name": "", "type": "string"}], "type": "function"},
 ]
 
-PLAN_TTL_SECONDS = 60
-PLAN_CACHE = {}
-
-logger = logging.getLogger("telegram_listener")
-logger.setLevel(logging.INFO)
-_handler = logging.StreamHandler(sys.stdout)
-_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s:%(name)s:%(message)s"))
-logger.addHandler(_handler)
-
-def _try_import(mod, attr=None):
+# ---------------------------- helpers ----------------------------------------
+def _get_w3() -> Web3:
+    """Use wallet.get_w3() if available; otherwise build one from config.RPC_URL."""
+    if hasattr(wallet, "get_w3"):
+        return wallet.get_w3()
+    rpc = getattr(config, "RPC_URL", "https://api.harmony.one")
+    w3 = Web3(Web3.HTTPProvider(rpc))
+    # Harmony uses Clique; adding POA middleware can't hurt if using S0
     try:
-        m = __import__(mod, fromlist=[attr] if attr else [])
-        return getattr(m, attr) if attr else m
+        w3.middleware_onion.inject(geth_poa_middleware, layer=0)
     except Exception:
-        return None
+        pass
+    return w3
 
-price_feed = _try_import("app.price_feed")
-preflight = _try_import("app.preflight")
-wallet = _try_import("app.wallet")
-config = _try_import("app.config")
-strategy_manager = _try_import("app.strategy_manager")
-
-def _is_admin(update_or_query) -> bool:
-    chat = getattr(update_or_query, "effective_chat", None)
-    if chat and chat.id in ADMIN_CHAT_IDS:
-        return True
-    user = getattr(getattr(update_or_query, "callback_query", None), "from_user", None)
-    return bool(user and user.id in ADMIN_CHAT_IDS)
-
-def _mk_plan_id(plan_payload: dict) -> str:
-    return hashlib.sha256(repr(sorted(plan_payload.items())).encode()).hexdigest()[:8]
-
-def _decimals(sym: str) -> int:
+def _checksum(w3: Web3, addr: str) -> str:
     try:
-        return int(getattr(config, "DECIMALS", {}).get(sym, 18))
+        return w3.to_checksum_address(addr)
     except Exception:
-        return 18
+        return addr
 
-def _d(x) -> Decimal:
-    return x if isinstance(x, Decimal) else Decimal(str(x))
+def _iter_wallet_groups_from_config(cfg) -> Iterable[Tuple[str, str, List[str]]]:
+    """
+    Yields (group_name, evm_address, display_list) from cfg.WALLETS.
+    Accepts either:
+      WALLETS = {"tecbot_eth": "0x..."}                           # simple form
+    or:
+      WALLETS = {"tecbot_eth": {"address":"0x...","display":[…]}} # rich form
+    """
+    WAL = getattr(cfg, "WALLETS", None)
+    if not WAL or not isinstance(WAL, dict):
+        raise RuntimeError("No WALLETS in config.py")
 
-def cmd_start(update, context):
-    context.bot.send_message(update.effective_chat.id, "TECBot online. Type /help for commands.")
+    defaults = {
+        "tecbot_eth":  ["ONE", "1ETH"],
+        "tecbot_usdc": ["ONE", "1USDC"],
+        "tecbot_sdai": ["ONE", "1ETH", "TEC", "1USDC"],
+        "tecbot_tec":  ["ONE", "TEC", "1sDAI"],
+    }
+    for name, val in WAL.items():
+        if isinstance(val, str):
+            addr = val
+            disp = defaults.get(name, ["ONE"])
+        elif isinstance(val, dict):
+            addr = val.get("address") or ""
+            disp = val.get("display") or defaults.get(name, ["ONE"])
+        else:
+            continue
+        addr = (addr or "").strip()
+        if addr:
+            yield name, addr, disp
 
-def cmd_help(update, context):
-    context.bot.send_message(
-        update.effective_chat.id,
-        (
-            "*TECBot Commands*\n"
-            "/ping — Health check\n"
-            "/balances — Show wallet balances\n"
-            "/sanity — Quick balance sanity check\n"
-            "/prices — Show prices (Quoter) + ETH Coinbase compare\n"
-            "/plan [all|<strategy>] — Preview intentions\n"
-            "/dryrun [all|<strategy>] — Sim; tap button to execute\n"
-            "/disable <strategy>|all — Disable\n"
-            "/enable <strategy>|all — Enable\n"
-            "/cooldowns — Show/set cooldowns\n"
-            "/version — Show version & checksum\n"
-            "/report — Per-bot & total PnL (if implemented)"
-        ),
-        parse_mode=ParseMode.MARKDOWN,
-    )
+def _fmt_usd(v: float | None) -> str:
+    if v is None or (isinstance(v, float) and (math.isnan(v) or math.isinf(v))):
+        return "—"
+    if v >= 1000:
+        return f"${v:,.2f}"
+    return f"${v:,.4f}"
 
-def cmd_ping(update, context):
-    context.bot.send_message(update.effective_chat.id, "pong")
+def _fmt_qty(v: Decimal | float | int | None, decimals: int = 4) -> str:
+    if v is None:
+        return "0"
+    if isinstance(v, Decimal):
+        return f"{v:.{decimals}f}"
+    return f"{float(v):.{decimals}f}"
 
-def cmd_balances(update, context):
-    chat_id = update.effective_chat.id
+async def _reply(update: Update, text: str):
+    if update and update.message:
+        await update.message.reply_text(text)
+
+def _get_token_address(symbol: str) -> str | None:
+    # prefer config.TOKENS map
+    tokens = getattr(config, "TOKENS", {})
+    return tokens.get(symbol)
+
+def _get_decimals(symbol: str, default: int = 18) -> int:
+    decs = getattr(config, "DECIMALS", {})
+    return int(decs.get(symbol, default))
+
+def _get_one_balance(w3: Web3, addr: str) -> Decimal:
+    wei = w3.eth.get_balance(addr)
+    return Decimal(wei) / Decimal(10**18)
+
+def _get_erc20_balance(w3: Web3, token_addr: str, holder: str, decimals: int) -> Decimal:
+    c = w3.eth.contract(address=_checksum(w3, token_addr), abi=ERC20_MIN_ABI)
+    bal = c.functions.balanceOf(_checksum(w3, holder)).call()
+    return Decimal(bal) / Decimal(10**decimals)
+
+# ---------------------------- command handlers --------------------------------
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _reply(update, "TECBot online. Try /balances, /prices, /sanity, /version")
+
+async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _reply(update, "/start /help /ping /balances /prices /sanity /version")
+
+async def cmd_ping(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _reply(update, "pong")
+
+async def cmd_balances(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        WALLETS = getattr(config, "WALLETS", {})
-        TOKENS = getattr(config, "TOKENS", {})
-        if not WALLETS:
-            raise RuntimeError("No WALLETS in config.py")
+        w3 = _get_w3()
+        groups = list(_iter_wallet_groups_from_config(config))
+        if not groups:
+            await _reply(update, "No wallet groups configured.")
+            return
 
-        lines = ["*Balances*"]
-        ONE_DEC = Decimal(10) ** 18
+        # Symbol -> token address
+        tok_addr = {s: _get_token_address(s) for s in ["1ETH", "1USDC", "1sDAI", "TEC"]}
 
-        for wname, waddr in WALLETS.items():
-            if not waddr:
-                continue
-            lines.append(f"\n*{wname}*")
+        lines: List[str] = []
+        for name, address, display in groups:
+            cs_addr = _checksum(w3, address)
+            lines.append(f"{name}")
+            # ONE balance always included
+            one_bal = _get_one_balance(w3, cs_addr)
+            lines.append(f"  ONE  {_fmt_qty(one_bal, 4)}")
 
-            try:
-                one_wei = wallet.get_native_balance_wei(waddr)
-                one = _d(one_wei) / ONE_DEC
-                lines.append(f"  ONE  {one.normalize()}")
-            except Exception as e:
-                lines.append(f"  ONE  error: {e}")
-
-            for sym, token_addr in TOKENS.items():
-                if sym == "WONE":
+            for sym in display:
+                if sym == "ONE":
                     continue
-                try:
-                    raw = wallet.get_erc20_balance_wei(token_addr, waddr)
-                    dec = Decimal(10) ** _decimals(sym)
-                    amt = _d(raw) / dec
-                    lines.append(f"  {sym}  {amt.normalize()}")
-                except Exception as e:
-                    lines.append(f"  {sym}  error: {e}")
+                taddr = tok_addr.get(sym)
+                if not taddr:
+                    continue
+                decs = _get_decimals(sym, 18 if sym != "1USDC" else 6)
+                bal = _get_erc20_balance(w3, taddr, cs_addr, decs)
+                lines.append(f"  {sym:<5} {_fmt_qty(bal, 4)}")
 
-        context.bot.send_message(chat_id, "\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+            lines.append("")  # spacer
+
+        await _reply(update, "\n".join(lines).rstrip())
+
     except Exception as e:
-        context.bot.send_message(chat_id, f"❌ /balances failed: {e}")
-        logger.exception("/balances error")
+        log.exception("/balances error")
+        await _reply(update, f"/balances error: {e}")
 
-def cmd_sanity(update, context):
-    chat_id = update.effective_chat.id
+async def cmd_prices(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        if not preflight or not callable(getattr(preflight, "run_sanity", None)):
-            raise RuntimeError("preflight.run_sanity() not available")
-        context.bot.send_message(chat_id, "Running sanity checks…")
-        result = preflight.run_sanity()
-        ok = "✅ All good" if result.get("ok") else "⚠️ Attention needed"
-        lines = [f"*Sanity Check* {ok}", ""]
-        for item in result.get("items", []):
-            status_icon = "✅" if item.get("status") == "ok" else "❌"
-            lines.append(f"{status_icon} *{item.get('wallet','?')}*")
-            for c in item.get("checks", []):
-                ico = "✅" if c.get("ok") else "❌"
-                lines.append(f"  {ico} {c.get('asset','?')}: have {c.get('have','?')} | need {c.get('need','?')}")
-            lines.append("")
-        context.bot.send_message(chat_id, "\n".join(lines).strip(), parse_mode=ParseMode.MARKDOWN)
-        logger.info("/sanity replied")
-    except Exception as e:
-        context.bot.send_message(chat_id, f"❌ /sanity failed: {e}")
-        logger.exception("/sanity error")
-
-def cmd_prices(update, context):
-    """Quoter-only for all tokens; ETH additionally shows Coinbase USD comparison."""
-    chat_id = update.effective_chat.id
-    try:
-        if not price_feed or not callable(getattr(price_feed, "get_prices", None)):
+        if not price_feed or not hasattr(price_feed, "get_prices"):
             raise RuntimeError("price_feed.get_prices() not available (ensure Quoter-backed get_prices exists).")
-        snap = price_feed.get_prices()
-        prices = snap.get("prices", {})
-        if not isinstance(prices, dict) or not prices:
-            raise RuntimeError("Quoter returned empty prices")
+        data: Dict[str, Any] = price_feed.get_prices()
 
-        lines = [f"*Prices* _({snap.get('via','routes')})_"]
-        preferred = ["TEC", "1sDAI", "1ETH", "WONE", "1USDC"]
-        shown = set()
-        for key in preferred:
-            if key in prices:
-                lines.append(f"{key}: {prices[key]}")
-                shown.add(key)
-        for k, v in prices.items():
-            if k not in shown:
-                lines.append(f"{k}: {v}")
+        err = data.get("errors", [])
+        ethc = data.get("ETH_COMPARE", {}) or {}
+        lp = ethc.get("lp_eth_usd")
+        cb = ethc.get("cb_eth_usd")
+        df = ethc.get("diff_pct")
 
-        # ETH comparison formatting (if present)
-        cmp_map = snap.get("comparisons", {})
-        eth_cmp = cmp_map.get("1ETH")
-        if eth_cmp:
-            lines.append(
-                f"_1ETH compare_: Harmony {eth_cmp.get('harmony_1USDC')} | "
-                f"Coinbase {eth_cmp.get('coinbase_usd')} | "
-                f"Δ {eth_cmp.get('premium_pct')}%"
-            )
-
-        context.bot.send_message(chat_id, "\n".join(lines), parse_mode=ParseMode.MARKDOWN)
-    except Exception as e:
-        context.bot.send_message(chat_id, f"❌ /prices failed: {e}")
-        logger.exception("/prices error")
-
-# (The rest of the listener stays exactly as in the previous version — omitted here for brevity)
-# --- START unchanged handlers ---
-
-def cmd_plan(update, context):
-    if not strategy_manager or not callable(getattr(strategy_manager, "simulate_tick", None)):
-        context.bot.send_message(update.effective_chat.id, "Plan/preview not wired yet (simulate_tick missing).")
-        return
-    args = [a.lower() for a in context.args]
-    target = args[0] if args else "all"
-    fn = strategy_manager.simulate_tick
-    strategies = getattr(strategy_manager, "list_strategies", lambda: ["sdai-arb","eth-arb","tec-rebal","usdc-hedge"])()
-    selected = strategies if target == "all" else [target]
-    blocks = []
-    for strat in selected:
-        try:
-            sim = fn(strat)
-            if sim.get("would_broadcast"):
-                blocks.append(f"[{strat}] READY — {sim.get('action','trade')} (edge {sim.get('edge','?')})")
+        lines = []
+        lines.append("LP Prices")
+        for sym in ["ONE", "1USDC", "1sDAI", "TEC", "1ETH"]:
+            v = data.get(sym, None)
+            if v is None:
+                lines.append(f"  {sym:<5}  —")
             else:
-                blocks.append(f"[{strat}] NOT READY — {sim.get('reason','not ready')}")
-        except Exception as e:
-            blocks.append(f"[{strat}] ❌ plan error: {e}")
-    context.bot.send_message(update.effective_chat.id, "\n".join(blocks) or "No strategies found.")
+                lines.append(f"  {sym:<5}  {_fmt_usd(v)}")
+        lines.append("")
+        lines.append("ETH: Harmony LP vs Coinbase")
+        lines.append(f"  LP:       {_fmt_usd(lp)}")
+        lines.append(f"  Coinbase: {_fmt_usd(cb)}")
+        lines.append(f"  Diff:     {('%.2f' % df) + '%' if df == df else '—'}")  # df==df to catch NaN
 
-def _render_dryrun_block(strat: str, sim: dict, plan_id: str, ts: int):
-    age = int(time.time()) - ts
-    if sim.get("would_broadcast"):
-        text = (
-            f"[{strat}] ✓ DRYRUN OK\n"
-            f"• Sim: {sim.get('size','?')} → {sim.get('est_out','?')} • Slip {sim.get('slippage_limit','?')} • Gas ~{sim.get('gas_est','?')}\n"
-            f"• Would broadcast: YES\n"
-            f"• plan_id: {plan_id} (valid {max(0, PLAN_TTL_SECONDS-age)}s)"
-        )
-        kb = InlineKeyboardMarkup([[InlineKeyboardButton(f"Execute now ({strat})", callback_data=f"exec:{strat}:{plan_id}")]])
-    else:
-        text = f"[{strat}] ✗ DRYRUN FAIL\n• Reason: {sim.get('reason','unknown')}\n• Would broadcast: NO"
-        kb = None
-    return text, kb
+        if err:
+            lines.append("")
+            lines.append("Notes:")
+            for m in err:
+                lines.append(f"  - {m}")
 
-def cmd_dryrun(update, context):
-    if not strategy_manager or not callable(getattr(strategy_manager, "simulate_tick", None)):
-        context.bot.send_message(update.effective_chat.id, "Dryrun not wired yet (simulate_tick missing).")
-        return
-    args = [a.lower() for a in context.args]
-    target = args[0] if args else "all"
-    sim_fn = strategy_manager.simulate_tick
-    strategies = getattr(strategy_manager, "list_strategies", lambda: ["sdai-arb","eth-arb","tec-rebal","usdc-hedge"])()
-    selected = strategies if target == "all" else [target]
+        await _reply(update, "\n".join(lines))
 
-    blocks, buttons = [], []
-    now = int(time.time())
-    for strat in selected:
-        try:
-            sim = sim_fn(strat)
-            plan_payload = {
-                "strategy": strat,
-                "size": str(sim.get("size","")),
-                "est_out": str(sim.get("est_out","")),
-                "slippage_limit": str(sim.get("slippage_limit","")),
-                "route": str(sim.get("route","")),
-            }
-            plan_id = _mk_plan_id(plan_payload)
-            PLAN_CACHE[strat] = {"plan": plan_payload, "ts": now, "used": False, "plan_id": plan_id}
-            text, kb = _render_dryrun_block(strat, sim, plan_id, now)
-            blocks.append(text)
-            if kb and kb.inline_keyboard:
-                buttons.extend(kb.inline_keyboard)
-        except Exception as e:
-            blocks.append(f"[{strat}] ❌ Dry-run error: {e}")
-            logger.exception("/dryrun error for %s", strat)
-
-    reply_markup = InlineKeyboardMarkup(buttons) if buttons else None
-    context.bot.send_message(
-        chat_id=update.effective_chat.id,
-        text="\n\n".join(blocks) or "No strategies found.",
-        reply_markup=reply_markup,
-        parse_mode=ParseMode.MARKDOWN
-    )
-
-def cb_execute_now(update, context):
-    q = update.callback_query
-    try:
-        if not _is_admin(update):
-            q.answer("Admin only.", show_alert=True)
-            return
-
-        try:
-            _, strat, plan_id = q.data.split(":", 2)
-        except Exception:
-            q.answer("Invalid payload.", show_alert=True)
-            return
-
-        entry = PLAN_CACHE.get(strat)
-        now = int(time.time())
-        if not entry or entry.get("plan_id") != plan_id:
-            q.answer("Plan not found. Please /dryrun again.", show_alert=True); return
-        if entry.get("used"):
-            q.answer("Already executed.", show_alert=True); return
-        if now - entry["ts"] > PLAN_TTL_SECONDS:
-            q.answer("Plan expired. Please /dryrun again.", show_alert=True); return
-
-        exec_forced = getattr(strategy_manager, "execute_forced", None) if strategy_manager else None
-        if not callable(exec_forced):
-            q.answer("Forced execution not available.", show_alert=True); return
-
-        entry["used"] = True
-        plan = entry["plan"]
-        tx = exec_forced(strat, plan=plan)
-        msg = (
-            f"[{strat}] FORCED EXECUTION\n"
-            f"• Using plan_id {plan_id} (age {now - entry['ts']}s)\n"
-            f"• Broadcasting: {plan.get('size','?')} → {plan.get('est_out','?')} (max slippage {plan.get('slippage_limit','?')})\n"
-            f"• Tx: {tx.get('hash','?')}\n"
-            f"• Result: {tx.get('status','?')}"
-        )
-        q.edit_message_text(text=msg)
     except Exception as e:
-        q.answer("Execution error", show_alert=True)
-        logger.exception("cb_execute_now error: %s", e)
-        context.bot.send_message(chat_id=update.effective_chat.id, text=f"❌ Execute error: {e}")
+        log.exception("/prices error")
+        await _reply(update, f"/prices error: {e}")
 
-def cmd_disable(update, context):
-    if not strategy_manager:
-        context.bot.send_message(update.effective_chat.id, "❌ strategy_manager not available."); return
-    args = [a.lower() for a in context.args]
-    if not args:
-        context.bot.send_message(update.effective_chat.id, "Usage: /disable <strategy> | /disable all"); return
+async def cmd_sanity(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        if args[0] == "all":
-            fn = getattr(strategy_manager, "disable_all", None);  fn and fn()
-            context.bot.send_message(update.effective_chat.id, "✅ All strategies disabled")
-        else:
-            fn = getattr(strategy_manager, "disable", None);      fn and fn(args[0])
-            context.bot.send_message(update.effective_chat.id, f"✅ {args[0]} disabled")
+        if not preflight or not hasattr(preflight, "run_sanity"):
+            raise RuntimeError("preflight.run_sanity() not available")
+        res = preflight.run_sanity()
+        ok = res.get("ok", False)
+        summary = res.get("summary", "")
+        details = res.get("details", [])
+        msg = f"Sanity: {'OK' if ok else 'FAILED'}\n{summary}"
+        if details:
+            msg += "\n\nDetails:\n" + "\n".join(f"- {d}" for d in details)
+        await _reply(update, msg)
     except Exception as e:
-        context.bot.send_message(update.effective_chat.id, f"❌ /disable failed: {e}")
-        logger.exception("/disable error")
+        log.exception("/sanity error")
+        await _reply(update, f"/sanity error: {e}")
 
-def cmd_enable(update, context):
-    if not strategy_manager:
-        context.bot.send_message(update.effective_chat.id, "❌ strategy_manager not available."); return
-    args = [a.lower() for a in context.args]
-    if not args:
-        context.bot.send_message(update.effective_chat.id, "Usage: /enable <strategy> | /enable all"); return
+def _git(cmd: list[str]) -> str:
     try:
-        if args[0] == "all":
-            fn = getattr(strategy_manager, "enable_all", None); fn and fn()
-            context.bot.send_message(update.effective_chat.id, "✅ All strategies enabled")
-        else:
-            fn = getattr(strategy_manager, "enable", None);     fn and fn(args[0])
-            context.bot.send_message(update.effective_chat.id, f"✅ {args[0]} enabled")
-    except Exception as e:
-        context.bot.send_message(update.effective_chat.id, f"❌ /enable failed: {e}")
-        logger.exception("/enable error")
+        out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL).decode().strip()
+    except Exception:
+        out = ""
+    return out
 
-def cmd_cooldowns(update, context):
-    if not strategy_manager:
-        context.bot.send_message(update.effective_chat.id, "❌ strategy_manager not available."); return
-    args = [a.lower() for a in context.args]
-    chat_id = update.effective_chat.id
-    try:
-        if not args:
-            fn = getattr(strategy_manager, "cooldowns", None)
-            if not callable(fn): raise RuntimeError("strategy_manager.cooldowns() not found")
-            info = fn()
-            if not info: context.bot.send_message(chat_id, "No cooldowns configured."); return
-            lines = [f"{s}: {v.get('seconds','0')}s (next in {v.get('next_in','0')}s)" for s, v in info.items()]
-            context.bot.send_message(chat_id, "\n".join(lines)); return
-        if args[0] == "set":
-            if len(args) < 3: context.bot.send_message(chat_id, "Usage: /cooldowns set <strategy> <seconds>"); return
-            s, seconds = args[1], int(args[2])
-            fn = getattr(strategy_manager, "set_cooldown", None)
-            if not callable(fn): raise RuntimeError("strategy_manager.set_cooldown() not found")
-            fn(s, seconds); context.bot.send_message(chat_id, f"✅ Cooldown for {s} set to {seconds}s")
-        elif args[0] == "off":
-            if len(args) < 2: context.bot.send_message(chat_id, "Usage: /cooldowns off <strategy>"); return
-            s = args[1]
-            fn = getattr(strategy_manager, "set_cooldown", None)
-            if not callable(fn): raise RuntimeError("strategy_manager.set_cooldown() not found")
-            fn(s, 0); context.bot.send_message(chat_id, f"✅ Cooldown for {s} disabled")
-        else:
-            context.bot.send_message(chat_id, "Usage:\n/cooldowns\n/cooldowns set <strategy> <seconds>\n/cooldowns off <strategy>")
-    except Exception as e:
-        context.bot.send_message(chat_id, f"❌ /cooldowns failed: {e}")
-        logger.exception("/cooldowns error")
+async def cmd_version(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Show tag (if any), short hash, dirty marker
+    tag = _git(["git", "describe", "--tags", "--abbrev=0"])
+    rev = _git(["git", "rev-parse", "--short", "HEAD"])
+    dirty = _git(["git", "status", "--porcelain"])
+    marker = "" if not dirty else " (dirty)"
+    text = f"Version: {tag or 'no-tag'} @ {rev or 'unknown'}{marker}"
+    await _reply(update, text)
 
-def cmd_version(update, context):
-    chat_id = update.effective_chat.id
-    try:
-        ver = "unknown"
-        try: ver = VERSION_FILE.read_text().strip()
-        except Exception: pass
-        h = hashlib.sha256()
-        for p in CHECKSUM_FILES:
-            try: h.update(p.read_bytes())
-            except Exception: pass
-        checksum = h.hexdigest()[:8]
-        context.bot.send_message(
-            chat_id,
-            f"tecbot {ver}\nConfig checksum: {checksum}\nPython {sys.version.split()[0]} • PTB 13.x",
-            parse_mode=ParseMode.MARKDOWN,
-        )
-    except Exception as e:
-        context.bot.send_message(chat_id, f"❌ /version failed: {e}")
-        logger.exception("/version error")
-
-def cmd_report(update, context):
-    chat_id = update.effective_chat.id
-    try:
-        report_fn = getattr(strategy_manager, "report_24h", None) if strategy_manager else None
-        if not callable(report_fn):
-            context.bot.send_message(chat_id, "(report) Not implemented yet."); return
-        rep = report_fn()
-        if isinstance(rep, str):
-            context.bot.send_message(chat_id, rep)
-        else:
-            lines = ["Report (last 24h)"]
-            for k, v in rep.items():
-                lines.append(f"{k}: {v}")
-            context.bot.send_message(chat_id, "\n".join(lines))
-    except Exception as e:
-        context.bot.send_message(chat_id, f"❌ /report failed: {e}")
-        logger.exception("/report error")
-
+# ---------------------------- main bootstrap ----------------------------------
 def main():
-    updater = Updater(BOT_TOKEN, use_context=True)
-    dp = updater.dispatcher
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    if not token:
+        raise SystemExit("TELEGRAM_BOT_TOKEN not set")
 
-    dp.add_handler(CommandHandler("start", cmd_start))
-    dp.add_handler(CommandHandler("help", cmd_help))
-    dp.add_handler(CommandHandler("ping", cmd_ping))
-    dp.add_handler(CommandHandler("balances", cmd_balances))
-    dp.add_handler(CommandHandler("sanity", cmd_sanity))
-    dp.add_handler(CommandHandler("prices", cmd_prices))
-    dp.add_handler(CommandHandler("plan", cmd_plan))
-    dp.add_handler(CommandHandler("dryrun", cmd_dryrun))
-    dp.add_handler(CommandHandler("disable", cmd_disable))
-    dp.add_handler(CommandHandler("enable", cmd_enable))
-    dp.add_handler(CommandHandler("cooldowns", cmd_cooldowns))
-    dp.add_handler(CommandHandler("version", cmd_version))
-    dp.add_handler(CommandHandler("report", cmd_report))
+    app = Application.builder().token(token).build()
 
-    dp.add_handler(CallbackQueryHandler(cb_execute_now, pattern=r"^exec:"))
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("ping", cmd_ping))
+    app.add_handler(CommandHandler("balances", cmd_balances))
+    app.add_handler(CommandHandler("prices", cmd_prices))
+    app.add_handler(CommandHandler("sanity", cmd_sanity))
+    app.add_handler(CommandHandler("version", cmd_version))
 
-    logger.info("Telegram bot started")
-    updater.start_polling()
-    updater.idle()
+    log.info("Telegram bot started")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
