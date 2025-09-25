@@ -1,14 +1,17 @@
 # telegram_listener.py
 # -*- coding: utf-8 -*-
 """
-TECBot Telegram Listener (python-telegram-bot v13-compatible)
+TECBot Telegram Listener (python-telegram-bot v13-compatible, non-blocking)
 
 Commands:
   /start, /help, /ping
-  /balances        - grouped balances by strategy (tecbot_eth, tecbot_usdc, ...)
-  /prices          - LP prices + ETH Coinbase comparison
-  /sanity          - run preflight checks
-  /version         - show deployed git version
+  /balances   - grouped balances by strategy (tecbot_eth, tecbot_usdc, ...)
+  /prices     - LP prices + ETH Coinbase comparison (time-boxed, never hangs)
+  /sanity     - run preflight checks (time-boxed, never hangs)
+  /version    - show deployed git version
+  /cooldowns  - show default cooldowns from config.py
+  /plan       - show brief plan (reads local repo docs); always replies
+  /dryrun     - explicit stub so it never fails silently
 """
 
 from __future__ import annotations
@@ -16,7 +19,9 @@ import os
 import logging
 import math
 import subprocess
-from typing import Dict, Any, Iterable, Tuple, List
+import threading
+from pathlib import Path
+from typing import Dict, Any, Iterable, Tuple, List, Optional
 
 from decimal import Decimal
 from web3 import Web3
@@ -34,7 +39,7 @@ except Exception:
 
 # Telegram (pre-v20)
 from telegram import Update
-from telegram.ext import Updater, CommandHandler, CallbackContext
+from telegram.ext import Updater, CommandHandler, CallbackContext, MessageHandler, Filters
 
 # ------- local imports (support both flat and app.* package styles) ----------
 def _imp(modname: str):
@@ -63,6 +68,11 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s:%(name)s:%(message)s"
 )
 log = logging.getLogger("telegram_listener")
+
+# ---------------------------- constants --------------------------------------
+PRICES_TIMEOUT_SEC = 6       # hard upper bound for /prices
+SANITY_TIMEOUT_SEC = 10      # hard upper bound for /sanity
+MAX_PLAN_LINES = 40          # show a short plan snippet, not the whole file
 
 # ---------------------------- ERC20 ABI (minimal) ----------------------------
 ERC20_MIN_ABI = [
@@ -163,12 +173,27 @@ def _get_erc20_balance(w3: Web3, token_addr: str, holder: str, decimals: int) ->
     bal = c.functions.balanceOf(_checksum(w3, holder)).call()
     return Decimal(bal) / Decimal(10**decimals)
 
+# --------- time-box wrappers to guarantee a response (no silent hangs) -------
+def _call_with_timeout(fn, timeout_sec: int, default: Any) -> Any:
+    box = {"res": default}
+    def runner():
+        try:
+            box["res"] = fn()
+        except Exception as e:
+            box["res"] = e
+    t = threading.Thread(target=runner, daemon=True)
+    t.start()
+    t.join(timeout=timeout_sec)
+    if t.is_alive():
+        return TimeoutError(f"timed out after {timeout_sec}s")
+    return box["res"]
+
 # ---------------------------- command handlers (sync) -------------------------
 def cmd_start(update: Update, context: CallbackContext):
-    _reply(update, "TECBot online. Try /balances, /prices, /sanity, /version")
+    _reply(update, "TECBot online. Try /balances, /prices, /sanity, /version, /cooldowns, /plan")
 
 def cmd_help(update: Update, context: CallbackContext):
-    _reply(update, "/start /help /ping /balances /prices /sanity /version")
+    _reply(update, "/start /help /ping /balances /prices /sanity /version /cooldowns /plan /dryrun")
 
 def cmd_ping(update: Update, context: CallbackContext):
     _reply(update, "pong")
@@ -211,48 +236,63 @@ def cmd_balances(update: Update, context: CallbackContext):
         _reply(update, f"/balances error: {e}")
 
 def cmd_prices(update: Update, context: CallbackContext):
-    try:
+    def _do():
         if not price_feed or not hasattr(price_feed, "get_prices"):
             raise RuntimeError("price_feed.get_prices() not available (ensure Quoter-backed get_prices exists).")
-        data: Dict[str, Any] = price_feed.get_prices()
+        return price_feed.get_prices()
 
+    res = _call_with_timeout(_do, PRICES_TIMEOUT_SEC, default=None)
+    if isinstance(res, Exception):
+        _reply(update, f"/prices error: {res}")
+        return
+    if res is None:
+        _reply(update, f"/prices error: timed out after {PRICES_TIMEOUT_SEC}s")
+        return
+
+    try:
+        data: Dict[str, Any] = res
         err = data.get("errors", [])
         ethc = data.get("ETH_COMPARE", {}) or {}
         lp = ethc.get("lp_eth_usd")
         cb = ethc.get("cb_eth_usd")
         df = ethc.get("diff_pct")
 
-        lines = []
-        lines.append("LP Prices")
+        lines = ["LP Prices"]
         for sym in ["ONE", "1USDC", "1sDAI", "TEC", "1ETH"]:
             v = data.get(sym, None)
-            if v is None:
-                lines.append(f"  {sym:<5}  —")
-            else:
-                lines.append(f"  {sym:<5}  {_fmt_usd(v)}")
-        lines.append("")
-        lines.append("ETH: Harmony LP vs Coinbase")
-        lines.append(f"  LP:       {_fmt_usd(lp)}")
-        lines.append(f"  Coinbase: {_fmt_usd(cb)}")
-        lines.append(f"  Diff:     {('%.2f' % df) + '%' if df == df else '—'}")  # NaN-safe
-
+            lines.append(f"  {sym:<5}  {_fmt_usd(v)}" if v is not None else f"  {sym:<5}  —")
+        lines += [
+            "",
+            "ETH: Harmony LP vs Coinbase",
+            f"  LP:       {_fmt_usd(lp)}",
+            f"  Coinbase: {_fmt_usd(cb)}",
+            f"  Diff:     {('%.2f' % df) + '%' if df == df else '—'}"
+        ]
         if err:
             lines.append("")
             lines.append("Notes:")
-            for m in err:
-                lines.append(f"  - {m}")
+            lines.extend([f"  - {m}" for m in err])
 
         _reply(update, "\n".join(lines))
-
     except Exception as e:
-        log.exception("/prices error")
+        log.exception("/prices format error")
         _reply(update, f"/prices error: {e}")
 
 def cmd_sanity(update: Update, context: CallbackContext):
-    try:
+    def _do():
         if not preflight or not hasattr(preflight, "run_sanity"):
             raise RuntimeError("preflight.run_sanity() not available")
-        res = preflight.run_sanity()
+        return preflight.run_sanity()
+
+    res = _call_with_timeout(_do, SANITY_TIMEOUT_SEC, default=None)
+    if isinstance(res, Exception):
+        _reply(update, f"Sanity: FAILED\n{res}")
+        return
+    if res is None:
+        _reply(update, f"Sanity: FAILED\nTimed out after {SANITY_TIMEOUT_SEC}s")
+        return
+
+    try:
         ok = res.get("ok", False)
         summary = res.get("summary", "")
         details = res.get("details", [])
@@ -261,8 +301,8 @@ def cmd_sanity(update: Update, context: CallbackContext):
             msg += "\n\nDetails:\n" + "\n".join(f"- {d}" for d in details)
         _reply(update, msg)
     except Exception as e:
-        log.exception("/sanity error")
-        _reply(update, f"/sanity error: {e}")
+        log.exception("/sanity format error")
+        _reply(update, f"Sanity: FAILED\n{e}")
 
 def _git(cmd: list[str]) -> str:
     try:
@@ -272,13 +312,60 @@ def _git(cmd: list[str]) -> str:
     return out
 
 def cmd_version(update: Update, context: CallbackContext):
-    # Show tag (if any), short hash, dirty marker
     tag = _git(["git", "describe", "--tags", "--abbrev=0"])
     rev = _git(["git", "rev-parse", "--short", "HEAD"])
     dirty = _git(["git", "status", "--porcelain"])
     marker = "" if not dirty else " (dirty)"
     text = f"Version: {tag or 'no-tag'} @ {rev or 'unknown'}{marker}"
     _reply(update, text)
+
+def _read_text_if_exists(paths: List[Path]) -> Optional[str]:
+    for p in paths:
+        try:
+            if p.exists() and p.is_file():
+                with p.open("r", encoding="utf-8", errors="ignore") as f:
+                    return f.read()
+        except Exception:
+            continue
+    return None
+
+def cmd_plan(update: Update, context: CallbackContext):
+    # Try to read a short plan excerpt from local repo docs so it always replies.
+    here = Path(__file__).resolve().parent
+    roots = [here, here.parent]  # /bot/app and /bot
+    candidates = []
+    for root in roots:
+        candidates += [
+            root / "Project_overview.md",
+            root / "BOT_ARCHITECTURE.md",
+            root / "README.md",
+        ]
+    txt = _read_text_if_exists(candidates)
+    if not txt:
+        _reply(update, "Plan: repo docs not found locally. (Place Project_overview.md or BOT_ARCHITECTURE.md alongside the bot files.)")
+        return
+    lines = [ln.rstrip() for ln in txt.splitlines()]
+    snippet = "\n".join(lines[:MAX_PLAN_LINES]).strip()
+    _reply(update, f"Plan (preview):\n{snippet}\n\n(Showing first {MAX_PLAN_LINES} lines)")
+
+def cmd_cooldowns(update: Update, context: CallbackContext):
+    data = getattr(config, "COOLDOWNS_DEFAULTS", {})
+    if not isinstance(data, dict) or not data:
+        _reply(update, "No default cooldowns configured.")
+        return
+    lines = ["Default cooldowns (seconds):"]
+    for k, v in data.items():
+        lines.append(f"  {k}: {v}")
+    _reply(update, "\n".join(lines))
+
+def cmd_dryrun(update: Update, context: CallbackContext):
+    # Explicit stub so the bot never fails silently.
+    _reply(update, "Dry-run is not enabled in this build. (No trades will be simulated.)")
+
+def cmd_unknown(update: Update, context: CallbackContext):
+    # Catch-all so we never ignore a command silently.
+    if update and update.message and update.message.text and update.message.text.startswith("/"):
+        _reply(update, f"Unknown command: {update.message.text}")
 
 # ---------------------------- main bootstrap ----------------------------------
 def main():
@@ -296,6 +383,12 @@ def main():
     dp.add_handler(CommandHandler("prices", cmd_prices))
     dp.add_handler(CommandHandler("sanity", cmd_sanity))
     dp.add_handler(CommandHandler("version", cmd_version))
+    dp.add_handler(CommandHandler("cooldowns", cmd_cooldowns))
+    dp.add_handler(CommandHandler("plan", cmd_plan))
+    dp.add_handler(CommandHandler("dryrun", cmd_dryrun))
+
+    # Catch unknown commands so nothing is ever silently dropped
+    dp.add_handler(MessageHandler(Filters.command, cmd_unknown))
 
     log.info("Telegram bot started")
     updater.start_polling()
