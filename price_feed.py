@@ -7,7 +7,8 @@ Symbols:
   ONE, 1USDC, 1sDAI, TEC, 1ETH
 
 Rules:
-  - 1USDC and 1sDAI are 1.00 by definition.
+  - 1USDC is 1.00 by definition.
+  - 1sDAI is QUOTED via QuoterV2 (NOT hard-coded).
   - ONE priced via WONE->1USDC single-hop (fee 500).
   - 1ETH priced via 1ETH->WONE (3000) -> 1USDC (500) multihop.
   - TEC  priced via TEC->WONE (10000) -> 1USDC (500) multihop.
@@ -47,8 +48,7 @@ log.setLevel(logging.INFO)
 # ----------------- Uniswap V3 constants -----------------
 QUOTER_V2 = Web3.to_checksum_address("0x314456E8F5efaa3dD1F036eD5900508da8A3B382")
 
-# Minimal ABI for QuoterV2
-# We only need quoteExactInput(bytes path, uint256 amountIn) -> (uint256 amountOut, ...extras)
+# Minimal ABI for QuoterV2: quoteExactInput(bytes path, uint256 amountIn)
 QUOTER_V2_ABI = [
     {
         "inputs": [
@@ -101,17 +101,14 @@ def _encode_path(tokens: List[str], fees: List[int]) -> bytes:
 def _quote_usd_for_1_token(sym: str, errors: List[str]) -> Optional[Decimal]:
     """
     Returns USD value for 1.0 unit of `sym` using QuoterV2 on Harmony.
-    ONE is priced via WONE.
-    Stables (1USDC, 1sDAI) return 1.0.
+    1USDC = 1.0 (fixed), 1sDAI is quoted.
     """
-    if sym in ("1USDC", "1sDAI"):
+    if sym == "1USDC":
         return Decimal("1.0")
 
     w3 = _w3()
     q = w3.eth.contract(address=QUOTER_V2, abi=QUOTER_V2_ABI)
 
-    # Map symbols to concrete multihops and fee tiers
-    # (based on your working preflight output)
     WONE  = _tok("WONE")
     USDC  = _tok("1USDC")
 
@@ -119,16 +116,25 @@ def _quote_usd_for_1_token(sym: str, errors: List[str]) -> Optional[Decimal]:
         # Price 1 WONE → USDC (single hop 500)
         amt_in = 10 ** _dec("WONE")
         path = _encode_path([WONE, USDC], [500])
+
     elif sym == "1ETH":
         ETH = _tok("1ETH")
         amt_in = 10 ** _dec("1ETH")
         # 1ETH -> WONE (3000) -> 1USDC (500)
         path = _encode_path([ETH, WONE, USDC], [3000, 500])
+
     elif sym == "TEC":
         TEC = _tok("TEC")
         amt_in = 10 ** _dec("TEC")
         # TEC -> WONE (10000) -> 1USDC (500)
         path = _encode_path([TEC, WONE, USDC], [10000, 500])
+
+    elif sym == "1sDAI":
+        SDAI = _tok("1sDAI")
+        amt_in = 10 ** _dec("1sDAI")
+        # 1sDAI -> 1USDC (fee 500)
+        path = _encode_path([SDAI, USDC], [500])
+
     else:
         errors.append(f"{sym}: unsupported symbol in price_feed")
         return None
@@ -187,7 +193,6 @@ def get_prices() -> Dict[str, Any]:
             out["errors"].append(f"{sym}: {e}")
 
     cmp_ = get_eth_prices_lp_vs_cb()
-    # merge any comparison errors into overall errors
     if cmp_.get("errors"):
         out["errors"].extend(cmp_["errors"])
     out["ETH_COMPARE"] = {k: cmp_[k] for k in ("lp_eth_usd","cb_eth_usd","diff_pct")}
