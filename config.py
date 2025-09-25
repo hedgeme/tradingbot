@@ -22,10 +22,11 @@ WALLETS = {
 }
 
 # --- Verified token contracts on Harmony (from verified_info.md) ---
+# NOTE: 1USDC updated to the widely used canonical address on Harmony.
 TOKENS = {
     "WONE":  "0xcF664087a5bB0237a0BAd6742852ec6c8d69A27a",  # Wrapped ONE
     "1ETH":  "0x4cc435d7b9557d54d6ef02d69bbf72634905bf11",
-    "1USDC": "0xbc594cabd205bd993e7ffa6f3e9cea75c1110da5",
+    "1USDC": "0x985458e523db3d53125813ed68c274899e9dfab4",  # <-- canonical USDC on Harmony
     "TEC":   "0x0deb9a1998aae32daacf6de21161c3e942ace074",
     "1sDAI": "0xedeb95d51dbc4116039435379bd58472a2c09b1f",
 }
@@ -47,5 +48,3 @@ COOLDOWNS_DEFAULTS = {
     "tec-rebal": 0,
     "usdc-hedge": 0,
 }
-
-
