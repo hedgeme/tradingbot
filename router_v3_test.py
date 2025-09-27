@@ -1,3 +1,4 @@
+# /bot/app/router_v3_test.py
 from __future__ import annotations
 import os
 from typing import Dict, List
@@ -8,16 +9,20 @@ import app.wallet as wallet
 import app.router_v3 as router
 from app.router_v3 import build_path_bytes, data_exact_input_single, data_exact_input
 
-# Web3
-w3 = router.w3 if hasattr(router, "w3") else wallet.get_w3()
+# Web3 from router (guaranteed real provider)
+w3 = router.w3()
 print("RPC:", getattr(getattr(w3, "provider", None), "endpoint_uri", "(unknown)"))
 
-# Token map (ensure ONE/WONE alias both exist)
+# Token map (ensure ONE/WONE alias both exist) and checksummed
 TOK: Dict[str, str] = {k: Web3.to_checksum_address(v) for k, v in config.TOKENS.items()}
 if "ONE" in TOK and "WONE" not in TOK: TOK["WONE"] = TOK["ONE"]
 if "WONE" in TOK and "ONE" not in TOK: TOK["ONE"] = TOK["WONE"]
 
-WONE = TOK["WONE"]; ETH = TOK["1ETH"]; USDC = TOK["1USDC"]; TEC = TOK["TEC"]; SDAI = TOK["1sDAI"]
+WONE = TOK["WONE"]
+ETH  = TOK["1ETH"]
+USDC = TOK["1USDC"]
+TEC  = TOK["TEC"]
+SDAI = TOK["1sDAI"]
 
 def _pick_recipient() -> str:
     cands: List[str] = []
