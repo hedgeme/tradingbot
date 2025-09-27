@@ -1,28 +1,84 @@
-# /bot/app/router_v3.py — minimal Uniswap V3 router helpers for TECBot
+# /bot/app/router_v3.py — Uniswap V3 router helpers (fork-aware)
+# Adapts to routers that include a 'deadline' in their structs by inspecting the ABI.
 
 import json
+import time
+from typing import Any, Dict, List, Tuple
+
 from web3 import Web3, HTTPProvider
 from .config import ROUTER_ADDR, HARMONY_RPC
 
-# Keep a module-level Web3 with a real HTTPProvider
+# ---------------------------------------------------------------------
+# Web3 + Router
+# ---------------------------------------------------------------------
 _W3 = Web3(HTTPProvider(HARMONY_RPC, request_kwargs={"timeout": 8}))
+
+with open("/bot/app/SwapRouter02_minimal.json") as f:
+    _ABI = json.load(f)
+
 _ROUTER = _W3.eth.contract(
     address=Web3.to_checksum_address(ROUTER_ADDR),
-    abi=json.load(open("/bot/app/SwapRouter02_minimal.json"))
+    abi=_ABI
 )
 
 def w3() -> Web3:
-    """Return a connected Web3 instance."""
     return _W3
 
 def router():
-    """Return the router contract."""
     return _ROUTER
 
-def build_path_bytes(legs):
+# ---------------------------------------------------------------------
+# ABI helpers to detect tuple shapes (7-field vs 8-field with deadline)
+# ---------------------------------------------------------------------
+def _get_fn_abi(fn_name: str) -> Dict[str, Any]:
+    # there may be multiple overloads; we pick the one taking a single tuple for *Single()
+    cands = [a for a in _ABI if a.get("type") == "function" and a.get("name") == fn_name]
+    if not cands:
+        raise ValueError(f"Function {fn_name} not found in ABI")
+    # Prefer the one whose first input is a tuple (struct)
+    for abi in cands:
+        ins = abi.get("inputs") or []
+        if ins and (ins[0].get("type", "").startswith("(") or ins[0].get("components")):
+            return abi
+    # Fallback to first
+    return cands[0]
+
+def _expects_deadline_in_single(fn_name: str) -> bool:
+    """
+    For exactInputSingle / exactOutputSingle:
+    true  -> struct has 8 components (includes 'deadline' before sqrtPriceLimitX96)
+    false -> struct has 7 components (no deadline)
+    """
+    abi = _get_fn_abi(fn_name)
+    ins = abi.get("inputs") or []
+    if not ins:
+        return False
+    comp = ins[0].get("components") or []
+    return len(comp) >= 8  # (address,address,uint24,address,uint256,uint256,uint256,uint160)
+
+def _expects_deadline_in_path(fn_name: str) -> bool:
+    """
+    For exactInput / exactOutput:
+    true  -> tuple has 5 components (path,recipient,amountIn/Out,amountOutMin/InMax,deadline)
+    false -> tuple has 4 components (no deadline)
+    """
+    abi = _get_fn_abi(fn_name)
+    ins = abi.get("inputs") or []
+    if not ins:
+        return False
+    comp = ins[0].get("components") or []
+    return len(comp) >= 5  # many forks: add deadline at the end
+
+def _deadline(seconds: int = 1800) -> int:
+    return int(time.time()) + int(seconds)
+
+# ---------------------------------------------------------------------
+# Path building (standard)
+# ---------------------------------------------------------------------
+def build_path_bytes(legs: List[Tuple[str, int, str]]) -> bytes:
     """
     legs = [(tokenA, feeAB, tokenB), (tokenB, feeBC, tokenC), ...]
-    Returns the canonical bytes: tokenA (20) + fee (3) + tokenB (20) + ...
+    Returns canonical path bytes: tokenA (20) + fee (3) + tokenB (20) + ...
     """
     out = b""
     for i, (a, fee, b) in enumerate(legs):
@@ -34,50 +90,83 @@ def build_path_bytes(legs):
         out += bytes.fromhex(b[2:])
     return out
 
-def data_exact_input_single(token_in, token_out, fee, recipient, amount_in, amount_out_min):
+# ---------------------------------------------------------------------
+# Single-hop calldata (fork-aware)
+# ---------------------------------------------------------------------
+def data_exact_input_single(token_in: str, token_out: str, fee: int, recipient: str,
+                            amount_in: int, amount_out_min: int,
+                            sqrt_price_limit_x96: int = 0, deadline: int | None = None) -> bytes:
     """
-    exactInputSingle((address tokenIn, address tokenOut, uint24 fee, address recipient, uint256 amountIn, uint256 amountOutMinimum))
-    NOTE: pass a TUPLE in the exact order required by the ABI.
+    exactInputSingle:
+      - Standard Uniswap V3: (address,address,uint24,address,uint256,uint256,uint160)
+      - Some forks (your Harmony router): (address,address,uint24,address,uint256,uint256,uint256,uint160)  # + deadline
     """
-    tup = (
-        Web3.to_checksum_address(token_in),
-        Web3.to_checksum_address(token_out),
-        int(fee),
-        Web3.to_checksum_address(recipient),
-        int(amount_in),
-        int(amount_out_min),
-    )
+    token_in  = Web3.to_checksum_address(token_in)
+    token_out = Web3.to_checksum_address(token_out)
+    recipient = Web3.to_checksum_address(recipient)
+    fee       = int(fee)
+    amount_in = int(amount_in)
+    amount_out_min = int(amount_out_min)
+    sqrt_price_limit_x96 = int(sqrt_price_limit_x96)
+    dl = _deadline() if deadline is None else int(deadline)
+
+    if _expects_deadline_in_single("exactInputSingle"):
+        tup = (token_in, token_out, fee, recipient, amount_in, amount_out_min, dl, sqrt_price_limit_x96)
+    else:
+        tup = (token_in, token_out, fee, recipient, amount_in, amount_out_min, sqrt_price_limit_x96)
+
     fn = _ROUTER.functions.exactInputSingle(tup)
     return fn._encode_transaction_data()
 
-def data_exact_output_single(token_in, token_out, fee, recipient, amount_out, amount_in_max):
-    tup = (
-        Web3.to_checksum_address(token_in),
-        Web3.to_checksum_address(token_out),
-        int(fee),
-        Web3.to_checksum_address(recipient),
-        int(amount_out),
-        int(amount_in_max),
-    )
+def data_exact_output_single(token_in: str, token_out: str, fee: int, recipient: str,
+                             amount_out: int, amount_in_max: int,
+                             sqrt_price_limit_x96: int = 0, deadline: int | None = None) -> bytes:
+    token_in  = Web3.to_checksum_address(token_in)
+    token_out = Web3.to_checksum_address(token_out)
+    recipient = Web3.to_checksum_address(recipient)
+    fee          = int(fee)
+    amount_out   = int(amount_out)
+    amount_in_max = int(amount_in_max)
+    sqrt_price_limit_x96 = int(sqrt_price_limit_x96)
+    dl = _deadline() if deadline is None else int(deadline)
+
+    if _expects_deadline_in_single("exactOutputSingle"):
+        tup = (token_in, token_out, fee, recipient, amount_out, amount_in_max, dl, sqrt_price_limit_x96)
+    else:
+        tup = (token_in, token_out, fee, recipient, amount_out, amount_in_max, sqrt_price_limit_x96)
+
     fn = _ROUTER.functions.exactOutputSingle(tup)
     return fn._encode_transaction_data()
 
-def data_exact_input(path_bytes, recipient, amount_in, amount_out_min):
-    tup = (
-        bytes(path_bytes),
-        Web3.to_checksum_address(recipient),
-        int(amount_in),
-        int(amount_out_min),
-    )
+# ---------------------------------------------------------------------
+# Multi-hop calldata (fork-aware)
+# ---------------------------------------------------------------------
+def data_exact_input(path_bytes: bytes, recipient: str, amount_in: int, amount_out_min: int,
+                     deadline: int | None = None) -> bytes:
+    recipient = Web3.to_checksum_address(recipient)
+    amount_in = int(amount_in)
+    amount_out_min = int(amount_out_min)
+    dl = _deadline() if deadline is None else int(deadline)
+
+    if _expects_deadline_in_path("exactInput"):
+        tup = (bytes(path_bytes), recipient, amount_in, amount_out_min, dl)
+    else:
+        tup = (bytes(path_bytes), recipient, amount_in, amount_out_min)
+
     fn = _ROUTER.functions.exactInput(tup)
     return fn._encode_transaction_data()
 
-def data_exact_output(path_bytes, recipient, amount_out, amount_in_max):
-    tup = (
-        bytes(path_bytes),
-        Web3.to_checksum_address(recipient),
-        int(amount_out),
-        int(amount_in_max),
-    )
+def data_exact_output(path_bytes: bytes, recipient: str, amount_out: int, amount_in_max: int,
+                      deadline: int | None = None) -> bytes:
+    recipient    = Web3.to_checksum_address(recipient)
+    amount_out   = int(amount_out)
+    amount_in_max = int(amount_in_max)
+    dl = _deadline() if deadline is None else int(deadline)
+
+    if _expects_deadline_in_path("exactOutput"):
+        tup = (bytes(path_bytes), recipient, amount_out, amount_in_max, dl)
+    else:
+        tup = (bytes(path_bytes), recipient, amount_out, amount_in_max)
+
     fn = _ROUTER.functions.exactOutput(tup)
     return fn._encode_transaction_data()
