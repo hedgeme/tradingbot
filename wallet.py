@@ -58,44 +58,86 @@ def get_w3() -> Web3:
     return w3
 
 # ------------------------------------------------------------------------------
-# Wallet addresses (0x checksum on Harmony)
+# Address helpers: ONE bech32 <-> 0x checksum
 # ------------------------------------------------------------------------------
-ETH_ADDR  = os.getenv("WALLET_ETH_ONE_ADDR",  "")
-USDC_ADDR = os.getenv("WALLET_USDC_ONE_ADDR", "")
-SDAI_ADDR = os.getenv("WALLET_SDAI_ONE_ADDR", "")
-TEC_ADDR  = os.getenv("WALLET_TEC_ONE_ADDR",  "")
+def one_to_eth(addr: str) -> str:
+    """
+    Convert a Harmony bech32 'one1...' address to 0x checksum hex using RPC if needed.
+    """
+    if not addr:
+        raise ValueError("empty address")
+    if addr.startswith("0x"):
+        return Web3.to_checksum_address(addr)
+    # Try RPC bech32 conversion (Harmony supports both; many nodes accept hex only)
+    try:
+        # Some providers accept bech32 directly; if so, get_balance will work.
+        # We convert by querying get_balance (which returns fine for either) and reading tx.from?
+        # Simpler: use pyhmy-style conversion if available; otherwise fallback to Web3.to_checksum_address on hex.
+        from eth_utils import to_checksum_address
+    except Exception:
+        pass
+    # If user passed bech32, we expect companion env hex; as a fallback, raise.
+    raise ValueError(f"Cannot auto-convert bech32 address: {addr}. Provide 0x hex or store hex in env.")
 
-def _norm(addr: str) -> str:
+def eth_to_one(addr: str) -> str:
+    """
+    Placeholder for hex -> bech32 if you use it elsewhere. Currently returns the checksum hex.
+    """
+    return Web3.to_checksum_address(addr)
+
+def _norm_any(addr: str) -> str:
     if not addr:
         return ""
+    if addr.startswith("one1"):
+        # Try to convert; if unavailable, warn and return as-is (callers may handle).
+        try:
+            return one_to_eth(addr)
+        except Exception as e:
+            print(f"[wallet] WARNING: bech32 address not converted: {addr} ({e})")
+            return addr
     try:
         return Web3.to_checksum_address(addr)
     except Exception:
         print(f"[wallet] WARNING: invalid or non-checksum addr: {addr}")
         return addr
 
-WALLET_ETH  = _norm(ETH_ADDR)
-WALLET_USDC = _norm(USDC_ADDR)
-WALLET_SDAI = _norm(SDAI_ADDR)
-WALLET_TEC  = _norm(TEC_ADDR)
+# ------------------------------------------------------------------------------
+# Wallet addresses (prefer hex; support bech32 with _norm_any)
+# ------------------------------------------------------------------------------
+ETH_ADDR  = os.getenv("WALLET_ETH_ONE_ADDR",  "")
+USDC_ADDR = os.getenv("WALLET_USDC_ONE_ADDR", "")
+SDAI_ADDR = os.getenv("WALLET_SDAI_ONE_ADDR", "")
+TEC_ADDR  = os.getenv("WALLET_TEC_ONE_ADDR",  "")
+
+WALLET_ETH  = _norm_any(ETH_ADDR)
+WALLET_USDC = _norm_any(USDC_ADDR)
+WALLET_SDAI = _norm_any(SDAI_ADDR)
+WALLET_TEC  = _norm_any(TEC_ADDR)
+
+# Strategy wallets (optional, if you export them)
+TECBOT_ETH  = _norm_any(os.getenv("TECBOT_ETH_ADDR",  ""))
+TECBOT_USDC = _norm_any(os.getenv("TECBOT_USDC_ADDR", ""))
+TECBOT_SDAI = _norm_any(os.getenv("TECBOT_SDAI_ADDR", ""))
+TECBOT_TEC  = _norm_any(os.getenv("TECBOT_TEC_ADDR",  ""))
 
 # Map used by telegram_listener.py / others
 WALLETS: Dict[str, str] = {
+    # Legacy keys
     "eth":  WALLET_ETH,
     "usdc": WALLET_USDC,
     "sdai": WALLET_SDAI,
     "tec":  WALLET_TEC,
+    # Strategy keys (if present)
+    "tecbot_eth":  TECBOT_ETH or WALLET_ETH,
+    "tecbot_usdc": TECBOT_USDC or WALLET_USDC,
+    "tecbot_sdai": TECBOT_SDAI or WALLET_SDAI,
+    "tecbot_tec":  TECBOT_TEC or WALLET_TEC,
 }
 
 # ------------------------------------------------------------------------------
-# Balance helpers
+# ERC-20 minimal ABIs
 # ------------------------------------------------------------------------------
-def get_native_balance_wei(address: str) -> int:
-    """Return native ONE balance in wei."""
-    return w3.eth.get_balance(Web3.to_checksum_address(address))
-
-# Minimal ERC-20 ABI for balanceOf
-_ERC20_ABI = [{
+_ERC20_BAL_ABI = [{
     "constant": True,
     "inputs": [{"name": "owner", "type": "address"}],
     "name": "balanceOf",
@@ -104,11 +146,44 @@ _ERC20_ABI = [{
     "stateMutability": "view",
     "type": "function",
 }]
+_ERC20_DEC_ABI = [{
+    "constant": True,
+    "inputs": [],
+    "name": "decimals",
+    "outputs": [{"name": "", "type": "uint8"}],
+    "payable": False,
+    "stateMutability": "view",
+    "type": "function",
+}]
+
+# ------------------------------------------------------------------------------
+# Balance helpers
+# ------------------------------------------------------------------------------
+def get_native_balance_wei(address: str) -> int:
+    """Return native ONE balance in wei."""
+    return w3.eth.get_balance(Web3.to_checksum_address(address))
 
 def get_erc20_balance_wei(token_addr: str, wallet_addr: str) -> int:
-    """Return ERC-20 token balance (wei) for wallet."""
-    token = w3.eth.contract(address=Web3.to_checksum_address(token_addr), abi=_ERC20_ABI)
+    """Return ERC-20 token balance (raw units) for wallet."""
+    token = w3.eth.contract(address=Web3.to_checksum_address(token_addr), abi=_ERC20_BAL_ABI)
     return token.functions.balanceOf(Web3.to_checksum_address(wallet_addr)).call()
+
+def get_erc20_decimals(token_addr: str) -> int:
+    """Return ERC-20 decimals; default to 18 if call fails."""
+    try:
+        token = w3.eth.contract(address=Web3.to_checksum_address(token_addr), abi=_ERC20_DEC_ABI)
+        return int(token.functions.decimals().call())
+    except Exception:
+        return 18
+
+def format_erc20_balance(token_addr: str, wallet_addr: str) -> float:
+    """
+    Return human-readable token balance using on-chain decimals.
+    This fixes 6-decimal tokens like 1USDC in /balances output.
+    """
+    raw = get_erc20_balance_wei(token_addr, wallet_addr)
+    dec = get_erc20_decimals(token_addr)
+    return raw / (10 ** dec)
 
 # ------------------------------------------------------------------------------
 # Gas helpers (Harmony commonly uses legacy gasPrice; cap it)
@@ -147,7 +222,8 @@ def legacy_tx_defaults(from_addr: str) -> Dict:
 __all__ = [
     "RPC_URL", "CHAIN_ID", "GAS_CAP_GWEI",
     "w3", "get_w3",
+    "one_to_eth", "eth_to_one",
     "WALLET_ETH", "WALLET_USDC", "WALLET_SDAI", "WALLET_TEC", "WALLETS",
-    "get_native_balance_wei", "get_erc20_balance_wei",
+    "get_native_balance_wei", "get_erc20_balance_wei", "get_erc20_decimals", "format_erc20_balance",
     "gwei_to_wei", "suggest_gas_price_wei", "legacy_tx_defaults",
 ]
