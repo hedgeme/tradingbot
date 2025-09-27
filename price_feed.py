@@ -9,14 +9,10 @@ Symbols:
 Rules:
   - 1USDC is 1.00 by definition.
   - 1sDAI is QUOTED via QuoterV2 (NOT hard-coded).
-  - ONE priced via WONE->1USDC single-hop (fee 500).
-  - 1ETH priced via 1ETH->WONE (3000) -> 1USDC (500) multihop.
-  - TEC  priced via TEC->WONE (10000) -> 1USDC (500) multihop.
+  - ONE priced via WONE/ONE -> 1USDC single-hop (fee 500).
+  - 1ETH priced via 1ETH->WONE/ONE (3000) -> 1USDC (500) multihop.
+  - TEC  priced via TEC->WONE/ONE (10000) -> 1USDC (500) multihop.
   - Coinbase ETH spot fetched via public endpoint (3s timeout).
-
-Addresses (from verified_info.md):
-  SwapRouter02: 0x85495f44768ccbb584d9380Cc29149fDAA445F69  (not used here)
-  QuoterV2:     0x314456E8F5efaa3dD1F036eD5900508da8A3B382
 """
 
 from __future__ import annotations
@@ -27,7 +23,6 @@ from decimal import Decimal
 from urllib.request import urlopen, Request
 from urllib.error import URLError, HTTPError
 
-# local imports (flat or app.*)
 def _imp(modname: str):
     try:
         return __import__(modname, fromlist=['*'])
@@ -46,9 +41,19 @@ log = logging.getLogger("price_feed")
 log.setLevel(logging.INFO)
 
 # ----------------- Uniswap V3 constants -----------------
-QUOTER_V2 = Web3.to_checksum_address("0x314456E8F5efaa3dD1F036eD5900508da8A3B382")
+# Use the address from config (do NOT hardcode), defaults to the verified one if missing.
+QUOTER_V2 = Web3.to_checksum_address(
+    getattr(config, "QUOTER_ADDR", "0x314456E8F5efaa3dD1F036eD5900508da8A3B382")
+)
 
-# Minimal ABI for QuoterV2: quoteExactInput(bytes path, uint256 amountIn)
+# Harmony RPC preference: use config.HARMONY_RPC if available
+def _w3() -> Web3:
+    if wallet and hasattr(wallet, "get_w3"):
+        return wallet.get_w3()
+    rpc = getattr(config, "HARMONY_RPC", None) or getattr(config, "RPC_URL", "https://api.harmony.one")
+    return Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": 8}))
+
+# Minimal ABI for your QuoterV2 variant: quoteExactInput(bytes path, uint256 amountIn)
 QUOTER_V2_ABI = [
     {
         "inputs": [
@@ -68,20 +73,32 @@ QUOTER_V2_ABI = [
 ]
 
 # ----------------- Helpers -----------------
-def _w3() -> Web3:
-    if wallet and hasattr(wallet, "get_w3"):
-        return wallet.get_w3()
-    return Web3(Web3.HTTPProvider(getattr(config, "RPC_URL", "https://api.harmony.one")))
-
 def _tok(sym: str) -> str:
-    addr = getattr(config, "TOKENS", {}).get(sym)
+    """
+    Return a checksum address for the given symbol.
+    Special handling: 'WONE' falls back to 'ONE' and vice versa.
+    """
+    toks = getattr(config, "TOKENS", {}) or {}
+    addr = toks.get(sym)
     if not addr:
-        raise RuntimeError(f"config.TOKENS missing symbol {sym}")
+        if sym == "WONE" and "ONE" in toks:
+            addr = toks["ONE"]
+        elif sym == "ONE" and "WONE" in toks:
+            addr = toks["WONE"]
+    if not addr:
+        raise RuntimeError(f"config.TOKENS missing symbol {sym} (and no alias fallback)")
     return Web3.to_checksum_address(addr)
 
 def _dec(sym: str) -> int:
-    decs = getattr(config, "DECIMALS", {})
-    return int(decs.get(sym, 6 if sym == "1USDC" else 18))
+    """
+    Decimals map (optional). Defaults: 1USDC=6, others=18.
+    """
+    decs = getattr(config, "DECIMALS", {}) or {}
+    if sym in decs:
+        return int(decs[sym])
+    if sym == "1USDC":
+        return 6
+    return 18
 
 def _encode_path(tokens: List[str], fees: List[int]) -> bytes:
     """
@@ -100,7 +117,7 @@ def _encode_path(tokens: List[str], fees: List[int]) -> bytes:
 
 def _quote_usd_for_1_token(sym: str, errors: List[str]) -> Optional[Decimal]:
     """
-    Returns USD value for 1.0 unit of `sym` using QuoterV2 on Harmony.
+    Returns USD value for 1.0 unit of `sym` using your QuoterV2 variant on Harmony.
     1USDC = 1.0 (fixed), 1sDAI is quoted.
     """
     if sym == "1USDC":
@@ -110,29 +127,26 @@ def _quote_usd_for_1_token(sym: str, errors: List[str]) -> Optional[Decimal]:
     q = w3.eth.contract(address=QUOTER_V2, abi=QUOTER_V2_ABI)
 
     WONE  = _tok("WONE")
+    ONE   = _tok("ONE")   # resolved to same address as WONE if only one exists
     USDC  = _tok("1USDC")
 
     if sym == "ONE":
-        # Price 1 WONE → USDC (single hop 500)
         amt_in = 10 ** _dec("WONE")
         path = _encode_path([WONE, USDC], [500])
 
     elif sym == "1ETH":
         ETH = _tok("1ETH")
         amt_in = 10 ** _dec("1ETH")
-        # 1ETH -> WONE (3000) -> 1USDC (500)
         path = _encode_path([ETH, WONE, USDC], [3000, 500])
 
     elif sym == "TEC":
         TEC = _tok("TEC")
         amt_in = 10 ** _dec("TEC")
-        # TEC -> WONE (10000) -> 1USDC (500)
         path = _encode_path([TEC, WONE, USDC], [10000, 500])
 
     elif sym == "1sDAI":
         SDAI = _tok("1sDAI")
         amt_in = 10 ** _dec("1sDAI")
-        # 1sDAI -> 1USDC (fee 500)
         path = _encode_path([SDAI, USDC], [500])
 
     else:
@@ -141,8 +155,7 @@ def _quote_usd_for_1_token(sym: str, errors: List[str]) -> Optional[Decimal]:
 
     try:
         amount_out, _, _, _ = q.functions.quoteExactInput(path, int(amt_in)).call()
-        # amount_out is in USDC (6 decimals)
-        usd = Decimal(amount_out) / Decimal(10 ** _dec("1USDC"))
+        usd = Decimal(amount_out) / Decimal(10 ** _dec("1USDC"))  # USDC has 6 decimals
         return usd
     except Exception as e:
         errors.append(f"{sym}: QuoterV2 quote failed ({e})")
