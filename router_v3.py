@@ -31,24 +31,16 @@ def router():
 # ABI helpers to detect tuple shapes (7-field vs 8-field with deadline)
 # ---------------------------------------------------------------------
 def _get_fn_abi(fn_name: str) -> Dict[str, Any]:
-    # there may be multiple overloads; we pick the one taking a single tuple for *Single()
     cands = [a for a in _ABI if a.get("type") == "function" and a.get("name") == fn_name]
     if not cands:
         raise ValueError(f"Function {fn_name} not found in ABI")
-    # Prefer the one whose first input is a tuple (struct)
     for abi in cands:
         ins = abi.get("inputs") or []
         if ins and (ins[0].get("type", "").startswith("(") or ins[0].get("components")):
             return abi
-    # Fallback to first
     return cands[0]
 
 def _expects_deadline_in_single(fn_name: str) -> bool:
-    """
-    For exactInputSingle / exactOutputSingle:
-    true  -> struct has 8 components (includes 'deadline' before sqrtPriceLimitX96)
-    false -> struct has 7 components (no deadline)
-    """
     abi = _get_fn_abi(fn_name)
     ins = abi.get("inputs") or []
     if not ins:
@@ -57,11 +49,6 @@ def _expects_deadline_in_single(fn_name: str) -> bool:
     return len(comp) >= 8  # (address,address,uint24,address,uint256,uint256,uint256,uint160)
 
 def _expects_deadline_in_path(fn_name: str) -> bool:
-    """
-    For exactInput / exactOutput:
-    true  -> tuple has 5 components (path,recipient,amountIn/Out,amountOutMin/InMax,deadline)
-    false -> tuple has 4 components (no deadline)
-    """
     abi = _get_fn_abi(fn_name)
     ins = abi.get("inputs") or []
     if not ins:
