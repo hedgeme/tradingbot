@@ -50,3 +50,16 @@ All notable changes and service updates for the TECBot project will be documente
 
 Documented in chat: *“09/23/25 Botfather /sanity”*
 
+
+## 2025-09-28
+- Improved **price feed logic** to show correct outputs and reference the correct contracts
+- Fixed balance displays so that all amounts now show accurately
+- Verified that price feeds and balances are working without errors
+
+**Next Work Items**
+- `/assets` command not working in Telegram
+- `/sanity` command still has issues
+- `/version` command not functioning
+
+Documented in chat: *“09/26/25 Telegram Bugs”*
+
