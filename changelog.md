@@ -8,7 +8,7 @@ https://github.com/hedgeme/tradingbot/tree/main
 
 All other chats within this project have been documented for the support of the development of this project. Review the Github and all its content before giving suggestions. Before giving recommendations on modifying working programs, provide at least 5 diagnostic checks to review the issue. 
 
-Do not give recommendations without review the Github repo above or all the files attached to this project.
+Do not give recommendations without reviewing the Github repo above and all the files attached to this project.
 
 
 
