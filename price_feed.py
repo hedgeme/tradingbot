@@ -7,16 +7,20 @@ Symbols:
   ONE, 1USDC, 1sDAI, TEC, 1ETH
 
 Rules:
-  - 1USDC is 1.00 by definition.
-  - 1sDAI is QUOTED via QuoterV2 (NOT hard-coded).
+  - 1USDC is 1.00 by definition (USDC is the USD anchor).
+  - 1sDAI is QUOTED via QuoterV2 (NOT hard-coded) against USDC.
   - ONE priced via WONE/ONE -> 1USDC single-hop (fee 500).
   - 1ETH priced via 1ETH->WONE/ONE (3000) -> 1USDC (500) multihop.
   - TEC  priced via TEC->WONE/ONE (10000) -> 1USDC (500) multihop.
   - Coinbase ETH spot fetched via public endpoint (3s timeout).
+
+Upgrade:
+  - Uses both quoteExactInput (forward) and quoteExactOutput (reverse on reversed path)
+    to avoid fork-specific quoting skew; prefers reverse if they diverge >20%.
 """
 
 from __future__ import annotations
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 import json
 import logging
 from decimal import Decimal
@@ -53,8 +57,8 @@ def _w3() -> Web3:
     rpc = getattr(config, "HARMONY_RPC", None) or getattr(config, "RPC_URL", "https://api.harmony.one")
     return Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": 8}))
 
-# Minimal ABI for your QuoterV2 variant: quoteExactInput(bytes path, uint256 amountIn)
-QUOTER_V2_ABI = [
+# Minimal ABI for your QuoterV2 variant: path-based quoting (exact input & exact output)
+QUOTER_V2_ABI_QEI = [  # quoteExactInput(bytes path, uint256 amountIn)
     {
         "inputs": [
             {"internalType": "bytes", "name": "path", "type": "bytes"},
@@ -63,6 +67,23 @@ QUOTER_V2_ABI = [
         "name": "quoteExactInput",
         "outputs": [
             {"internalType": "uint256", "name": "amountOut", "type": "uint256"},
+            {"internalType": "uint160[]", "name": "sqrtPriceX96AfterList", "type": "uint160[]"},
+            {"internalType": "uint32[]",  "name": "initializedTicksCrossedList", "type": "uint32[]"},
+            {"internalType": "uint256", "name": "gasEstimate", "type": "uint256"},
+        ],
+        "stateMutability": "nonpayable",
+        "type": "function",
+    }
+]
+QUOTER_V2_ABI_QEO = [  # quoteExactOutput(bytes path, uint256 amountOut)
+    {
+        "inputs": [
+            {"internalType": "bytes", "name": "path", "type": "bytes"},
+            {"internalType": "uint256", "name": "amountOut", "type": "uint256"},
+        ],
+        "name": "quoteExactOutput",
+        "outputs": [
+            {"internalType": "uint256", "name": "amountIn", "type": "uint256"},
             {"internalType": "uint160[]", "name": "sqrtPriceX96AfterList", "type": "uint160[]"},
             {"internalType": "uint32[]",  "name": "initializedTicksCrossedList", "type": "uint32[]"},
             {"internalType": "uint256", "name": "gasEstimate", "type": "uint256"},
@@ -115,50 +136,105 @@ def _encode_path(tokens: List[str], fees: List[int]) -> bytes:
     out += bytes.fromhex(tokens[-1][2:].lower())              # last token (20 bytes)
     return out
 
+def _path_for(sym: str) -> Tuple[List[str], List[int]]:
+    """
+    Forward path for sym -> 1USDC (USDC anchor).
+    - ONE:  WONE -> USDC (500)
+    - 1ETH: 1ETH -> WONE (3000) -> USDC (500)
+    - TEC:  TEC  -> WONE (10000) -> USDC (500)
+    - 1sDAI: 1sDAI -> USDC (500)
+    - 1USDC: handled separately (anchor = 1.00)
+    """
+    WONE = _tok("WONE")
+    USDC = _tok("1USDC")
+    if sym == "ONE":
+        return [WONE, USDC], [500]
+    if sym == "1ETH":
+        return [_tok("1ETH"), WONE, USDC], [3000, 500]
+    if sym == "TEC":
+        return [_tok("TEC"), WONE, USDC], [10000, 500]
+    if sym == "1sDAI":
+        return [_tok("1sDAI"), USDC], [500]
+    raise RuntimeError(f"{sym}: unsupported symbol in price_feed")
+
+def _qe_input(path: bytes, amount_in: int) -> Optional[int]:
+    """quoteExactInput(path, amountIn) -> amountOut (int)"""
+    try:
+        w3 = _w3()
+        q = w3.eth.contract(address=QUOTER_V2, abi=QUOTER_V2_ABI_QEI)
+        amount_out, *_ = q.functions.quoteExactInput(path, int(amount_in)).call()
+        return int(amount_out)
+    except Exception:
+        return None
+
+def _qe_output(path: bytes, amount_out: int) -> Optional[int]:
+    """quoteExactOutput(path, amountOut) -> amountIn (int)"""
+    try:
+        w3 = _w3()
+        q = w3.eth.contract(address=QUOTER_V2, abi=QUOTER_V2_ABI_QEO)
+        amount_in, *_ = q.functions.quoteExactOutput(path, int(amount_out)).call()
+        return int(amount_in)
+    except Exception:
+        return None
+
+def _lp_usd_forward(sym: str) -> Optional[Decimal]:
+    """
+    Forward price: 1.0 sym -> USDC via quoteExactInput.
+    """
+    tokens, fees = _path_for(sym)
+    path = _encode_path(tokens, fees)
+    amt_in = 10 ** _dec(sym)
+    out = _qe_input(path, amt_in)
+    if out is None:
+        return None
+    return Decimal(out) / Decimal(10 ** _dec("1USDC"))
+
+def _lp_usd_reverse(sym: str) -> Optional[Decimal]:
+    """
+    Reverse price: ask for exactly 1.0 USDC via quoteExactOutput on REVERSED path; invert.
+    More robust on some forks.
+    """
+    tokens, fees = _path_for(sym)
+    rev_tokens = list(reversed(tokens))
+    rev_fees   = list(reversed(fees))
+    path_rev = _encode_path(rev_tokens, rev_fees)
+    want_out = 10 ** _dec("1USDC")  # 1.0 USDC
+    amt_in_sym = _qe_output(path_rev, want_out)
+    if not amt_in_sym:
+        return None
+    tokens_for_1_usd = Decimal(amt_in_sym) / Decimal(10 ** _dec(sym))
+    if tokens_for_1_usd == 0:
+        return None
+    return Decimal(1) / tokens_for_1_usd
+
 def _quote_usd_for_1_token(sym: str, errors: List[str]) -> Optional[Decimal]:
     """
     Returns USD value for 1.0 unit of `sym` using your QuoterV2 variant on Harmony.
-    1USDC = 1.0 (fixed), 1sDAI is quoted.
+    USDC is the USD anchor => 1USDC = 1.00.
+    Others are quoted to USDC using forward+reverse with auto-selection.
     """
     if sym == "1USDC":
         return Decimal("1.0")
 
-    w3 = _w3()
-    q = w3.eth.contract(address=QUOTER_V2, abi=QUOTER_V2_ABI)
-
-    WONE  = _tok("WONE")
-    ONE   = _tok("ONE")   # resolved to same address as WONE if only one exists
-    USDC  = _tok("1USDC")
-
-    if sym == "ONE":
-        amt_in = 10 ** _dec("WONE")
-        path = _encode_path([WONE, USDC], [500])
-
-    elif sym == "1ETH":
-        ETH = _tok("1ETH")
-        amt_in = 10 ** _dec("1ETH")
-        path = _encode_path([ETH, WONE, USDC], [3000, 500])
-
-    elif sym == "TEC":
-        TEC = _tok("TEC")
-        amt_in = 10 ** _dec("TEC")
-        path = _encode_path([TEC, WONE, USDC], [10000, 500])
-
-    elif sym == "1sDAI":
-        SDAI = _tok("1sDAI")
-        amt_in = 10 ** _dec("1sDAI")
-        path = _encode_path([SDAI, USDC], [500])
-
-    else:
-        errors.append(f"{sym}: unsupported symbol in price_feed")
-        return None
-
     try:
-        amount_out, _, _, _ = q.functions.quoteExactInput(path, int(amt_in)).call()
-        usd = Decimal(amount_out) / Decimal(10 ** _dec("1USDC"))  # USDC has 6 decimals
-        return usd
+        fwd = _lp_usd_forward(sym)
+        rev = _lp_usd_reverse(sym)
+        if fwd is None and rev is None:
+            errors.append(f"{sym}: both forward/reverse LP quotes failed")
+            return None
+        if fwd is None:
+            return rev
+        if rev is None:
+            return fwd
+        if fwd == 0 or rev == 0:
+            return max(fwd, rev)
+        diff = abs((fwd - rev) / rev)
+        if diff > Decimal("0.20"):
+            errors.append(f"{sym}: forward {fwd:.6f} vs reverse {rev:.6f} diverged; using reverse")
+            return rev
+        return (fwd + rev) / 2
     except Exception as e:
-        errors.append(f"{sym}: QuoterV2 quote failed ({e})")
+        errors.append(f"{sym}: quote failed ({e})")
         return None
 
 def _coinbase_eth_usd(errors: List[str]) -> Optional[float]:
@@ -178,19 +254,19 @@ def _coinbase_eth_usd(errors: List[str]) -> Optional[float]:
 # ----------------- Public API -----------------
 def get_eth_prices_lp_vs_cb() -> Dict[str, float]:
     errors: List[str] = []
-    lp = None
+    lp_val = None
     try:
         v = _quote_usd_for_1_token("1ETH", errors)
         if v is not None:
-            lp = float(v)
+            lp_val = float(v)
     except Exception as e:
         errors.append(f"LP ETH quote: {e}")
 
     cb = _coinbase_eth_usd(errors)
     diff = float("nan")
-    if lp is not None and cb is not None and cb != 0.0:
-        diff = (cb - lp) / cb * 100.0
-    return {"lp_eth_usd": lp if lp is not None else float("nan"),
+    if lp_val is not None and cb is not None and cb != 0.0:
+        diff = (cb - lp_val) / cb * 100.0
+    return {"lp_eth_usd": lp_val if lp_val is not None else float("nan"),
             "cb_eth_usd": cb if cb is not None else float("nan"),
             "diff_pct": diff,
             "errors": errors}
