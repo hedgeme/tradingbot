@@ -11,6 +11,16 @@ TOKENS = {
     "TEC":   "0x0DEB9A1998aAE32dAAcF6de21161c3E942aCe074",
 }
 
+# Verified SWAP (v3-style) pools and fee tiers (from your verified_info.md)
+# Keys are only labels for humans; code reads addresses/fees, not the key name.
+POOLS_V3 = {
+    "1ETH/WONE@3000":  {"address": "0xe0566c122bdbb29beb5ff2148a6a547df814a246", "fee": 3000},
+    "1USDC/WONE@3000": {"address": "0x6e543b707693492a2d14d729ac10a9d03b4c9383", "fee": 3000},
+    "TEC/WONE@10000":  {"address": "0xfac981a64ecedf1be8722125fe776bde2f746ff2", "fee": 10000},
+    "1USDC/1sDAI@500": {"address": "0xc28f4b97aa9a983da81326f7fb4b9cf84a9703a2", "fee": 500},
+    "TEC/1sDAI@10000": {"address": "0x90bfca0ee66ca53cddfc0f6ee5217b6f2acde4ee", "fee": 10000},
+}
+
 ROUTER_ADDR = "0x85495f44768ccbb584d9380Cc29149fDAA445F69"
 QUOTER_ADDR = "0x314456E8F5efaa3dD1F036eD5900508da8A3B382"
 
