@@ -2,7 +2,7 @@
 
 All notable changes and service updates for the TECBot project will be documented here.
 
-This chat is created to work through this project:
+This project is created to work through this Trading Bot project:
 
 https://github.com/hedgeme/tradingbot/tree/main
 
