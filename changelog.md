@@ -2,6 +2,17 @@
 
 All notable changes and service updates for the TECBot project will be documented here.
 
+This chat is created to work through this project:
+
+https://github.com/hedgeme/tradingbot/tree/main
+
+All other chats within this project have been documented for support the involvement of this project. Review the Github and all its content before giving suggestions. Before giving recommendations on modifying working programs, provide at least 5 diagnostic checks to review the issue. 
+
+Do not give recommendations without review the Github repo above or all the files attached to this project.
+
+
+
+
 ## 2025-09-21
 - Fixed `wallet.py` and `.env` (permissions + recoding)
 - Restored Telegram service (see chat: "Telegram bot issue 9/21/25")
