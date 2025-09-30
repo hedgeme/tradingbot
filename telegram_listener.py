@@ -9,8 +9,8 @@ Commands:
   /balances   - grouped balances by strategy (tecbot_eth, tecbot_usdc, ...)
   /prices     - LP prices + ETH Coinbase comparison (time-boxed, never hangs)
   /slippage   - slippage curve for a token vs USDC (time-boxed)
-  /sanity     - run preflight checks (handles stdout-printing preflight)
-  /version    - show deployed git version
+  /sanity     - run preflight checks (subprocess w/ timeout; parse PASS/FAIL)
+  /version    - show deployed git version (robust fallbacks)
   /cooldowns  - show default cooldowns from config.py
   /plan       - show brief plan (reads local repo docs); always replies
   /dryrun     - explicit stub so it never fails silently
@@ -18,7 +18,7 @@ Commands:
 
 from __future__ import annotations
 import os
-import io
+import sys
 import re
 import logging
 import math
@@ -73,12 +73,13 @@ log = logging.getLogger("telegram_listener")
 
 # ---------------------------- constants --------------------------------------
 PRICES_TIMEOUT_SEC = 6
-SANITY_TIMEOUT_SEC = 10
+SANITY_TIMEOUT_SEC = 12  # headroom for subprocess spawn
 SLIPPAGE_TIMEOUT_SEC = 8
 MAX_PLAN_LINES = 40
 
 # Repo root (this file is in /bot/app; .git is in /bot)
 REPO_ROOT = Path(__file__).resolve().parent.parent
+GIT_DIR = REPO_ROOT / ".git"
 
 # ---------------------------- ERC20 ABI (minimal) ----------------------------
 ERC20_MIN_ABI = [
@@ -93,17 +94,12 @@ ERC20_MIN_ABI = [
 
 # ---------------------------- helpers ----------------------------------------
 def _get_w3() -> Web3:
-    """
-    Prefer HARMONY_RPC if present; fall back to RPC_URL; finally default to api.harmony.one.
-    Use wallet.get_w3() when available.
-    """
+    """Prefer HARMONY_RPC if present; fall back to RPC_URL; finally default to api.harmony.one."""
     if hasattr(wallet, "get_w3"):
         w3 = wallet.get_w3()
     else:
         rpc = getattr(config, "HARMONY_RPC", None) or getattr(config, "RPC_URL", "https://api.harmony.one")
         w3 = Web3(Web3.HTTPProvider(rpc))
-
-    # Inject PoA middleware if available (safe on Harmony)
     if _POA_MIDDLEWARE:
         try:
             w3.middleware_onion.inject(_POA_MIDDLEWARE, layer=0)
@@ -370,57 +366,51 @@ def cmd_slippage(update: Update, context: CallbackContext):
         log.exception("/slippage format error")
         _reply(update, f"/slippage error: {e}")
 
-def cmd_sanity(update: Update, context: CallbackContext):
+# -------- Sanity via subprocess (captures stdout/stderr reliably) ------------
+def _run_preflight_subprocess(timeout_sec: int) -> Tuple[int, str]:
     """
-    Run preflight checks. Supports legacy preflight.run_sanity() that PRINTS and returns None.
-    We capture stdout, parse PASS/FAIL, and always reply.
+    Execute: python -c "import app.preflight as p; p.run_sanity()"
+    Capture stdout+stderr; return (exit_code, combined_output).
     """
-    def _do():
-        if not preflight or not hasattr(preflight, "run_sanity"):
-            raise RuntimeError("preflight.run_sanity() not available")
-        import sys
-        buf = io.StringIO()
-        old = sys.stdout
-        try:
-            sys.stdout = buf
-            res = preflight.run_sanity()  # may return dict or None
-        finally:
-            sys.stdout = old
-        return (res, buf.getvalue().strip())
+    cmd = [
+        sys.executable,
+        "-c",
+        "import app.preflight as p; p.run_sanity()"
+    ]
+    env = os.environ.copy()
+    env["PYTHONPATH"] = str(REPO_ROOT)  # ensure app.* is importable
+    try:
+        p = subprocess.run(
+            cmd,
+            cwd=str(REPO_ROOT / "app"),
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout_sec,
+            text=True
+        )
+        out = (p.stdout or "") + (("\n" + p.stderr) if p.stderr else "")
+        return p.returncode, out.strip()
+    except subprocess.TimeoutExpired as e:
+        return 124, (e.stdout or "") + (("\n" + e.stderr) if e.stderr else "")
 
-    out = _call_with_timeout(_do, SANITY_TIMEOUT_SEC, default=None)
-    if isinstance(out, TimeoutError):
+def cmd_sanity(update: Update, context: CallbackContext):
+    rc, out = _run_preflight_subprocess(SANITY_TIMEOUT_SEC)
+    if rc == 124:
         _reply(update, f"Sanity: FAILED\nTimed out after {SANITY_TIMEOUT_SEC}s")
         return
-    if isinstance(out, Exception) or out is None:
-        _reply(update, f"Sanity: FAILED\n{out or 'No result'}")
+    if rc != 0 and not out:
+        _reply(update, "Sanity: FAILED\nNo output from preflight.")
         return
-
-    res, printed = out
-    if isinstance(res, dict) and res:
-        try:
-            ok = res.get("ok", False)
-            summary = res.get("summary", "")
-            details = res.get("details", [])
-            msg = f"Sanity: {'OK' if ok else 'FAILED'}\n{summary}"
-            if details:
-                msg += "\n\nDetails:\n" + "\n".join(f"- {d}" for d in details)
-            _reply(update, msg)
-            return
-        except Exception:
-            pass
-
-    # Parse the printed output (e.g., "OVERALL: ✅ PASS")
-    txt = printed or ""
-    ok = bool(re.search(r"OVERALL:\s*(✅\s*PASS|PASS)", txt, re.IGNORECASE))
-    lines = [ln for ln in txt.splitlines() if ln.strip()]
+    ok = bool(re.search(r"OVERALL:\s*(✅\s*PASS|PASS)", out, re.IGNORECASE))
+    lines = [ln for ln in (out or "").splitlines() if ln.strip()]
     summary = lines[-1] if lines else "preflight completed."
     _reply(update, f"Sanity: {'OK' if ok else 'FAILED'}\n{summary}")
 
-def _git(cmd: list[str]) -> str:
+# ---------------------------- version helpers --------------------------------
+def _git(args: List[str]) -> str:
     try:
-        # Use repo root so git finds .git even though WorkingDirectory=/bot/app
-        return subprocess.check_output(cmd, stderr=subprocess.DEVNULL, cwd=str(REPO_ROOT)).decode().strip()
+        return subprocess.check_output(args, stderr=subprocess.DEVNULL).decode().strip()
     except Exception:
         return ""
 
@@ -438,18 +428,29 @@ def _changelog_headline() -> str:
     return ""
 
 def cmd_version(update: Update, context: CallbackContext):
-    # Explicit /usr/bin/git based on your systemd PATH dump
-    tag = _git(["/usr/bin/git", "describe", "--tags", "--abbrev=0"])
-    rev = _git(["/usr/bin/git", "rev-parse", "--short", "HEAD"])
-    dirty = _git(["/usr/bin/git", "status", "--porcelain"])
+    tag = rev = dirty = ""
+    if GIT_DIR.exists():
+        # Prefer explicit --git-dir so it works regardless of WorkingDirectory
+        tag   = _git(["/usr/bin/git", f"--git-dir={GIT_DIR}", "describe", "--tags", "--abbrev=0"])
+        rev   = _git(["/usr/bin/git", f"--git-dir={GIT_DIR}", "rev-parse", "--short", "HEAD"])
+        dirty = _git(["/usr/bin/git", f"--git-dir={GIT_DIR}", "status", "--porcelain"])
+    else:
+        # Try normal git (will fail cleanly if not a repo)
+        tag   = _git(["/usr/bin/git", "describe", "--tags", "--abbrev=0"])
+        rev   = _git(["/usr/bin/git", "rev-parse", "--short", "HEAD"])
+        dirty = _git(["/usr/bin/git", "status", "--porcelain"])
+
     marker = "" if not dirty else " (dirty)"
     if not tag and not rev:
         head = _changelog_headline()
         if head:
             _reply(update, f"Version: (no git) • {head}")
             return
+        _reply(update, f"Version: unknown • RepoRoot={REPO_ROOT} • .git present={GIT_DIR.exists()}")
+        return
     _reply(update, f"Version: {tag or 'no-tag'} @ {rev or 'unknown'}{marker}")
 
+# ---------------------------- docs & misc ------------------------------------
 def _read_text_if_exists(paths: List[Path]) -> Optional[str]:
     for p in paths:
         try:
@@ -479,53 +480,4 @@ def cmd_plan(update: Update, context: CallbackContext):
     snippet = "\n".join(lines[:MAX_PLAN_LINES]).strip()
     _reply(update, f"Plan (preview):\n{snippet}\n\n(Showing first {MAX_PLAN_LINES} lines)")
 
-def cmd_cooldowns(update: Update, context: CallbackContext):
-    data = getattr(config, "COOLDOWNS_DEFAULTS", {})
-    if not isinstance(data, dict) or not data:
-        _reply(update, "No default cooldowns configured.")
-        return
-    lines = ["Default cooldowns (seconds):"]
-    for k, v in data.items():
-        lines.append(f"  {k}: {v}")
-    _reply(update, "\n".join(lines))
-
-def cmd_dryrun(update: Update, context: CallbackContext):
-    # Explicit stub so the bot never fails silently.
-    _reply(update, "Dry-run is not enabled in this build. (No trades will be simulated.)")
-
-def cmd_unknown(update: Update, context: CallbackContext):
-    # Catch-all so we never ignore a command silently.
-    if update and update.message and update.message.text and update.message.text.startswith("/"):
-        _reply(update, f"Unknown command: {update.message.text}")
-
-# ---------------------------- main bootstrap ----------------------------------
-def main():
-    token = os.getenv("TELEGRAM_BOT_TOKEN")
-    if not token:
-        raise SystemExit("TELEGRAM_BOT_TOKEN not set")
-
-    updater = Updater(token=token, use_context=True)
-    dp = updater.dispatcher
-
-    dp.add_handler(CommandHandler("start", cmd_start))
-    dp.add_handler(CommandHandler("help", cmd_help))
-    dp.add_handler(CommandHandler("ping", cmd_ping))
-    dp.add_handler(CommandHandler("assets", cmd_assets))
-    dp.add_handler(CommandHandler("balances", cmd_balances))
-    dp.add_handler(CommandHandler("prices", cmd_prices))
-    dp.add_handler(CommandHandler("slippage", cmd_slippage))
-    dp.add_handler(CommandHandler("sanity", cmd_sanity))
-    dp.add_handler(CommandHandler("version", cmd_version))
-    dp.add_handler(CommandHandler("cooldowns", cmd_cooldowns))
-    dp.add_handler(CommandHandler("plan", cmd_plan))
-    dp.add_handler(CommandHandler("dryrun", cmd_dryrun))
-
-    # Catch unknown commands so nothing is ever silently dropped
-    dp.add_handler(MessageHandler(Filters.command, cmd_unknown))
-
-    log.info("Telegram bot started")
-    updater.start_polling()
-    updater.idle()
-
-if __name__ == "__main__":
-    main()
+def cmd_cooldowns(update:
