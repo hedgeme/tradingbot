@@ -5,10 +5,11 @@ TECBot Telegram Listener (python-telegram-bot v13-compatible, non-blocking)
 
 Commands:
   /start, /help, /ping
+  /assets     - list configured wallet groups & tracked symbols (from config)
   /balances   - grouped balances by strategy (tecbot_eth, tecbot_usdc, ...)
   /prices     - LP prices + ETH Coinbase comparison (time-boxed, never hangs)
   /slippage   - slippage curve for a token vs USDC (time-boxed)
-  /sanity     - run preflight checks (time-boxed, never hangs)
+  /sanity     - run preflight checks (handles stdout-printing preflight)
   /version    - show deployed git version
   /cooldowns  - show default cooldowns from config.py
   /plan       - show brief plan (reads local repo docs); always replies
@@ -17,6 +18,8 @@ Commands:
 
 from __future__ import annotations
 import os
+import io
+import re
 import logging
 import math
 import subprocess
@@ -73,6 +76,9 @@ PRICES_TIMEOUT_SEC = 6
 SANITY_TIMEOUT_SEC = 10
 SLIPPAGE_TIMEOUT_SEC = 8
 MAX_PLAN_LINES = 40
+
+# Repo root (this file is in /bot/app; .git is in /bot)
+REPO_ROOT = Path(__file__).resolve().parent.parent
 
 # ---------------------------- ERC20 ABI (minimal) ----------------------------
 ERC20_MIN_ABI = [
@@ -193,12 +199,12 @@ def _call_with_timeout(fn, timeout_sec: int, default: Any) -> Any:
 
 # ---------------------------- command handlers (sync) -------------------------
 def cmd_start(update: Update, context: CallbackContext):
-    _reply(update, "TECBot online. Try /balances, /prices, /slippage 1ETH, /sanity, /version, /cooldowns, /plan")
+    _reply(update, "TECBot online. Try /assets, /balances, /prices, /slippage 1ETH, /sanity, /version, /cooldowns, /plan")
 
 def cmd_help(update: Update, context: CallbackContext):
     supported_syms = ", ".join(getattr(config, "TOKENS", {}).keys())
     _reply(update,
-           "/start /help /ping /balances /prices /slippage <SYMBOL> [USDC sizes…] /sanity /version /cooldowns /plan /dryrun\n"
+           "/start /help /ping /assets /balances /prices /slippage <SYMBOL> [USDC sizes…] /sanity /version /cooldowns /plan /dryrun\n"
            f"Symbols: {supported_syms}\n"
            "Examples:\n"
            "  /slippage 1ETH 10 100 1000\n"
@@ -206,6 +212,35 @@ def cmd_help(update: Update, context: CallbackContext):
 
 def cmd_ping(update: Update, context: CallbackContext):
     _reply(update, "pong")
+
+def cmd_assets(update: Update, context: CallbackContext):
+    """List configured wallet groups and their tracked symbols (static from config)."""
+    try:
+        WAL = getattr(config, "WALLETS", {})
+        TOK = getattr(config, "TOKENS", {})
+        if not isinstance(WAL, dict) or not WAL:
+            _reply(update, "No WALLETS configured in config.py")
+            return
+        defaults = {
+            "tecbot_eth":  ["ONE", "1ETH"],
+            "tecbot_usdc": ["ONE", "1USDC"],
+            "tecbot_sdai": ["ONE", "1ETH", "TEC", "1USDC"],
+            "tecbot_tec":  ["ONE", "TEC", "1sDAI"],
+        }
+        lines = ["Assets (by wallet group):"]
+        for name, val in WAL.items():
+            if isinstance(val, str):
+                disp = defaults.get(name, ["ONE"])
+            elif isinstance(val, dict):
+                disp = val.get("display") or defaults.get(name, ["ONE"])
+            else:
+                continue
+            marks = [s if s in TOK else f"{s}❓" for s in disp]
+            lines.append(f"  {name}: " + ", ".join(marks))
+        _reply(update, "\n".join(lines))
+    except Exception as e:
+        log.exception("/assets error")
+        _reply(update, f"/assets error: {e}")
 
 def cmd_balances(update: Update, context: CallbackContext):
     try:
@@ -336,45 +371,84 @@ def cmd_slippage(update: Update, context: CallbackContext):
         _reply(update, f"/slippage error: {e}")
 
 def cmd_sanity(update: Update, context: CallbackContext):
+    """
+    Run preflight checks. Supports legacy preflight.run_sanity() that PRINTS and returns None.
+    We capture stdout, parse PASS/FAIL, and always reply.
+    """
     def _do():
         if not preflight or not hasattr(preflight, "run_sanity"):
             raise RuntimeError("preflight.run_sanity() not available")
-        return preflight.run_sanity()
+        import sys
+        buf = io.StringIO()
+        old = sys.stdout
+        try:
+            sys.stdout = buf
+            res = preflight.run_sanity()  # may return dict or None
+        finally:
+            sys.stdout = old
+        return (res, buf.getvalue().strip())
 
-    res = _call_with_timeout(_do, SANITY_TIMEOUT_SEC, default=None)
-    if isinstance(res, Exception):
-        _reply(update, f"Sanity: FAILED\n{res}")
-        return
-    if res is None:
+    out = _call_with_timeout(_do, SANITY_TIMEOUT_SEC, default=None)
+    if isinstance(out, TimeoutError):
         _reply(update, f"Sanity: FAILED\nTimed out after {SANITY_TIMEOUT_SEC}s")
         return
+    if isinstance(out, Exception) or out is None:
+        _reply(update, f"Sanity: FAILED\n{out or 'No result'}")
+        return
 
-    try:
-        ok = res.get("ok", False)
-        summary = res.get("summary", "")
-        details = res.get("details", [])
-        msg = f"Sanity: {'OK' if ok else 'FAILED'}\n{summary}"
-        if details:
-            msg += "\n\nDetails:\n" + "\n".join(f"- {d}" for d in details)
-        _reply(update, msg)
-    except Exception as e:
-        log.exception("/sanity format error")
-        _reply(update, f"Sanity: FAILED\n{e}")
+    res, printed = out
+    if isinstance(res, dict) and res:
+        try:
+            ok = res.get("ok", False)
+            summary = res.get("summary", "")
+            details = res.get("details", [])
+            msg = f"Sanity: {'OK' if ok else 'FAILED'}\n{summary}"
+            if details:
+                msg += "\n\nDetails:\n" + "\n".join(f"- {d}" for d in details)
+            _reply(update, msg)
+            return
+        except Exception:
+            pass
+
+    # Parse the printed output (e.g., "OVERALL: ✅ PASS")
+    txt = printed or ""
+    ok = bool(re.search(r"OVERALL:\s*(✅\s*PASS|PASS)", txt, re.IGNORECASE))
+    lines = [ln for ln in txt.splitlines() if ln.strip()]
+    summary = lines[-1] if lines else "preflight completed."
+    _reply(update, f"Sanity: {'OK' if ok else 'FAILED'}\n{summary}")
 
 def _git(cmd: list[str]) -> str:
     try:
-        out = subprocess.check_output(cmd, stderr=subprocess.DEVNULL).decode().strip()
+        # Use repo root so git finds .git even though WorkingDirectory=/bot/app
+        return subprocess.check_output(cmd, stderr=subprocess.DEVNULL, cwd=str(REPO_ROOT)).decode().strip()
     except Exception:
-        out = ""
-    return out
+        return ""
+
+def _changelog_headline() -> str:
+    try:
+        p = REPO_ROOT / "changelog.md"
+        if p.exists():
+            with p.open("r", encoding="utf-8", errors="ignore") as f:
+                for ln in f:
+                    ln = ln.strip()
+                    if ln:
+                        return ln[:120]
+    except Exception:
+        pass
+    return ""
 
 def cmd_version(update: Update, context: CallbackContext):
-    tag = _git(["git", "describe", "--tags", "--abbrev=0"])
-    rev = _git(["git", "rev-parse", "--short", "HEAD"])
-    dirty = _git(["git", "status", "--porcelain"])
+    # Explicit /usr/bin/git based on your systemd PATH dump
+    tag = _git(["/usr/bin/git", "describe", "--tags", "--abbrev=0"])
+    rev = _git(["/usr/bin/git", "rev-parse", "--short", "HEAD"])
+    dirty = _git(["/usr/bin/git", "status", "--porcelain"])
     marker = "" if not dirty else " (dirty)"
-    text = f"Version: {tag or 'no-tag'} @ {rev or 'unknown'}{marker}"
-    _reply(update, text)
+    if not tag and not rev:
+        head = _changelog_headline()
+        if head:
+            _reply(update, f"Version: (no git) • {head}")
+            return
+    _reply(update, f"Version: {tag or 'no-tag'} @ {rev or 'unknown'}{marker}")
 
 def _read_text_if_exists(paths: List[Path]) -> Optional[str]:
     for p in paths:
@@ -436,6 +510,7 @@ def main():
     dp.add_handler(CommandHandler("start", cmd_start))
     dp.add_handler(CommandHandler("help", cmd_help))
     dp.add_handler(CommandHandler("ping", cmd_ping))
+    dp.add_handler(CommandHandler("assets", cmd_assets))
     dp.add_handler(CommandHandler("balances", cmd_balances))
     dp.add_handler(CommandHandler("prices", cmd_prices))
     dp.add_handler(CommandHandler("slippage", cmd_slippage))
