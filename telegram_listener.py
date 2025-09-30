@@ -366,22 +366,22 @@ def cmd_slippage(update: Update, context: CallbackContext):
         log.exception("/slippage format error")
         _reply(update, f"/slippage error: {e}")
 
-# -------- Sanity via subprocess (captures stdout/stderr reliably) ------------
+# -------- Sanity via subprocess (single-line ASCII -c to avoid SyntaxError) ---
 def _run_preflight_subprocess(timeout_sec: int) -> Tuple[int, str]:
     """
-    Execute: python -c "import app.preflight as p; p.run_sanity()"
+    Execute: python -c "<one-line>" to run app.preflight.run_sanity()
     Capture stdout+stderr; return (exit_code, combined_output).
     """
-    cmd = [
-        sys.executable,
-        "-c",
-        "import app.preflight as p; p.run_sanity()"
-    ]
+    one_liner = (
+        "import app.preflight as p,sys,json; "
+        "res=p.run_sanity(); "
+        "print('__JSON__:'+json.dumps(res)) if isinstance(res,dict) else None"
+    )
     env = os.environ.copy()
     env["PYTHONPATH"] = str(REPO_ROOT)  # ensure app.* is importable
     try:
         p = subprocess.run(
-            cmd,
+            [sys.executable, "-c", one_liner],
             cwd=str(REPO_ROOT / "app"),
             env=env,
             stdout=subprocess.PIPE,
@@ -402,10 +402,39 @@ def cmd_sanity(update: Update, context: CallbackContext):
     if rc != 0 and not out:
         _reply(update, "Sanity: FAILED\nNo output from preflight.")
         return
+
+    # Try JSON line first (if preflight returned a dict)
+    m = re.search(r"__JSON__:(\{.*\})", out)
+    if m:
+        try:
+            import json
+            data = json.loads(m.group(1))
+            ok = bool(data.get("ok", False))
+            summary = data.get("summary", "") or "preflight completed."
+            details = data.get("details", []) or []
+            msg = f"Sanity: {'OK' if ok else 'FAILED'}\n{summary}"
+            if details:
+                msg += "\n\nDetails:\n" + "\n".join(f"- {d}" for d in details)
+            _reply(update, msg)
+            return
+        except Exception:
+            pass
+
+    # If the subprocess printed a Python traceback or SyntaxError, include enough to debug.
+    if "Traceback (most recent call last)" in out or "SyntaxError:" in out:
+        snippet = "\n".join(out.splitlines()[-20:])  # last 20 lines for context
+        _reply(update, f"Sanity: FAILED\n{subsnippet(snippet)}")
+        return
+
+    # Fallback: parse printed/logged output
     ok = bool(re.search(r"OVERALL:\s*(✅\s*PASS|PASS)", out, re.IGNORECASE))
-    lines = [ln for ln in (out or "").splitlines() if ln.strip()]
+    lines = [ln for ln in out.splitlines() if ln.strip()]
     summary = lines[-1] if lines else "preflight completed."
     _reply(update, f"Sanity: {'OK' if ok else 'FAILED'}\n{summary}")
+
+def _subsnippet(s: str, limit: int = 1500) -> str:
+    """Trim long error text to keep Telegram happy."""
+    return s if len(s) <= limit else s[-limit:]
 
 # ---------------------------- version helpers --------------------------------
 def _git(args: List[str]) -> str:
@@ -430,12 +459,10 @@ def _changelog_headline() -> str:
 def cmd_version(update: Update, context: CallbackContext):
     tag = rev = dirty = ""
     if GIT_DIR.exists():
-        # Prefer explicit --git-dir so it works regardless of WorkingDirectory
         tag   = _git(["/usr/bin/git", f"--git-dir={GIT_DIR}", "describe", "--tags", "--abbrev=0"])
         rev   = _git(["/usr/bin/git", f"--git-dir={GIT_DIR}", "rev-parse", "--short", "HEAD"])
         dirty = _git(["/usr/bin/git", f"--git-dir={GIT_DIR}", "status", "--porcelain"])
     else:
-        # Try normal git (will fail cleanly if not a repo)
         tag   = _git(["/usr/bin/git", "describe", "--tags", "--abbrev=0"])
         rev   = _git(["/usr/bin/git", "rev-parse", "--short", "HEAD"])
         dirty = _git(["/usr/bin/git", "status", "--porcelain"])
@@ -462,7 +489,6 @@ def _read_text_if_exists(paths: List[Path]) -> Optional[str]:
     return None
 
 def cmd_plan(update: Update, context: CallbackContext):
-    # Try to read a short plan excerpt from local repo docs so it always replies.
     here = Path(__file__).resolve().parent
     roots = [here, here.parent]  # /bot/app and /bot
     candidates = []
@@ -480,4 +506,52 @@ def cmd_plan(update: Update, context: CallbackContext):
     snippet = "\n".join(lines[:MAX_PLAN_LINES]).strip()
     _reply(update, f"Plan (preview):\n{snippet}\n\n(Showing first {MAX_PLAN_LINES} lines)")
 
-def cmd_cooldowns(update:
+def cmd_cooldowns(update: Update, context: CallbackContext):
+    data = getattr(config, "COOLDOWNS_DEFAULTS", {})
+    if not isinstance(data, dict) or not data:
+        _reply(update, "No default cooldowns configured.")
+        return
+    lines = ["Default cooldowns (seconds):"]
+    for k, v in data.items():
+        lines.append(f"  {k}: {v}")
+    _reply(update, "\n".join(lines))
+
+def cmd_dryrun(update: Update, context: CallbackContext):
+    _reply(update, "Dry-run is not enabled in this build. (No trades will be simulated.)")
+
+def cmd_unknown(update: Update, context: CallbackContext):
+    if update and update.message and update.message.text and update.message.text.startswith("/"):
+        _reply(update, f"Unknown command: {update.message.text}")
+
+# ---------------------------- main bootstrap ----------------------------------
+def main():
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    if not token:
+        raise SystemExit("TELEGRAM_BOT_TOKEN not set")
+
+    os.environ.setdefault("PYTHONPATH", str(REPO_ROOT))
+
+    updater = Updater(token=token, use_context=True)
+    dp = updater.dispatcher
+
+    dp.add_handler(CommandHandler("start", cmd_start))
+    dp.add_handler(CommandHandler("help", cmd_help))
+    dp.add_handler(CommandHandler("ping", cmd_ping))
+    dp.add_handler(CommandHandler("assets", cmd_assets))
+    dp.add_handler(CommandHandler("balances", cmd_balances))
+    dp.add_handler(CommandHandler("prices", cmd_prices))
+    dp.add_handler(CommandHandler("slippage", cmd_slippage))
+    dp.add_handler(CommandHandler("sanity", cmd_sanity))
+    dp.add_handler(CommandHandler("version", cmd_version))
+    dp.add_handler(CommandHandler("cooldowns", cmd_cooldowns))
+    dp.add_handler(CommandHandler("plan", cmd_plan))
+    dp.add_handler(CommandHandler("dryrun", cmd_dryrun))
+
+    dp.add_handler(MessageHandler(Filters.command, cmd_unknown))
+
+    log.info("Telegram bot started")
+    updater.start_polling()
+    updater.idle()
+
+if __name__ == "__main__":
+    main()
