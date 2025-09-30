@@ -26,8 +26,8 @@ import subprocess
 import threading
 from pathlib import Path
 from typing import Dict, Any, Iterable, Tuple, List, Optional
-
 from decimal import Decimal
+
 from web3 import Web3
 
 # web3.py v5 vs v6 PoA middleware compatibility
@@ -39,21 +39,25 @@ except Exception:
     except Exception:
         _POA_MIDDLEWARE = None
 
-# Telegram (pre-v20)
+# Telegram (pre-v20 API)
 from telegram import Update
 from telegram.ext import Updater, CommandHandler, CallbackContext, MessageHandler, Filters
 
-# ------- local imports (support both flat and app.* package styles) ----------
+# ---------------------------- repo root ---------------------------------------
+# This file lives at repo root (/bot). If it were nested, .parent handles it.
+REPO_ROOT = Path(__file__).resolve().parent
+GIT_DIR = REPO_ROOT / ".git"
+
+# ------- local imports (support both flat and legacy app.* package styles) ----
 def _imp(modname: str):
     try:
-        return __import__(modname, fromlist=['*'])
+        return __import__(modname, fromlist=["*"])
     except Exception:
-        return __import__(f"app.{modname}", fromlist=['*'])
+        return __import__(f"app.{modname}", fromlist=["*"])
 
 config = _imp("config")
 wallet = _imp("wallet")
 
-# Optional modules; handlers will degrade gracefully if missing
 try:
     price_feed = _imp("price_feed")
 except Exception:
@@ -77,10 +81,6 @@ SANITY_TIMEOUT_SEC = 12  # headroom for subprocess spawn
 SLIPPAGE_TIMEOUT_SEC = 8
 MAX_PLAN_LINES = 40
 
-# Repo root (this file is in /bot/app; .git is in /bot)
-REPO_ROOT = Path(__file__).resolve().parent.parent
-GIT_DIR = REPO_ROOT / ".git"
-
 # ---------------------------- ERC20 ABI (minimal) ----------------------------
 ERC20_MIN_ABI = [
     {"constant": True, "inputs": [{"name": "owner", "type": "address"}],
@@ -94,7 +94,7 @@ ERC20_MIN_ABI = [
 
 # ---------------------------- helpers ----------------------------------------
 def _get_w3() -> Web3:
-    """Prefer HARMONY_RPC if present; fall back to RPC_URL; finally default to api.harmony.one."""
+    """Prefer wallet.get_w3() if available; otherwise use HARMONY_RPC/RPC_URL."""
     if hasattr(wallet, "get_w3"):
         w3 = wallet.get_w3()
     else:
@@ -116,10 +116,9 @@ def _checksum(w3: Web3, addr: str) -> str:
 def _iter_wallet_groups_from_config(cfg) -> Iterable[Tuple[str, str, List[str]]]:
     """
     Yields (group_name, evm_address, display_list) from cfg.WALLETS.
-    Accepts either:
-      WALLETS = {"tecbot_eth": "0x..."}                           # simple form
-    or:
-      WALLETS = {"tecbot_eth": {"address":"0x...","display":[…]}} # rich form
+    Accepts:
+      WALLETS = {"tecbot_eth": "0x..."}                           # simple
+      WALLETS = {"tecbot_eth": {"address":"0x...","display":[…]}} # rich
     """
     WAL = getattr(cfg, "WALLETS", None)
     if not WAL or not isinstance(WAL, dict):
@@ -210,7 +209,6 @@ def cmd_ping(update: Update, context: CallbackContext):
     _reply(update, "pong")
 
 def cmd_assets(update: Update, context: CallbackContext):
-    """List configured wallet groups and their tracked symbols (static from config)."""
     try:
         WAL = getattr(config, "WALLETS", {})
         TOK = getattr(config, "TOKENS", {})
@@ -246,14 +244,12 @@ def cmd_balances(update: Update, context: CallbackContext):
             _reply(update, "No wallet groups configured.")
             return
 
-        # Symbol -> token address
         tok_addr = {s: _get_token_address(s) for s in ["1ETH", "1USDC", "1sDAI", "TEC"]}
 
         lines: List[str] = []
         for name, address, display in groups:
             cs_addr = _checksum(w3, address)
             lines.append(f"{name}")
-            # ONE balance always included
             one_bal = _get_one_balance(w3, cs_addr)
             lines.append(f"  ONE   {_fmt_qty(one_bal, 4)}")
 
@@ -267,7 +263,7 @@ def cmd_balances(update: Update, context: CallbackContext):
                 bal = _get_erc20_balance(w3, taddr, cs_addr, decs)
                 lines.append(f"  {sym:<5} {_fmt_qty(bal, 4)}")
 
-            lines.append("")  # spacer
+            lines.append("")
 
         _reply(update, "\n".join(lines).rstrip())
 
@@ -366,23 +362,30 @@ def cmd_slippage(update: Update, context: CallbackContext):
         log.exception("/slippage format error")
         _reply(update, f"/slippage error: {e}")
 
-# -------- Sanity via subprocess (single-line ASCII -c to avoid SyntaxError) ---
+# -------------------- Sanity via subprocess (repo-root aware) -----------------
 def _run_preflight_subprocess(timeout_sec: int) -> Tuple[int, str]:
     """
-    Execute: python -c "<one-line>" to run app.preflight.run_sanity()
-    Capture stdout+stderr; return (exit_code, combined_output).
+    Execute a small inline script that tries flat import first, then legacy app.*.
+    Runs from REPO_ROOT and prints a JSON line on success.
     """
     one_liner = (
-        "import app.preflight as p,sys,json; "
+        "import sys,json,os; "
+        "from pathlib import Path; "
+        "root=Path(__file__).resolve().parent; "
+        "sys.path.insert(0,str(root)); "
+        "try:\n"
+        " import preflight as p\n"
+        "except Exception:\n"
+        " import app.preflight as p\n"
         "res=p.run_sanity(); "
         "print('__JSON__:'+json.dumps(res)) if isinstance(res,dict) else None"
     )
     env = os.environ.copy()
-    env["PYTHONPATH"] = str(REPO_ROOT)  # ensure app.* is importable
+    env["PYTHONPATH"] = str(REPO_ROOT)
     try:
         p = subprocess.run(
             [sys.executable, "-c", one_liner],
-            cwd=str(REPO_ROOT / "app"),
+            cwd=str(REPO_ROOT),
             env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -403,7 +406,6 @@ def cmd_sanity(update: Update, context: CallbackContext):
         _reply(update, "Sanity: FAILED\nNo output from preflight.")
         return
 
-    # Try JSON line first (if preflight returned a dict)
     m = re.search(r"__JSON__:(\{.*\})", out)
     if m:
         try:
@@ -420,20 +422,17 @@ def cmd_sanity(update: Update, context: CallbackContext):
         except Exception:
             pass
 
-    # If the subprocess printed a Python traceback or SyntaxError, include enough to debug.
     if "Traceback (most recent call last)" in out or "SyntaxError:" in out:
-        snippet = "\n".join(out.splitlines()[-20:])  # last 20 lines for context
-        _reply(update, f"Sanity: FAILED\n{subsnippet(snippet)}")
+        snippet = "\n".join(out.splitlines()[-20:])
+        _reply(update, f"Sanity: FAILED\n{_subsnippet(snippet)}")
         return
 
-    # Fallback: parse printed/logged output
     ok = bool(re.search(r"OVERALL:\s*(✅\s*PASS|PASS)", out, re.IGNORECASE))
     lines = [ln for ln in out.splitlines() if ln.strip()]
     summary = lines[-1] if lines else "preflight completed."
     _reply(update, f"Sanity: {'OK' if ok else 'FAILED'}\n{summary}")
 
 def _subsnippet(s: str, limit: int = 1500) -> str:
-    """Trim long error text to keep Telegram happy."""
     return s if len(s) <= limit else s[-limit:]
 
 # ---------------------------- version helpers --------------------------------
@@ -489,9 +488,8 @@ def _read_text_if_exists(paths: List[Path]) -> Optional[str]:
     return None
 
 def cmd_plan(update: Update, context: CallbackContext):
-    here = Path(__file__).resolve().parent
-    roots = [here, here.parent]  # /bot/app and /bot
-    candidates = []
+    roots = [REPO_ROOT]
+    candidates: List[Path] = []
     for root in roots:
         candidates += [
             root / "Project_overview.md",
