@@ -383,7 +383,6 @@ def cmd_sanity(update: Update, context: CallbackContext):
         _reply(update, "Sanity: FAILED\nNo output from preflight.")
         return
 
-    # Try to parse a PASS/FAIL line; otherwise show the tail of output
     ok = bool(re.search(r"OVERALL:\s*(✅\s*PASS|PASS)", out, re.IGNORECASE))
     lines = [ln for ln in out.splitlines() if ln.strip()]
     summary = lines[-1] if lines else "preflight completed."
@@ -447,6 +446,13 @@ def cmd_unknown(update: Update, context: CallbackContext):
     if update and update.message and update.message.text and update.message.text.startswith("/"):
         _reply(update, f"Unknown command: {update.message.text}")
 
+# ---------------------------- error handler ----------------------------------
+def _on_error(update: Optional[Update], context: CallbackContext):
+    try:
+        raise context.error
+    except Exception:
+        log.exception("Unhandled error in handler")
+
 # ---------------------------- main bootstrap ----------------------------------
 def main():
     token = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -473,6 +479,9 @@ def main():
 
     # keep catch-all LAST
     dp.add_handler(MessageHandler(Filters.command, cmd_unknown))
+
+    # one global error handler
+    dp.add_error_handler(_on_error)
 
     log.info("Telegram bot started")
     updater.start_polling()
