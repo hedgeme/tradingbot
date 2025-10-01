@@ -59,3 +59,36 @@ COOLDOWNS_DEFAULTS = {
     "trade_retry": 30,
     "alert_throttle": 60,
 }
+
+# --- TECBot: additive flags for /plan, /dryrun, /cooldowns ---
+
+import os
+
+# Toggle dry-run feature from config or environment (default True to enable /dryrun)
+DRYRUN_ENABLED = bool(str(os.getenv("TECBOT_DRYRUN_ENABLED", "true")).lower() in ("1", "true", "yes"))
+
+# Telegram admin user IDs allowed to press Execute buttons (comma-separated in env, e.g., "123,456")
+try:
+    ADMIN_USER_IDS = [int(x.strip()) for x in (os.getenv("TECBOT_ADMIN_USER_IDS", "").split(",")) if x.strip()]
+except Exception:
+    ADMIN_USER_IDS = []
+
+# Cooldown defaults and optional overrides (read by /cooldowns)
+COOLDOWNS_DEFAULTS = dict(
+    price_refresh=int(os.getenv("TECBOT_CD_PRICE_REFRESH", "15")),
+    trade_retry=int(os.getenv("TECBOT_CD_TRADE_RETRY", "30")),
+    alert_throttle=int(os.getenv("TECBOT_CD_ALERT_THROTTLE", "60")),
+)
+
+# Optional per-bot overrides: {"tecbot_eth": {"trade_retry": 120}, ...}
+COOLDOWNS_BY_BOT = COOLDOWNS_BY_BOT if 'COOLDOWNS_BY_BOT' in globals() else {}
+
+# Optional per-route overrides: {"1ETH/WONE@3000": {"trade_retry": 180}, ...}
+COOLDOWNS_BY_ROUTE = COOLDOWNS_BY_ROUTE if 'COOLDOWNS_BY_ROUTE' in globals() else {}
+
+
+export TECBOT_DRYRUN_ENABLED=true
+export TECBOT_ADMIN_USER_IDS="1539031664"
+export TECBOT_CD_PRICE_REFRESH=15
+export TECBOT_CD_TRADE_RETRY=30
+export TECBOT_CD_ALERT_THROTTLE=60
