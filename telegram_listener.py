@@ -10,9 +10,9 @@ Commands:
   /prices     - LP prices + ETH Coinbase comparison (time-boxed, never hangs)
   /slippage   - slippage curve for a token vs USDC (time-boxed)
   /sanity     - run preflight checks (subprocess w/ timeout; parse PASS/FAIL)
-  /version    - show deployed git version (robust fallbacks)
+  /version    - show deployed git version
   /cooldowns  - show default cooldowns from config.py
-  /plan       - show brief plan (reads local repo docs); always replies
+  /plan       - show brief plan (reads local repo docs)
   /dryrun     - explicit stub so it never fails silently
 """
 
@@ -168,6 +168,7 @@ def _get_erc20_balance(w3: Web3, token_addr: str, holder: str, decimals: int) ->
     bal = c.functions.balanceOf(_checksum(w3, holder)).call()
     return Decimal(bal) / Decimal(10**decimals)
 
+# --------- time-box wrappers to guarantee a response (no silent hangs) -------
 def _call_with_timeout(fn, timeout_sec: int, default: Any) -> Any:
     box = {"res": default}
     def runner():
@@ -190,15 +191,167 @@ def cmd_help(update: Update, context: CallbackContext):
     supported_syms = ", ".join(getattr(config, "TOKENS", {}).keys())
     _reply(update,
            "/start /help /ping /assets /balances /prices /slippage <SYMBOL> [USDC sizes…] /sanity /version /cooldowns /plan /dryrun\n"
-           f"Symbols: {supported_syms}\n")
+           f"Symbols: {supported_syms}\n"
+           "Examples:\n"
+           "  /slippage 1ETH 10 100 1000\n"
+           "  /slippage TEC 50 200 1000")
 
 def cmd_ping(update: Update, context: CallbackContext):
     _reply(update, "pong")
 
-# (assets, balances, prices, slippage — unchanged, omitted here for brevity)
-# ------------------------------------------------------------------------------
+def cmd_assets(update: Update, context: CallbackContext):
+    try:
+        WAL = getattr(config, "WALLETS", {})
+        TOK = getattr(config, "TOKENS", {})
+        if not isinstance(WAL, dict) or not WAL:
+            _reply(update, "No WALLETS configured in config.py")
+            return
+        defaults = {
+            "tecbot_eth":  ["ONE", "1ETH"],
+            "tecbot_usdc": ["ONE", "1USDC"],
+            "tecbot_sdai": ["ONE", "1ETH", "TEC", "1USDC"],
+            "tecbot_tec":  ["ONE", "TEC", "1sDAI"],
+        }
+        lines = ["Assets (by wallet group):"]
+        for name, val in WAL.items():
+            if isinstance(val, str):
+                disp = defaults.get(name, ["ONE"])
+            elif isinstance(val, dict):
+                disp = val.get("display") or defaults.get(name, ["ONE"])
+            else:
+                continue
+            marks = [s if s in TOK else f"{s}❓" for s in disp]
+            lines.append(f"  {name}: " + ", ".join(marks))
+        _reply(update, "\n".join(lines))
+    except Exception as e:
+        log.exception("/assets error")
+        _reply(update, f"/assets error: {e}")
 
-# -------------------- Sanity via subprocess (fixed) ---------------------------
+def cmd_balances(update: Update, context: CallbackContext):
+    try:
+        w3 = _get_w3()
+        groups = list(_iter_wallet_groups_from_config(config))
+        if not groups:
+            _reply(update, "No wallet groups configured.")
+            return
+
+        tok_addr = {s: _get_token_address(s) for s in ["1ETH", "1USDC", "1sDAI", "TEC"]}
+
+        lines: List[str] = []
+        for name, address, display in groups:
+            cs_addr = _checksum(w3, address)
+            lines.append(f"{name}")
+            one_bal = _get_one_balance(w3, cs_addr)
+            lines.append(f"  ONE   {_fmt_qty(one_bal, 4)}")
+
+            for sym in display:
+                if sym == "ONE":
+                    continue
+                taddr = tok_addr.get(sym)
+                if not taddr:
+                    continue
+                decs = _get_decimals(sym, 18 if sym != "1USDC" else 6)
+                bal = _get_erc20_balance(w3, taddr, cs_addr, decs)
+                lines.append(f"  {sym:<5} {_fmt_qty(bal, 4)}")
+
+            lines.append("")
+        _reply(update, "\n".join(lines).rstrip())
+    except Exception as e:
+        log.exception("/balances error")
+        _reply(update, f"/balances error: {e}")
+
+def cmd_prices(update: Update, context: CallbackContext):
+    def _do():
+        if not price_feed or not hasattr(price_feed, "get_prices"):
+            raise RuntimeError("price_feed.get_prices() not available.")
+        return price_feed.get_prices()
+
+    res = _call_with_timeout(_do, PRICES_TIMEOUT_SEC, default=None)
+    if isinstance(res, Exception):
+        _reply(update, f"/prices error: {res}")
+        return
+    if res is None:
+        _reply(update, f"/prices error: timed out after {PRICES_TIMEOUT_SEC}s")
+        return
+
+    try:
+        data: Dict[str, Any] = res
+        err = data.get("errors", [])
+        ethc = data.get("ETH_COMPARE", {}) or {}
+        lp = ethc.get("lp_eth_usd")
+        cb = ethc.get("cb_eth_usd")
+        df = ethc.get("diff_pct")
+
+        lines = ["LP Prices"]
+        for sym in ["ONE", "1USDC", "1sDAI", "TEC", "1ETH"]:
+            v = data.get(sym, None)
+            lines.append(f"  {sym:<5}  {_fmt_usd(v)}" if v is not None else f"  {sym:<5}  —")
+        lines += [
+            "",
+            "ETH: Harmony LP vs Coinbase",
+            f"  LP:       {_fmt_usd(lp)}",
+            f"  Coinbase: {_fmt_usd(cb)}",
+            f"  Diff:     {('%.2f' % df) + '%' if df == df else '—'}"
+        ]
+        if err:
+            lines.append("")
+            lines.append("Notes:")
+            lines.extend([f"  - {m}" for m in err])
+
+        _reply(update, "\n".join(lines))
+    except Exception as e:
+        log.exception("/prices format error")
+        _reply(update, f"/prices error: {e}")
+
+def cmd_slippage(update: Update, context: CallbackContext):
+    """Usage: /slippage 1ETH [10 100 1000]  -> USDC targets"""
+    args = (update.message.text.split()[1:] if update and update.message and update.message.text else [])
+    if not args:
+        _reply(update, "Usage: /slippage <SYMBOL> [USDC sizes…]\nEx: /slippage 1ETH 10 100 1000")
+        return
+    sym = args[0].strip()
+    try:
+        sizes = [float(x) for x in args[1:]] if len(args) > 1 else [10, 100, 1000, 10000]
+    except Exception:
+        sizes = [10, 100, 1000, 10000]
+
+    def _do():
+        if not price_feed or not hasattr(price_feed, "get_slippage_curve"):
+            raise RuntimeError("price_feed.get_slippage_curve() not available.")
+        return price_feed.get_slippage_curve(sym, sizes)
+
+    res = _call_with_timeout(_do, SLIPPAGE_TIMEOUT_SEC, default=None)
+    if isinstance(res, Exception):
+        _reply(update, f"/slippage error: {res}")
+        return
+    if res is None:
+        _reply(update, f"/slippage error: timed out after {SLIPPAGE_TIMEOUT_SEC}s")
+        return
+
+    try:
+        mid = res.get("mid_usdc_per_sym", None)
+        rows = res.get("rows", [])
+        errs = res.get("errors", [])
+        lines = [f"Slippage curve: {sym} → USDC",
+                 f"Baseline (mid): {_fmt_usd(mid) if mid is not None else '—'} per {sym}",
+                 "",
+                 "Size (USDC) | Amount In (sym) | Eff. Price | Slippage vs mid"]
+        for r in rows:
+            usdc = r["usdc"]
+            amt  = r["amount_in_sym"]
+            px   = r["px_eff"]
+            sl   = r["slippage_pct"]
+            lines.append(f"{usdc:>10,.0f} | {('%.6f' % amt) if amt else '—':>15} | "
+                         f"{_fmt_usd(px):>10} | {(('%.2f' % sl)+'%') if sl is not None else '—':>8}")
+        if errs:
+            lines += ["", "Notes:"]
+            lines += [f"  - {e}" for e in errs]
+        _reply(update, "\n".join(lines))
+    except Exception as e:
+        log.exception("/slippage format error")
+        _reply(update, f"/slippage error: {e}")
+
+# -------------------- Sanity via subprocess (repo-root aware) -----------------
 def _run_preflight_subprocess(timeout_sec: int) -> Tuple[int, str]:
     """
     Run the repo's sanity script directly from the repo root.
@@ -229,6 +382,8 @@ def cmd_sanity(update: Update, context: CallbackContext):
     if rc != 0 and not out:
         _reply(update, "Sanity: FAILED\nNo output from preflight.")
         return
+
+    # Try to parse a PASS/FAIL line; otherwise show the tail of output
     ok = bool(re.search(r"OVERALL:\s*(✅\s*PASS|PASS)", out, re.IGNORECASE))
     lines = [ln for ln in out.splitlines() if ln.strip()]
     summary = lines[-1] if lines else "preflight completed."
@@ -250,7 +405,49 @@ def cmd_version(update: Update, context: CallbackContext):
     marker = "" if not dirty else " (dirty)"
     _reply(update, f"Version: {tag or 'no-tag'} @ {rev or 'unknown'}{marker}")
 
-# ---------------------------- bootstrap --------------------------------------
+# ---------------------------- docs & misc ------------------------------------
+def _read_text_if_exists(paths: List[Path]) -> Optional[str]:
+    for p in paths:
+        try:
+            if p.exists() and p.is_file():
+                with p.open("r", encoding="utf-8", errors="ignore") as f:
+                    return f.read()
+        except Exception:
+            continue
+    return None
+
+def cmd_plan(update: Update, context: CallbackContext):
+    candidates = [
+        REPO_ROOT / "Project_overview.md",
+        REPO_ROOT / "BOT_ARCHITECTURE.md",
+        REPO_ROOT / "README.md",
+    ]
+    txt = _read_text_if_exists(candidates)
+    if not txt:
+        _reply(update, "Plan: repo docs not found locally.")
+        return
+    lines = [ln.rstrip() for ln in txt.splitlines()]
+    snippet = "\n".join(lines[:MAX_PLAN_LINES]).strip()
+    _reply(update, f"Plan (preview):\n{snippet}\n\n(Showing first {MAX_PLAN_LINES} lines)")
+
+def cmd_cooldowns(update: Update, context: CallbackContext):
+    data = getattr(config, "COOLDOWNS_DEFAULTS", {})
+    if not isinstance(data, dict) or not data:
+        _reply(update, "No default cooldowns configured.")
+        return
+    lines = ["Default cooldowns (seconds):"]
+    for k, v in data.items():
+        lines.append(f"  {k}: {v}")
+    _reply(update, "\n".join(lines))
+
+def cmd_dryrun(update: Update, context: CallbackContext):
+    _reply(update, "Dry-run is not enabled in this build. (No trades will be simulated.)")
+
+def cmd_unknown(update: Update, context: CallbackContext):
+    if update and update.message and update.message.text and update.message.text.startswith("/"):
+        _reply(update, f"Unknown command: {update.message.text}")
+
+# ---------------------------- main bootstrap ----------------------------------
 def main():
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
@@ -264,9 +461,18 @@ def main():
     dp.add_handler(CommandHandler("start", cmd_start))
     dp.add_handler(CommandHandler("help", cmd_help))
     dp.add_handler(CommandHandler("ping", cmd_ping))
+    dp.add_handler(CommandHandler("assets", cmd_assets))
+    dp.add_handler(CommandHandler("balances", cmd_balances))
+    dp.add_handler(CommandHandler("prices", cmd_prices))
+    dp.add_handler(CommandHandler("slippage", cmd_slippage))
     dp.add_handler(CommandHandler("sanity", cmd_sanity))
     dp.add_handler(CommandHandler("version", cmd_version))
-    dp.add_handler(MessageHandler(Filters.command, lambda u, c: _reply(u, f"Unknown command: {u.message.text}")))
+    dp.add_handler(CommandHandler("cooldowns", cmd_cooldowns))
+    dp.add_handler(CommandHandler("plan", cmd_plan))
+    dp.add_handler(CommandHandler("dryrun", cmd_dryrun))
+
+    # keep catch-all LAST
+    dp.add_handler(MessageHandler(Filters.command, cmd_unknown))
 
     log.info("Telegram bot started")
     updater.start_polling()
