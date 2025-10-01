@@ -204,4 +204,164 @@ def cmd_dryrun(update: Update, context: CallbackContext) -> None:
     try:
         results = runner.build_dryrun()
     except Exception as e:
-        update.message.reply_text(f"Dry-run_
+        update.message.reply_text(f"Dry-run error: {e}")
+        return
+
+    if not results:
+        update.message.reply_text("Dry-run: no executable actions.")
+        return
+
+    # Render summary
+    text = render_dryrun(results)
+
+    # Inline buttons: one Execute per action
+    keyboard_rows = []
+    for r in results:
+        action_id = getattr(r, "action_id", None)
+        if not action_id:
+            continue
+        keyboard_rows.append([InlineKeyboardButton(f"▶️ Execute {action_id}", callback_data=f"exec:{action_id}")])
+    keyboard_rows.append([InlineKeyboardButton("❌ Cancel", callback_data="exec_cancel")])
+
+    update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard_rows), parse_mode=ParseMode.HTML)
+
+def cmd_cooldowns(update: Update, context: CallbackContext) -> None:
+    args = context.args
+    defaults = getattr(C, "COOLDOWNS_DEFAULTS", {"price_refresh": 15, "trade_retry": 30, "alert_throttle": 60})
+    by_bot = getattr(C, "COOLDOWNS_BY_BOT", {})
+    by_route = getattr(C, "COOLDOWNS_BY_ROUTE", {})
+
+    if not args:
+        lines = ["Default cooldowns (seconds):"]
+        for k, v in defaults.items():
+            lines.append(f"  {k}: {v}")
+        update.message.reply_text("\n".join(lines))
+        return
+
+    key = args[0]
+    if key in by_bot:
+        d = by_bot[key]
+        header = f"Cooldowns for {key} (seconds):"
+    elif key in by_route:
+        d = by_route[key]
+        header = f"Cooldowns for route {key} (seconds):"
+    else:
+        lines = [f"No specific cooldowns for '{key}'. Showing defaults."]
+        for k, v in defaults.items():
+            lines.append(f"  {k}: {v}")
+        update.message.reply_text("\n".join(lines))
+        return
+
+    lines = [header] + [f"  {k}: {v}" for k, v in d.items()]
+    update.message.reply_text("\n".join(lines))
+
+# --- Callback query handlers for Execute flow ---
+
+def on_exec_button(update: Update, context: CallbackContext) -> None:
+    """First press: show confirmation for a specific action."""
+    query = update.callback_query
+    data = query.data or ""
+    if not data.startswith("exec:"):
+        query.answer()
+        return
+
+    if not is_admin(query.from_user.id):
+        query.answer("Not authorized.", show_alert=True)
+        return
+
+    action_id = data.split(":", 1)[1]
+    # idempotency pre-lock (prevent spam after confirm, too)
+    lock_key = f"preconfirm:{action_id}"
+    if not _lock_once(lock_key, ttl_sec=180):
+        query.answer("Already pending.", show_alert=False)
+        return
+
+    text = f"Confirm execution: Action #{action_id}\nAre you sure?"
+    keyboard = [[
+        InlineKeyboardButton("✅ Confirm", callback_data=f"exec_go:{action_id}"),
+        InlineKeyboardButton("❌ Abort", callback_data="exec_cancel"),
+    ]]
+    query.edit_message_text(text)
+    query.edit_message_reply_markup(InlineKeyboardMarkup(keyboard))
+    query.answer()
+
+def on_exec_confirm(update: Update, context: CallbackContext) -> None:
+    """Second press: actually execute the prepared tx using runner.execute_action(action_id)."""
+    query = update.callback_query
+    data = query.data or ""
+    if not data.startswith("exec_go:"):
+        query.answer()
+        return
+
+    if not is_admin(query.from_user.id):
+        query.answer("Not authorized.", show_alert=True)
+        return
+
+    if runner is None or not hasattr(runner, "execute_action"):
+        query.answer("Execution backend missing.", show_alert=True)
+        return
+
+    action_id = data.split(":", 1)[1]
+
+    # Idempotency lock: prevent double-send
+    lock_key = f"exec:{action_id}"
+    if not _lock_once(lock_key, ttl_sec=180):
+        query.answer("Already processed.", show_alert=False)
+        return
+
+    try:
+        # Execute with exactly the params prepared by dry-run (runner should cache/lookup by action_id)
+        txr = runner.execute_action(action_id)
+        # txr should include tx hash, filled amounts, gas, explorer URL, etc.
+        tx_hash = getattr(txr, "tx_hash", "0x")
+        filled_text = getattr(txr, "filled_text", "")
+        gas_used = getattr(txr, "gas_used", "—")
+        explorer = getattr(txr, "explorer_url", "")
+        msg = (
+            f"✅ Executed {action_id}\n"
+            f"{filled_text}\n"
+            f"Gas used: {gas_used}\n"
+            f"Tx: {tx_hash}\n"
+            f"{explorer}"
+        ).strip()
+        query.edit_message_text(msg)
+        query.answer("Executed.")
+    except Exception as e:
+        query.edit_message_text(f"❌ Execution failed for {action_id}\n{e}")
+        query.answer("Failed.", show_alert=True)
+
+def on_exec_cancel(update: Update, context: CallbackContext) -> None:
+    query = update.callback_query
+    query.edit_message_text("Canceled. No transaction sent.")
+    query.answer()
+
+# --- Bootstrapping (only used if this module is run directly) ---
+
+def main():
+    token = os.environ.get("TELEGRAM_BOT_TOKEN") or getattr(C, "TELEGRAM_BOT_TOKEN", None)
+    if not token:
+        raise SystemExit("TELEGRAM_BOT_TOKEN not set in environment or app/config.py")
+
+    updater = Updater(token=token, use_context=True)
+    dp = updater.dispatcher
+
+    # Core commands
+    dp.add_handler(CommandHandler("ping", cmd_ping))
+    dp.add_handler(CommandHandler("plan", cmd_plan))
+    dp.add_handler(CommandHandler("dryrun", cmd_dryrun))
+    dp.add_handler(CommandHandler("cooldowns", cmd_cooldowns, pass_args=True))
+
+    # Keep your existing handlers for /balances, /sanity, /preflight, /prices here.
+    # Example stubs (uncomment and point to your existing implementations):
+    # dp.add_handler(CommandHandler("preflight", lambda u, c: u.message.reply_text(run_preflight() if run_preflight else "preflight not wired")))
+
+    # Callback buttons
+    dp.add_handler(CallbackQueryHandler(on_exec_button, pattern=r"^exec:[A-Za-z0-9_\-]+$"))
+    dp.add_handler(CallbackQueryHandler(on_exec_confirm, pattern=r"^exec_go:[A-Za-z0-9_\-]+$"))
+    dp.add_handler(CallbackQueryHandler(on_exec_cancel, pattern=r"^exec_cancel$"))
+
+    updater.start_polling()
+    updater.idle()
+
+if __name__ == "__main__":
+    main()
