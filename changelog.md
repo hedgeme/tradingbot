@@ -74,3 +74,19 @@ Documented in chat: *“09/23/25 Botfather /sanity”*
 
 Documented in chat: *“09/26/25 Telegram Bugs”*
 
+## 2025-10-01
+- Completed fixes for `/assets`, `/sanity`, and `/version`
+- Confirmed working in **Version: v0.1.0-ops @ f25a7a6**
+
+**Pending**
+- Fix remaining Telegram commands:
+  - `/cooldowns`
+  - `/plan`
+  - `/dryrun`
+- Begin implementation of the 4 trading strategies
+- Add `.db` integration for data persistence and reporting
+- Plan future dashboard integration (e.g., Power BI) for visualization
+
+Documented in chat: *“10/21/25 Telegram Bugs”*
+
+
