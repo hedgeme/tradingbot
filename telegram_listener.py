@@ -1,60 +1,96 @@
 #!/usr/bin/env python3
-# TECBot Telegram Listener (root entrypoint) — compatible with python-telegram-bot 13.x
+# TECBot Telegram Listener — python-telegram-bot 13.x, chain-first
 
-import os, sys, logging
+import os, sys, logging, subprocess, shlex
 from datetime import datetime, timezone
+from decimal import Decimal
+from typing import Optional
+
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ParseMode, Update
 from telegram.ext import (
     Updater, CommandHandler, CallbackQueryHandler, MessageHandler, Filters, CallbackContext
 )
 
+# ---------- Logging ----------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
 log = logging.getLogger("telegram_listener")
 
-# Ensure /bot imports work
+# Ensure /bot imports work (root and app.* both supported)
 if "/bot" not in sys.path:
     sys.path.insert(0, "/bot")
 
-# ----- tolerant imports: app.* first, then root modules -----
+# ---------- Tolerant imports (prefer app.*, else root) ----------
 # config
 try:
-    from app import config as C  # preferred
+    from app import config as C
     log.info("Loaded config from app.config")
 except Exception:
     try:
-        import config as C       # fallback to /bot/config.py
+        import config as C
         log.info("Loaded config from root config")
     except Exception as e:
         log.exception("Failed to import config")
         raise
 
-# planner
+# optional modules (prices, balances, slippage)
+PR = BL = SL = None
+try:
+    from app import prices as PR      # on-chain Quoter
+    log.info("Loaded prices from app.prices")
+except Exception:
+    try:
+        import prices as PR
+        log.info("Loaded prices from root prices")
+    except Exception as e:
+        log.warning("prices module not available: %s", e)
+
+try:
+    from app import balances as BL    # ERC20 + native ONE
+    log.info("Loaded balances from app.balances")
+except Exception:
+    try:
+        import balances as BL
+        log.info("Loaded balances from root balances")
+    except Exception as e:
+        log.warning("balances module not available: %s", e)
+
+try:
+    from app import slippage as SL    # real slippage calc
+    log.info("Loaded slippage from app.slippage")
+except Exception:
+    try:
+        import slippage as SL
+        log.info("Loaded slippage from root slippage")
+    except Exception as e:
+        log.warning("slippage module not available: %s", e)
+
+# optional planner/runner (you may have stubs today)
 planner = None
 try:
-    from app.strategies import planner  # preferred
+    from app.strategies import planner
     log.info("Loaded planner from app.strategies.planner")
 except Exception:
     try:
-        from strategies import planner   # fallback to /bot/strategies/planner.py
+        from strategies import planner
         log.info("Loaded planner from root strategies.planner")
     except Exception as e:
-        log.warning("Planner module not available: %s", e)
+        log.warning("planner module not available: %s", e)
         planner = None
 
-# runner
 runner = None
 try:
-    from app import runner  # preferred /bot/app/runner.py
+    from app import runner
     log.info("Loaded runner from app.runner")
 except Exception:
     try:
-        import runner       # fallback /bot/runner.py
+        import runner
         log.info("Loaded runner from root runner")
     except Exception as e:
-        log.warning("Runner module not available: %s", e)
+        log.warning("runner module not available: %s", e)
         runner = None
 
-def now_iso():
+# ---------- Utilities ----------
+def now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 def is_admin(user_id: int) -> bool:
@@ -63,7 +99,18 @@ def is_admin(user_id: int) -> bool:
     except Exception:
         return False
 
-# ---------- render helpers ----------
+def _git_short_rev() -> Optional[str]:
+    try:
+        out = subprocess.check_output(shlex.split("git rev-parse --short HEAD"), cwd="/bot", stderr=subprocess.DEVNULL)
+        return out.decode().strip()
+    except Exception:
+        return None
+
+def _fmt_kv(d: dict, indent: int = 2) -> str:
+    pad = " " * indent
+    return "\n".join(f"{pad}{k}: {v}" for k, v in d.items())
+
+# ---------- Render helpers ----------
 def render_plan(actions_by_bot) -> str:
     if not actions_by_bot or not any(actions_by_bot.values()):
         return f"Plan (preview @ {now_iso()})\nNo actions proposed."
@@ -125,7 +172,7 @@ def render_dryrun(results):
         )
     return "\n".join(lines).strip()
 
-# ---------- log updates & errors so we see failures ----------
+# ---------- Meta logging ----------
 def _log_update(update: Update, context: CallbackContext):
     try:
         uid = update.effective_user.id if update.effective_user else "?"
@@ -137,7 +184,135 @@ def _log_update(update: Update, context: CallbackContext):
 def _log_error(update: object, context: CallbackContext):
     log.exception("Handler error")
 
-# ---------- commands ----------
+# ---------- Commands (meta/system) ----------
+def cmd_start(update: Update, context: CallbackContext):
+    update.message.reply_text(
+        "TECBot online.\n"
+        "Try: /help\n"
+        "Core: /plan /dryrun /cooldowns /ping\n"
+        "On-chain: /prices [SYMS…] /balances /slippage <IN> [AMOUNT] [OUT]\n"
+        "Meta: /version /sanity /assets"
+    )
+
+def cmd_help(update: Update, context: CallbackContext):
+    update.message.reply_text(
+        "Commands:\n"
+        "  /ping — health check\n"
+        "  /plan — preview proposed actions (planner)\n"
+        "  /dryrun — simulate current action(s) with Execute button (runner)\n"
+        "  /cooldowns [bot|route] — show cooldowns\n"
+        "  /prices [SYMS…] — on-chain quotes in USDC (e.g. /prices 1ETH TEC)\n"
+        "  /balances — per-wallet balances (ERC-20 + native ONE)\n"
+        "  /slippage <IN> [AMOUNT] [OUT] — live impact/minOut (default OUT=1USDC, AMOUNT=1)\n"
+        "  /assets — configured tokens & wallets\n"
+        "  /version — code version\n"
+        "  /sanity — config/modules sanity"
+    )
+
+def cmd_version(update: Update, context: CallbackContext):
+    ver = os.getenv("TECBOT_VERSION", getattr(C, "TECBOT_VERSION", "v0.1.0-ops"))
+    rev = _git_short_rev()
+    update.message.reply_text(f"Version: {ver}" + (f" · git {rev}" if rev else ""))
+
+def cmd_sanity(update: Update, context: CallbackContext):
+    details = {
+        "chain_id": getattr(C, "CHAIN_ID", "?"),
+        "rpc": getattr(C, "HARMONY_RPC", "?"),
+        "dryrun_enabled": getattr(C, "DRYRUN_ENABLED", True),
+        "admin_ids": getattr(C, "ADMIN_USER_IDS", []),
+        "tokens": len(getattr(C, "TOKENS", {})),
+        "pools_v3": len(getattr(C, "POOLS_V3", {})),
+        "slippage_default_bps": getattr(C, "SLIPPAGE_DEFAULT_BPS", 30),
+    }
+    avail = {
+        "planner_loaded": bool(planner),
+        "runner_loaded": bool(runner),
+        "prices_loaded": bool(PR),
+        "balances_loaded": bool(BL),
+        "slippage_loaded": bool(SL),
+    }
+    update.message.reply_text("Sanity:\n" + _fmt_kv(details) + "\n\nModules:\n" + _fmt_kv(avail))
+
+def cmd_assets(update: Update, context: CallbackContext):
+    tokens = getattr(C, "TOKENS", {})
+    wallets = getattr(C, "WALLETS", {})
+    lines = ["Assets:", "Tokens:"]
+    for sym, addr in tokens.items():
+        lines.append(f"  {sym}: {addr}")
+    lines.append("Wallets:")
+    for name, addr in wallets.items():
+        lines.append(f"  {name}: {addr}")
+    update.message.reply_text("\n".join(lines))
+
+# ---------- Commands (on-chain) ----------
+def cmd_prices(update: Update, context: CallbackContext):
+    if PR is None:
+        update.message.reply_text("Prices unavailable (module not loaded)."); return
+    args = (context.args or [])
+    syms = [s.upper() for s in args] if args else list(getattr(C, "TOKENS", {}).keys())
+    if len(syms) > 6:
+        syms = syms[:6]
+    try:
+        data = PR.batch_prices_usd(syms)
+    except Exception as e:
+        log.exception("prices failure")
+        update.message.reply_text(f"Prices error: {e}"); return
+    lines = [f"Prices (@ {now_iso()}) — USD per 1 token"]
+    for s in syms:
+        p = data.get(s)
+        lines.append(f"  {s}: {'—' if p is None else f'${p}'}")
+    update.message.reply_text("\n".join(lines))
+
+def cmd_balances(update: Update, context: CallbackContext):
+    if BL is None:
+        update.message.reply_text("Balances unavailable (module not loaded)."); return
+    try:
+        table = BL.all_balances()
+    except Exception as e:
+        log.exception("balances failure")
+        update.message.reply_text(f"Balances error: {e}"); return
+    lines = [f"Balances (@ {now_iso()})"]
+    for w_name, row in table.items():
+        lines.append(f"\n{w_name}:")
+        for sym, amt in row.items():
+            lines.append(f"  {sym}: {amt}")
+    update.message.reply_text("\n".join(lines))
+
+def cmd_slippage(update: Update, context: CallbackContext):
+    if SL is None:
+        update.message.reply_text("Slippage unavailable (module not loaded)."); return
+    args = context.args or []
+    default_bps = int(getattr(C, "SLIPPAGE_DEFAULT_BPS", 30))
+    if not args:
+        update.message.reply_text(
+            "Usage: /slippage <TOKEN_IN> [AMOUNT] [TOKEN_OUT]\n"
+            "Examples:\n"
+            "  /slippage 1ETH            (defaults: 1 unit to 1USDC)\n"
+            "  /slippage 1ETH 0.5 1USDC  (0.5 1ETH to 1USDC)"
+        ); return
+    token_in = args[0].upper()
+    amount = Decimal(args[1]) if len(args) >= 2 else Decimal("1")
+    token_out = args[2].upper() if len(args) >= 3 else "1USDC"
+
+    try:
+        res = SL.compute_slippage(token_in, token_out, amount, default_bps)
+    except Exception as e:
+        log.exception("slippage failure")
+        update.message.reply_text(f"Slippage error: {e}"); return
+    if not res:
+        update.message.reply_text(f"No route for {token_in} → {token_out}. Check POOLS_V3."); return
+
+    lines = [
+        f"Slippage — {token_in} → {token_out}",
+        f"Size     : {res['amount_in']} {token_in}",
+        f"UnitPx   : {res['unit_price']} {token_out}/{token_in}",
+        f"QuoteOut : {res['amount_out']} {token_out}",
+        f"Impact   : {res['impact_bps']} bps",
+        f"minOut   : {res['min_out']} {token_out}  (tolerance {default_bps} bps)",
+    ]
+    update.message.reply_text("\n".join(lines))
+
+# ---------- Commands (planner/runner) ----------
 def cmd_ping(update: Update, context: CallbackContext):
     ip_txt = "unknown"
     try:
@@ -164,18 +339,15 @@ def cmd_cooldowns(update: Update, context: CallbackContext):
     by_route = getattr(C, "COOLDOWNS_BY_ROUTE", {})
     args = context.args or []
     if not args:
-        lines = ["Default cooldowns (seconds):"] + [f"  {k}: {v}" for k, v in defaults.items()]
-        update.message.reply_text("\n".join(lines)); return
+        update.message.reply_text("Default cooldowns (seconds):\n" + _fmt_kv(defaults)); return
     key = args[0]
     if key in by_bot:
         d = by_bot[key]; header = f"Cooldowns for {key} (seconds):"
     elif key in by_route:
         d = by_route[key]; header = f"Cooldowns for route {key} (seconds):"
     else:
-        lines = [f"No specific cooldowns for '{key}'. Showing defaults."] + [f"  {k}: {v}" for k, v in defaults.items()]
-        update.message.reply_text("\n".join(lines)); return
-    lines = [header] + [f"  {k}: {v}" for k, v in d.items()]
-    update.message.reply_text("\n".join(lines))
+        update.message.reply_text(f"No specific cooldowns for '{key}'. Showing defaults.\n" + _fmt_kv(defaults)); return
+    update.message.reply_text(header + "\n" + _fmt_kv(d))
 
 def cmd_dryrun(update: Update, context: CallbackContext):
     if not getattr(C, "DRYRUN_ENABLED", True):
@@ -227,6 +399,7 @@ def on_exec_cancel(update: Update, context: CallbackContext):
     q.edit_message_text("Canceled. No transaction sent.")
     q.answer()
 
+# ---------- Main ----------
 def main():
     token = os.environ.get("TELEGRAM_BOT_TOKEN") or getattr(C, "TELEGRAM_BOT_TOKEN", None)
     if not token:
@@ -235,20 +408,30 @@ def main():
     up = Updater(token=token, use_context=True)
     dp = up.dispatcher
 
+    # Core & on-chain
+    dp.add_handler(CommandHandler("start", cmd_start))
+    dp.add_handler(CommandHandler("help", cmd_help))
+    dp.add_handler(CommandHandler("version", cmd_version))
+    dp.add_handler(CommandHandler("sanity", cmd_sanity))
+    dp.add_handler(CommandHandler("assets", cmd_assets))
+    dp.add_handler(CommandHandler("prices", cmd_prices))
+    dp.add_handler(CommandHandler("balances", cmd_balances))
+    dp.add_handler(CommandHandler("slippage", cmd_slippage, pass_args=True))
+
     dp.add_handler(CommandHandler("ping", cmd_ping))
     dp.add_handler(CommandHandler("plan", cmd_plan))
     dp.add_handler(CommandHandler("dryrun", cmd_dryrun))
     dp.add_handler(CommandHandler("cooldowns", cmd_cooldowns, pass_args=True))
 
+    # Callbacks & diagnostics
     dp.add_handler(CallbackQueryHandler(on_exec_button, pattern=r"^exec:[A-Za-z0-9_\-]+$"))
     dp.add_handler(CallbackQueryHandler(on_exec_confirm, pattern=r"^exec_go:[A-Za-z0-9_\-]+$"))
     dp.add_handler(CallbackQueryHandler(on_exec_cancel, pattern=r"^exec_cancel$"))
-
     dp.add_error_handler(_log_error)
     dp.add_handler(MessageHandler(Filters.all, _log_update), group=-1)
 
-    log.info("Handlers registered: /ping /plan /dryrun /cooldowns")
-    up.start_polling(clean=True)
+    log.info("Handlers registered: /start /help /version /sanity /assets /prices /balances /slippage /ping /plan /dryrun /cooldowns")
+    up.start_polling(clean=True)  # deprecation warning is harmless on v13
     log.info("Telegram bot started")
     up.idle()
 
