@@ -4,7 +4,12 @@ from decimal import Decimal, getcontext
 from typing import Dict, Tuple, Optional, List
 from web3 import Web3
 
-from app import config as C
+# tolerant import: app.config or root config
+try:
+    from app import config as C
+except Exception:
+    import config as C
+
 from app.chain import get_ctx
 
 getcontext().prec = 40
@@ -19,7 +24,7 @@ def _find_pool(sym_in: str, sym_out: str) -> Optional[int]:
     key1 = f"{sym_in}/{sym_out}"
     key2 = f"{sym_out}/{sym_in}"
     for label, meta in C.POOLS_V3.items():
-        if label.startswith(key1+"@") or label.startswith(key2+"@"):
+        if label.startswith(key1 + "@") or label.startswith(key2 + "@"):
             return int(meta["fee"])
     return None
 
@@ -31,7 +36,9 @@ def _quote_single(symbol_in: str, symbol_out: str, amount_in_wei: int) -> Option
     fee = _find_pool(symbol_in, symbol_out)
     if fee is None:
         return None
-    params = (token_in, token_out, fee, "0x0000000000000000000000000000000000000000", amount_in_wei, 0)
+    params = (token_in, token_out, fee,
+              "0x0000000000000000000000000000000000000000",
+              amount_in_wei, 0)
     try:
         amount_out, *_ = quoter.functions.quoteExactInputSingle(params).call()
         return int(amount_out)
