@@ -4,7 +4,12 @@ from decimal import Decimal
 from typing import Dict
 from web3 import Web3
 
-from app import config as C
+# tolerant import: app.config or root config
+try:
+    from app import config as C
+except Exception:
+    import config as C
+
 from app.chain import get_ctx
 
 def native_one_balance(wallet: str) -> Decimal:
@@ -30,7 +35,7 @@ def all_balances() -> Dict[str, Dict[str, Decimal]]:
             row["ONE(native)"] = native_one_balance(w_addr)
         except Exception:
             row["ONE(native)"] = Decimal(0)
-        # ERC-20s
+        # ERC-20 tokens
         for sym in C.TOKENS.keys():
             try:
                 row[sym] = erc20_balance(sym, w_addr)
