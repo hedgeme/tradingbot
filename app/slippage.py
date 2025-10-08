@@ -1,4 +1,4 @@
-# app/slippage.py
+# /bot/app/slippage.py
 from __future__ import annotations
 from decimal import Decimal, getcontext
 from typing import Optional
@@ -8,7 +8,6 @@ try:
 except Exception:
     import config as C
 
-# reuse helpers from prices
 from app.prices import _canon, _dec, _find_pool, _quote_single, _quote_two_hop
 
 getcontext().prec = 40
@@ -23,19 +22,27 @@ def compute_slippage(token_in: str, token_out: str, amount_in: Decimal, default_
     amt_wei = int(amount_in * (Decimal(10) ** dec_in))
 
     out_wei = _quote_single(ti, to, amt_wei)
-    if out_wei is None and _find_pool(ti, "WONE") and _find_pool("WONE", to):
-        out_wei = _quote_two_hop(ti, "WONE", to, amt_wei)
+    if out_wei is None:
+        for bridge in ("WONE", "1sDAI"):
+            if _find_pool(ti, bridge) and _find_pool(bridge, to):
+                out_wei = _quote_two_hop(ti, bridge, to, amt_wei)
+                if out_wei is not None:
+                    break
     if out_wei is None:
         return None
 
     amount_out = Decimal(out_wei) / (Decimal(10) ** dec_out)
 
-    # approximate "unit" price for no-impact reference
+    # "unit" price baseline for impact calc
     one_unit_wei = int(Decimal(10) ** dec_in)
     unit_out_wei = _quote_single(ti, to, one_unit_wei)
-    if unit_out_wei is None and _find_pool(ti, "WONE") and _find_pool("WONE", to):
-        unit_out_wei = _quote_two_hop(ti, "WONE", to, one_unit_wei)
-    unit_out = (Decimal(unit_out_wei) / (Decimal(10) ** dec_out)) if unit_out_wei else amount_out / amount_in
+    if unit_out_wei is None:
+        for bridge in ("WONE", "1sDAI"):
+            if _find_pool(ti, bridge) and _find_pool(bridge, to):
+                unit_out_wei = _quote_two_hop(ti, bridge, to, one_unit_wei)
+                if unit_out_wei is not None:
+                    break
+    unit_out = (Decimal(unit_out_wei) / (Decimal(10) ** dec_out)) if unit_out_wei else (amount_out / amount_in)
 
     implied_no_impact = unit_out * amount_in
     impact_bps = (Decimal(0) if implied_no_impact == 0
