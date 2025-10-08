@@ -4,21 +4,21 @@ from dataclasses import dataclass
 from typing import Optional
 from web3 import Web3
 
-# ---- POA middleware: handle multiple web3 versions gracefully ----
+# ---- POA middleware: support web3 v5–v7 ----
 _POA_MW = None
 try:
-    # web3 v6+ (including v7): new name & location
-    from web3.middleware.proof_of_authority import ExtraDataToPOAMiddleware  # type: ignore
+    from web3.middleware.proof_of_authority import ExtraDataToPOAMiddleware  # v6/v7
     _POA_MW = ExtraDataToPOAMiddleware
 except Exception:
     try:
-        # web3 v5 style
-        from web3.middleware import geth_poa_middleware  # type: ignore
+        from web3.middleware import geth_poa_middleware  # v5
         _POA_MW = geth_poa_middleware
     except Exception:
-        _POA_MW = None  # no POA middleware available; proceed without it
+        _POA_MW = None
 
 # ---- Minimal ABIs ----
+
+# ERC-20 read-only
 ERC20_ABI = [
     {"constant": True, "inputs": [], "name": "decimals", "outputs": [{"name":"","type":"uint8"}], "type": "function"},
     {"constant": True, "inputs": [{"name":"owner","type":"address"}], "name": "balanceOf", "outputs": [{"name":"","type":"uint256"}], "type": "function"},
@@ -26,6 +26,9 @@ ERC20_ABI = [
     {"constant": True, "inputs": [], "name": "symbol", "outputs": [{"name":"","type":"string"}], "type": "function"},
 ]
 
+# ✅ Correct Uniswap QuoterV2 ABI (NO recipient field)
+# quoteExactInputSingle((address tokenIn, address tokenOut, uint24 fee, uint256 amountIn, uint160 sqrtPriceLimitX96))
+#   -> (uint256 amountOut, uint160 sqrtPriceX96After, uint32 initializedTicksCrossed, uint256 gasEstimate)
 QUOTER_V2_ABI = [
     {
         "inputs": [{
@@ -33,7 +36,6 @@ QUOTER_V2_ABI = [
                 {"internalType":"address","name":"tokenIn","type":"address"},
                 {"internalType":"address","name":"tokenOut","type":"address"},
                 {"internalType":"uint24","name":"fee","type":"uint24"},
-                {"internalType":"address","name":"recipient","type":"address"},
                 {"internalType":"uint256","name":"amountIn","type":"uint256"},
                 {"internalType":"uint160","name":"sqrtPriceLimitX96","type":"uint160"},
             ],
@@ -62,20 +64,13 @@ class ChainCtx:
 _ctx: Optional[ChainCtx] = None
 
 def get_ctx(rpc_url: str) -> ChainCtx:
-    """
-    Create (once) and return a Web3 context.
-    Inject POA middleware when available (Harmony is EVM-compatible; POA MW is harmless if unneeded).
-    """
     global _ctx
     if _ctx is None:
         w3 = Web3(Web3.HTTPProvider(rpc_url, request_kwargs={"timeout": 15}))
-        # Try to inject POA middleware if present for this web3 version
         try:
             if _POA_MW is not None:
-                # v6/v7: class; v5: function — both are callable in middleware_onion.inject
                 w3.middleware_onion.inject(_POA_MW, layer=0)
         except Exception:
-            # Non-fatal; proceed without POA middleware
             pass
         _ctx = ChainCtx(w3=w3)
     return _ctx
