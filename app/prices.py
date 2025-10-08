@@ -1,4 +1,4 @@
-# app/prices.py
+# /bot/app/prices.py
 from __future__ import annotations
 from decimal import Decimal, getcontext
 from typing import Dict, Tuple, Optional, List
@@ -16,7 +16,6 @@ getcontext().prec = 40
 
 # ---------- symbol helpers (case-insensitive) ----------
 def _canon(sym: str) -> str:
-    """Return the canonical symbol key as defined in config, case-insensitive."""
     s = (sym or "").strip()
     if not s:
         raise KeyError("empty symbol")
@@ -24,13 +23,11 @@ def _canon(sym: str) -> str:
     for k in C.TOKENS.keys():
         if k.upper() == up:
             return k
-    # allow 'ONE(native)' passthrough for balances (has no ERC20 address)
     if up in ("ONE(NATIVE)", "ONE_NATIVE", "NATIVE_ONE"):
         return "ONE(native)"
     raise KeyError(s)
 
 def _dec(symbol: str) -> int:
-    """Decimals by canonical key; default to 18 if unknown."""
     key = _canon(symbol) if symbol != "ONE(native)" else "ONE(native)"
     return int(C.DECIMALS.get(key, 18)) if key != "ONE(native)" else 18
 
@@ -39,12 +36,8 @@ def _addr(symbol: str) -> str:
     return C.TOKENS[key]
 
 # ---------- pool helpers (case-insensitive, order-agnostic) ----------
-def _parse_label_pair(label: str) -> Optional[Tuple[str, str, int]]:
-    """
-    Given label like '1USDC/WONE@3000', return ('1USDC','WONE',3000) in original case.
-    """
-    if "@" not in label or "/" not in label:
-        return None
+def _parse_label_pair(label: str):
+    if "@" not in label or "/" not in label: return None
     pair, fee_str = label.split("@", 1)
     a, b = pair.split("/", 1)
     try:
@@ -54,13 +47,10 @@ def _parse_label_pair(label: str) -> Optional[Tuple[str, str, int]]:
     return (a, b, fee)
 
 def _find_pool(sym_in: str, sym_out: str) -> Optional[int]:
-    """Return fee tier if any label in POOLS_V3 matches the unordered pair, case-insensitive."""
-    A = _canon(sym_in).upper()
-    B = _canon(sym_out).upper()
+    A = _canon(sym_in).upper(); B = _canon(sym_out).upper()
     for label, meta in C.POOLS_V3.items():
         parsed = _parse_label_pair(label)
-        if not parsed:
-            continue
+        if not parsed: continue
         x, y, _ = parsed
         if {x.upper(), y.upper()} == {A, B}:
             try:
@@ -72,7 +62,7 @@ def _find_pool(sym_in: str, sym_out: str) -> Optional[int]:
 # ---------- quoting ----------
 def _quote_single(symbol_in: str, symbol_out: str, amount_in_wei: int) -> Optional[int]:
     """
-    Quote via a single pool using QuoterV2. Returns amountOut (int) or None.
+    Quote via QuoterV2 single-hop. Returns amountOut (int) or None.
     """
     fee = _find_pool(symbol_in, symbol_out)
     if fee is None:
@@ -84,12 +74,11 @@ def _quote_single(symbol_in: str, symbol_out: str, amount_in_wei: int) -> Option
     token_in = Web3.to_checksum_address(_addr(symbol_in))
     token_out = Web3.to_checksum_address(_addr(symbol_out))
 
-    # IQuoterV2.QuoteExactInputSingleParams tuple
+    # ✅ Correct V2 param order: (tokenIn, tokenOut, fee, amountIn, sqrtPriceLimitX96)
     params = (
         token_in,
         token_out,
         int(fee),
-        "0x0000000000000000000000000000000000000000",  # recipient (ignored)
         int(amount_in_wei),
         0,  # sqrtPriceLimitX96
     )
@@ -109,7 +98,8 @@ def _quote_two_hop(symbol_in: str, inter: str, symbol_out: str, amount_in_wei: i
 def price_usd(symbol: str, amount: Decimal = Decimal("1")) -> Optional[Tuple[Decimal, Decimal]]:
     """
     Returns (unit_price_in_USDC, total_out_USDC) for `amount` of `symbol`.
-    If direct pool to 1USDC is missing, tries two-hop via WONE.
+    Prefers direct pool to 1USDC; if absent, tries two-hop via common bridges.
+    Bridges attempted: WONE, 1sDAI (based on your verified pools).
     """
     key = _canon(symbol)
     if key.upper() == "1USDC":
@@ -119,12 +109,16 @@ def price_usd(symbol: str, amount: Decimal = Decimal("1")) -> Optional[Tuple[Dec
     dec_out = _dec("1USDC")
     amt_wei = int(amount * (Decimal(10) ** dec_in))
 
-    # direct
+    # Direct
     out_wei = _quote_single(key, "1USDC", amt_wei)
 
-    # two-hop via WONE
-    if out_wei is None and _find_pool(key, "WONE") and _find_pool("WONE", "1USDC"):
-        out_wei = _quote_two_hop(key, "WONE", "1USDC", amt_wei)
+    # Two-hop via bridges you actually have on-chain
+    if out_wei is None:
+        for bridge in ("WONE", "1sDAI"):
+            if _find_pool(key, bridge) and _find_pool(bridge, "1USDC"):
+                out_wei = _quote_two_hop(key, bridge, "1USDC", amt_wei)
+                if out_wei is not None:
+                    break
 
     if out_wei is None:
         return None
