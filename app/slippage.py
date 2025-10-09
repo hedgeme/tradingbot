@@ -1,59 +1,81 @@
-# /bot/app/slippage.py
-from __future__ import annotations
-from decimal import Decimal, getcontext
-from typing import Optional
+# app/slippage.py — slippage/impact using QuoterV2.quoteExactInput(path, amountIn)
+from decimal import Decimal, ROUND_DOWN
+from typing import Dict, List, Tuple, Optional
+from web3 import Web3
 
 try:
     from app import config as C
+    from app.chain import get_ctx
+    from app import prices as PR
 except Exception:
     import config as C
+    from chain import get_ctx
+    import prices as PR
 
-from app.prices import _canon, _dec, _find_pool, _quote_single, _quote_two_hop
+DEFAULT_BPS = int(getattr(C, "SLIPPAGE_DEFAULT_BPS", 30))  # 0.30% default
 
-getcontext().prec = 40
+def _quote(sym_in: str, sym_out: str, hops: List[Tuple[str,int,str]], amount_in: Decimal) -> Optional[int]:
+    """Generic path quote returning amountOut in wei."""
+    dec_in = PR._dec(sym_in)
+    amt_wei = int((amount_in * (Decimal(10) ** dec_in)).to_integral_value(rounding=ROUND_DOWN))
+    return PR._quote_path(hops, amt_wei)
 
-def compute_slippage(token_in: str, token_out: str, amount_in: Decimal, default_bps: int = 30) -> Optional[dict]:
-    ti = _canon(token_in)
-    to = _canon(token_out)
+def _path_between(sym_in: str, sym_out: str) -> Optional[List[Tuple[str,int,str]]]:
+    a, b = sym_in.upper(), sym_out.upper()
+    fee = PR._find_pool(a, b)
+    if fee:
+        return [(a, fee, b)]
 
-    dec_in = _dec(ti)
-    dec_out = _dec(to)
+    # Known 2-hop combinations for this deployment (from verified pools)
+    # We only need a minimal set for /slippage UX; expand if you add more pools.
+    if (a, b) == ("1ETH", "1USDC"):
+        return [("1ETH", 3000, "WONE"), ("WONE", 3000, "1USDC")]
+    if (a, b) == ("TEC", "1USDC"):
+        return [("TEC", 10000, "1sDAI"), ("1sDAI", 500, "1USDC")]
+    if (a, b) == ("1sDAI", "1USDC"):
+        return [("1sDAI", 500, "1USDC")]
+    if (a, b) == ("WONE", "1USDC"):
+        return [("WONE", 3000, "1USDC")]
+    if (a, b) == ("1ETH", "WONE"):
+        return [("1ETH", 3000, "WONE")]
 
-    amt_wei = int(amount_in * (Decimal(10) ** dec_in))
+    # try reverse?
+    fee_rev = PR._find_pool(b, a)
+    if fee_rev:
+        return [(a, fee_rev, b)]  # Quoter uses tokenIn→tokenOut with that fee; direction OK
+    return None
 
-    out_wei = _quote_single(ti, to, amt_wei)
-    if out_wei is None:
-        for bridge in ("WONE", "1sDAI"):
-            if _find_pool(ti, bridge) and _find_pool(bridge, to):
-                out_wei = _quote_two_hop(ti, bridge, to, amt_wei)
-                if out_wei is not None:
-                    break
+def compute_slippage(token_in: str, token_out: str, amount_in: Decimal, slippage_bps: Optional[int]=None) -> Optional[Dict]:
+    """
+    Returns dict with:
+      amount_out_wei, amount_out_fmt, min_out_wei, min_out_fmt, impact_bps, path_text
+    or None on failure.
+    """
+    path = _path_between(token_in, token_out)
+    if not path:
+        return None
+
+    out_wei = _quote(token_in, token_out, path, amount_in)
     if out_wei is None:
         return None
 
-    amount_out = Decimal(out_wei) / (Decimal(10) ** dec_out)
+    # express amounts in token_out units
+    dec_out = PR._dec(token_out)
+    out_amt = (Decimal(out_wei) / (Decimal(10) ** dec_out))
+    bps = int(DEFAULT_BPS if slippage_bps is None else slippage_bps)
+    min_out = (out_amt * (Decimal(1) - Decimal(bps) / Decimal(10_000))).quantize(Decimal("0.000001"))
 
-    # "unit" price baseline for impact calc
-    one_unit_wei = int(Decimal(10) ** dec_in)
-    unit_out_wei = _quote_single(ti, to, one_unit_wei)
-    if unit_out_wei is None:
-        for bridge in ("WONE", "1sDAI"):
-            if _find_pool(ti, bridge) and _find_pool(bridge, to):
-                unit_out_wei = _quote_two_hop(ti, bridge, to, one_unit_wei)
-                if unit_out_wei is not None:
-                    break
-    unit_out = (Decimal(unit_out_wei) / (Decimal(10) ** dec_out)) if unit_out_wei else (amount_out / amount_in)
-
-    implied_no_impact = unit_out * amount_in
-    impact_bps = (Decimal(0) if implied_no_impact == 0
-                  else (1 - (amount_out / implied_no_impact)) * Decimal(10000))
-
-    min_out = amount_out * (Decimal(1) - Decimal(default_bps) / Decimal(10000))
+    # very rough “price impact” proxy: 0 for now (needs pool liquidity math to be precise)
+    impact_bps = None
 
     return {
-        "amount_in": amount_in,
-        "amount_out": amount_out.quantize(Decimal("0.00000001")),
-        "unit_price": unit_out.quantize(Decimal("0.00000001")),
-        "impact_bps": impact_bps.quantize(Decimal("0.01")),
-        "min_out": min_out.quantize(Decimal("0.00000001")),
+        "amount_out_wei": out_wei,
+        "amount_out_fmt": f"{out_amt}",
+        "min_out_wei": int((min_out * (Decimal(10) ** dec_out)).to_integral_value(rounding=ROUND_DOWN)),
+        "min_out_fmt": f"{min_out}",
+        "impact_bps": impact_bps,
+        "slippage_bps": bps,
+        "path_text": " → ".join([f"{a}@{fee}" if i<len(path)-1 else b for i,(a,fee,b) in enumerate(path)])
     }
+
+__all__ = ["compute_slippage"]
