@@ -1,138 +1,150 @@
-# /bot/app/prices.py
-from __future__ import annotations
-from decimal import Decimal, getcontext
-from typing import Dict, Tuple, Optional, List
+# app/prices.py — on-chain quoting using QuoterV2.quoteExactInput(path, amountIn)
+from decimal import Decimal, ROUND_DOWN
+from typing import List, Tuple, Optional
 from web3 import Web3
 
-# tolerant config import
+# tolerant imports (repo supports both /bot and /bot/app)
 try:
     from app import config as C
+    from app.chain import get_ctx
 except Exception:
     import config as C
+    from chain import get_ctx
 
-from app.chain import get_ctx
+# -------- utilities --------
 
-getcontext().prec = 40
+def _addr(sym: str) -> str:
+    a = C.TOKENS.get(sym)
+    if not a:
+        raise KeyError(f"unknown token: {sym}")
+    return Web3.to_checksum_address(a)
 
-# ---------- symbol helpers (case-insensitive) ----------
-def _canon(sym: str) -> str:
-    s = (sym or "").strip()
-    if not s:
-        raise KeyError("empty symbol")
-    up = s.upper()
-    for k in C.TOKENS.keys():
-        if k.upper() == up:
-            return k
-    if up in ("ONE(NATIVE)", "ONE_NATIVE", "NATIVE_ONE"):
-        return "ONE(native)"
-    raise KeyError(s)
-
-def _dec(symbol: str) -> int:
-    key = _canon(symbol) if symbol != "ONE(native)" else "ONE(native)"
-    return int(C.DECIMALS.get(key, 18)) if key != "ONE(native)" else 18
-
-def _addr(symbol: str) -> str:
-    key = _canon(symbol)
-    return C.TOKENS[key]
-
-# ---------- pool helpers (case-insensitive, order-agnostic) ----------
-def _parse_label_pair(label: str):
-    if "@" not in label or "/" not in label: return None
-    pair, fee_str = label.split("@", 1)
-    a, b = pair.split("/", 1)
-    try:
-        fee = int(fee_str)
-    except Exception:
-        return None
-    return (a, b, fee)
+def _dec(sym: str) -> int:
+    d = C.DECIMALS.get(sym)
+    if d is None:
+        raise KeyError(f"missing decimals for {sym}")
+    return int(d)
 
 def _find_pool(sym_in: str, sym_out: str) -> Optional[int]:
-    A = _canon(sym_in).upper(); B = _canon(sym_out).upper()
-    for label, meta in C.POOLS_V3.items():
-        parsed = _parse_label_pair(label)
-        if not parsed: continue
-        x, y, _ = parsed
-        if {x.upper(), y.upper()} == {A, B}:
-            try:
+    """Return fee (uint24) if we have a direct pool for (sym_in,sym_out) in either order."""
+    for key, meta in C.POOLS_V3.items():
+        if "/" not in key or "@” not in key:  # safety
+            pass
+        try:
+            pair, fee_lab = key.split("@")
+            a, b = pair.split("/")
+            if {a.upper(), b.upper()} == {sym_in.upper(), sym_out.upper()}:
                 return int(meta["fee"])
-            except Exception:
-                pass
+        except Exception:
+            continue
     return None
 
-# ---------- quoting ----------
-def _quote_single(symbol_in: str, symbol_out: str, amount_in_wei: int) -> Optional[int]:
-    """
-    Quote via QuoterV2 single-hop. Returns amountOut (int) or None.
-    """
-    fee = _find_pool(symbol_in, symbol_out)
-    if fee is None:
-        return None
-
+def _w3_and_quoter():
     ctx = get_ctx(C.HARMONY_RPC)
-    quoter = ctx.quoter(C.QUOTER_ADDR)
-
-    token_in = Web3.to_checksum_address(_addr(symbol_in))
-    token_out = Web3.to_checksum_address(_addr(symbol_out))
-
-    # ✅ Correct V2 param order: (tokenIn, tokenOut, fee, amountIn, sqrtPriceLimitX96)
-    params = (
-        token_in,
-        token_out,
-        int(fee),
-        int(amount_in_wei),
-        0,  # sqrtPriceLimitX96
+    q = ctx.w3.eth.contract(
+        address=Web3.to_checksum_address(C.QUOTER_ADDR),
+        abi=[{
+          "inputs":[{"internalType":"bytes","name":"path","type":"bytes"},
+                    {"internalType":"uint256","name":"amountIn","type":"uint256"}],
+          "name":"quoteExactInput",
+          "outputs":[
+            {"internalType":"uint256","name":"amountOut","type":"uint256"},
+            {"internalType":"uint160","name":"sqrtPriceX96After","type":"uint160"},
+            {"internalType":"uint32","name":"initializedTicksCrossed","type":"uint32"},
+            {"internalType":"uint256","name":"gasEstimate","type":"uint256"}],
+          "stateMutability":"nonpayable","type":"function"
+        }]
     )
+    return ctx.w3, q
+
+def _fee3(fee: int) -> bytes:
+    return int(fee).to_bytes(3, "big")
+
+def _build_path(hops: List[Tuple[str,int,str]]) -> bytes:
+    """
+    hops: list of (tokenInSym, fee, tokenOutSym), e.g.
+          [("1ETH",3000,"WONE"), ("WONE",3000,"1USDC")]
+    Encoded as: tokenIn (20) + fee(3) + tokenOut (20) [+ fee + token ...]
+    """
+    path = b""
+    for i, (a, fee, b) in enumerate(hops):
+        if i == 0:
+            path += Web3.to_bytes(hexstr=_addr(a))
+        path += _fee3(fee) + Web3.to_bytes(hexstr=_addr(b))
+    return path
+
+def _quote_path(hops: List[Tuple[str,int,str]], amount_in_wei: int) -> Optional[int]:
+    if not hops:
+        return None
+    _, quoter = _w3_and_quoter()
+    path = _build_path(hops)
     try:
-        amount_out, *_ = quoter.functions.quoteExactInputSingle(params).call()
-        return int(amount_out)
+        amt_out, *_ = quoter.functions.quoteExactInput(path, int(amount_in_wei)).call()
+        return int(amt_out)
     except Exception:
         return None
 
-def _quote_two_hop(symbol_in: str, inter: str, symbol_out: str, amount_in_wei: int) -> Optional[int]:
-    mid = _quote_single(symbol_in, inter, amount_in_wei)
-    if mid is None:
-        return None
-    return _quote_single(inter, symbol_out, mid)
+# -------- route policy (based on verified pools) --------
 
-# ---------- public API ----------
-def price_usd(symbol: str, amount: Decimal = Decimal("1")) -> Optional[Tuple[Decimal, Decimal]]:
+def _route_to_usdc(sym: str) -> Optional[List[Tuple[str,int,str]]]:
     """
-    Returns (unit_price_in_USDC, total_out_USDC) for `amount` of `symbol`.
-    Prefers direct pool to 1USDC; if absent, tries two-hop via common bridges.
-    Bridges attempted: WONE, 1sDAI (based on your verified pools).
+    Return the hop list to 1USDC for a given sym, using the verified pools:
+
+      1ETH/WONE@3000
+      1USDC/WONE@3000
+      TEC/WONE@10000
+      1USDC/1sDAI@500
+      TEC/1sDAI@10000
+
     """
-    key = _canon(symbol)
-    if key.upper() == "1USDC":
-        return (Decimal(1), amount)
+    s = sym.upper()
+    if s == "1USDC":
+        return []  # identity
+    if _find_pool(s, "1USDC"):
+        return [(s, _find_pool(s, "1USDC"), "1USDC")]
 
-    dec_in  = _dec(key)
-    dec_out = _dec("1USDC")
-    amt_wei = int(amount * (Decimal(10) ** dec_in))
+    # Known working paths per your diagnostics (D8):
+    if s == "WONE":
+        return [("WONE", 3000, "1USDC")]
+    if s == "1ETH":
+        return [("1ETH", 3000, "WONE"), ("WONE", 3000, "1USDC")]
+    if s == "1SDAI":
+        return [("1sDAI", 500, "1USDC")]
+    if s == "TEC":
+        return [("TEC", 10000, "1sDAI"), ("1sDAI", 500, "1USDC")]
 
-    # Direct
-    out_wei = _quote_single(key, "1USDC", amt_wei)
+    # fallback: try direct pool
+    fee = _find_pool(s, "1USDC")
+    if fee:
+        return [(s, fee, "1USDC")]
+    return None
 
-    # Two-hop via bridges you actually have on-chain
-    if out_wei is None:
-        for bridge in ("WONE", "1sDAI"):
-            if _find_pool(key, bridge) and _find_pool(bridge, "1USDC"):
-                out_wei = _quote_two_hop(key, bridge, "1USDC", amt_wei)
-                if out_wei is not None:
-                    break
+# -------- public API --------
 
+def price_usd(sym: str, amount: Decimal) -> Optional[Decimal]:
+    """
+    Quote `amount` of `sym` into 1USDC using QuoterV2 path quoting.
+    Returns Decimal USD (token is 1USDC with 6 decimals) or None.
+    """
+    route = _route_to_usdc(sym)
+    if route is None:
+        return None
+    if route == []:  # sym == 1USDC
+        return amount.quantize(Decimal("0.000001"))
+
+    dec_in = _dec(route[0][0])
+    amt_wei = int((amount * (Decimal(10) ** dec_in)).to_integral_value(rounding=ROUND_DOWN))
+    out_wei = _quote_path(route, amt_wei)
     if out_wei is None:
         return None
 
-    out = Decimal(out_wei) / (Decimal(10) ** dec_out)
-    price = (out / amount).quantize(Decimal("0.00000001"))
-    return (price, out)
+    # 1USDC has 6 decimals
+    usd = Decimal(out_wei) / (Decimal(10) ** _dec("1USDC"))
+    return usd
 
-def batch_prices_usd(symbols: List[str]) -> Dict[str, Optional[Decimal]]:
-    res: Dict[str, Optional[Decimal]] = {}
-    for s in symbols:
-        try:
-            q = price_usd(s, Decimal("1"))
-            res[_canon(s)] = (q[0] if q else None)
-        except Exception:
-            res[str(s)] = None
-    return res
+# Keep helpers referenced by diagnostics or other modules
+__all__ = [
+    "price_usd",
+    "_addr", "_dec", "_find_pool",
+    "_build_path", "_quote_path", "_route_to_usdc"
+]
