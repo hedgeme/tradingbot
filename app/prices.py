@@ -9,7 +9,7 @@ try:
     from app.chain import get_ctx
 except Exception:
     import config as C
-    from chain import get_ctx
+    from app.chain import get_ctx  # chain.py is under app/ now
 
 # -------- utilities --------
 
@@ -28,11 +28,12 @@ def _dec(sym: str) -> int:
 def _find_pool(sym_in: str, sym_out: str) -> Optional[int]:
     """Return fee (uint24) if we have a direct pool for (sym_in,sym_out) in either order."""
     for key, meta in C.POOLS_V3.items():
-        if "/" not in key or "@” not in key:  # safety
-            pass
+        # safety guard: only consider entries that look like "A/B@fee"
+        if ("/" not in key) or ("@" not in key):
+            continue
         try:
-            pair, fee_lab = key.split("@")
-            a, b = pair.split("/")
+            pair, _fee_label = key.split("@", 1)
+            a, b = pair.split("/", 1)
             if {a.upper(), b.upper()} == {sym_in.upper(), sym_out.upper()}:
                 return int(meta["fee"])
         except Exception:
@@ -88,22 +89,24 @@ def _quote_path(hops: List[Tuple[str,int,str]], amount_in_wei: int) -> Optional[
 
 def _route_to_usdc(sym: str) -> Optional[List[Tuple[str,int,str]]]:
     """
-    Return the hop list to 1USDC for a given sym, using the verified pools:
+    Return the hop list to 1USDC for a given sym, using verified pools:
 
       1ETH/WONE@3000
       1USDC/WONE@3000
       TEC/WONE@10000
       1USDC/1sDAI@500
       TEC/1sDAI@10000
-
     """
     s = sym.upper()
     if s == "1USDC":
         return []  # identity
-    if _find_pool(s, "1USDC"):
-        return [(s, _find_pool(s, "1USDC"), "1USDC")]
 
-    # Known working paths per your diagnostics (D8):
+    # direct (if ever added)
+    fee = _find_pool(s, "1USDC")
+    if fee:
+        return [(s, fee, "1USDC")]
+
+    # Known working paths (per diagnostics):
     if s == "WONE":
         return [("WONE", 3000, "1USDC")]
     if s == "1ETH":
@@ -113,10 +116,6 @@ def _route_to_usdc(sym: str) -> Optional[List[Tuple[str,int,str]]]:
     if s == "TEC":
         return [("TEC", 10000, "1sDAI"), ("1sDAI", 500, "1USDC")]
 
-    # fallback: try direct pool
-    fee = _find_pool(s, "1USDC")
-    if fee:
-        return [(s, fee, "1USDC")]
     return None
 
 # -------- public API --------
@@ -138,11 +137,10 @@ def price_usd(sym: str, amount: Decimal) -> Optional[Decimal]:
     if out_wei is None:
         return None
 
-    # 1USDC has 6 decimals
-    usd = Decimal(out_wei) / (Decimal(10) ** _dec("1USDC"))
+    usd = Decimal(out_wei) / (Decimal(10) ** _dec("1USDC"))  # 6 decimals
     return usd
 
-# Keep helpers referenced by diagnostics or other modules
+# re-export helpers used elsewhere / by diagnostics
 __all__ = [
     "price_usd",
     "_addr", "_dec", "_find_pool",
