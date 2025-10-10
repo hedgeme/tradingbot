@@ -1,16 +1,10 @@
 #!/usr/bin/env python3
-# TECBot Telegram Listener — python-telegram-bot 13.x, chain-forward (QuoterV2)
-# This file expects:
-#   - app/prices.py   with price_usd(sym, Decimal) and helpers
-#   - app/slippage.py with compute_slippage(token_in, token_out, Decimal, bps)
-#   - app/balances.py with all_balances() -> {wallet: {sym: Decimal/float}}
-#   - app/strategies/planner.py (optional)
-#   - runner.py or app/runner.py (optional)
+# TECBot Telegram Listener — python-telegram-bot 13.x, chain-first + Coinbase compare
 
 import os, sys, logging, subprocess, shlex
 from datetime import datetime, timezone
-from decimal import Decimal, InvalidOperation
-from typing import Optional, Dict, Any, List
+from decimal import Decimal
+from typing import Optional, List, Tuple
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ParseMode, Update
 from telegram.ext import (
@@ -21,11 +15,11 @@ from telegram.ext import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
 log = logging.getLogger("telegram_listener")
 
-# Ensure /bot imports work (root and app.* both supported)
+# PYTHONPATH so /bot works
 if "/bot" not in sys.path:
     sys.path.insert(0, "/bot")
 
-# ---------- Tolerant imports (prefer app.*, else root) ----------
+# ---------- tolerant imports ----------
 # config
 try:
     from app import config as C
@@ -34,43 +28,31 @@ except Exception:
     try:
         import config as C
         log.info("Loaded config from root config")
-    except Exception:
+    except Exception as e:
         log.exception("Failed to import config")
         raise
 
-# optional modules (prices, balances, slippage)
+# on-chain modules
 PR = BL = SL = None
 try:
     from app import prices as PR
     log.info("Loaded prices from app.prices")
-except Exception:
-    try:
-        import prices as PR
-        log.info("Loaded prices from root prices")
-    except Exception as e:
-        log.warning("prices module not available: %s", e)
+except Exception as e:
+    log.warning("prices module not available: %s", e)
 
 try:
     from app import balances as BL
     log.info("Loaded balances from app.balances")
-except Exception:
-    try:
-        import balances as BL
-        log.info("Loaded balances from root balances")
-    except Exception as e:
-        log.warning("balances module not available: %s", e)
+except Exception as e:
+    log.warning("balances module not available: %s", e)
 
 try:
     from app import slippage as SL
     log.info("Loaded slippage from app.slippage")
-except Exception:
-    try:
-        import slippage as SL
-        log.info("Loaded slippage from root slippage")
-    except Exception as e:
-        log.warning("slippage module not available: %s", e)
+except Exception as e:
+    log.warning("slippage module not available: %s", e)
 
-# optional planner/runner (you may have stubs)
+# planner/runner (optional)
 planner = None
 try:
     from app.strategies import planner
@@ -95,7 +77,14 @@ except Exception:
         log.warning("runner module not available: %s", e)
         runner = None
 
-# ---------- Utilities ----------
+# coinbase spot (optional)
+CB = None
+try:
+    import coinbase_client as CB
+except Exception:
+    CB = None
+
+# ---------- utils ----------
 def now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
@@ -112,22 +101,11 @@ def _git_short_rev() -> Optional[str]:
     except Exception:
         return None
 
-def _fmt_kv(d: Dict[str, Any], indent: int = 2) -> str:
+def _fmt_kv(d: dict, indent: int = 2) -> str:
     pad = " " * indent
     return "\n".join(f"{pad}{k}: {v}" for k, v in d.items())
 
-def _format_decimal(x: Any, places: int = 8) -> str:
-    try:
-        if isinstance(x, Decimal):
-            q = Decimal(10) ** -places
-            return f"{x.quantize(q):,f}"
-        if isinstance(x, (int, float)):
-            return f"{x:,.{places}f}"
-        return str(x)
-    except Exception:
-        return str(x)
-
-# ---------- Render helpers ----------
+# ---------- rendering ----------
 def render_plan(actions_by_bot) -> str:
     if not actions_by_bot or not any(actions_by_bot.values()):
         return f"Plan (preview @ {now_iso()})\nNo actions proposed."
@@ -189,52 +167,7 @@ def render_dryrun(results):
         )
     return "\n".join(lines).strip()
 
-def _render_balances_table(data: Dict[str, Dict[str, Any]]) -> str:
-    # Collect all symbols that appear (to keep columns consistent)
-    syms = set()
-    for _, rows in data.items():
-        syms.update(rows.keys())
-    syms = ["ONE(native)"] + sorted([s for s in syms if s != "ONE(native)"])
-
-    name_w = max(12, max(len(w) for w in data.keys()))
-    col_w  = 14
-
-    lines = []
-    lines.append(f"Balances (@ {now_iso()})")
-    header = ("Wallet".ljust(name_w)) + "  " + "  ".join(s.rjust(col_w) for s in syms)
-    lines.append(header)
-    lines.append("-" * len(header))
-
-    for w in sorted(data.keys()):
-        row = data[w]
-        vals = []
-        for s in syms:
-            v = row.get(s, 0)
-            vals.append(_format_decimal(v).rjust(col_w))
-        lines.append(w.ljust(name_w) + "  " + "  ".join(vals))
-    return "```\n" + "\n".join(lines) + "\n```"
-
-def _render_assets(tokens: Dict[str, str], wallets: Dict[str, str]) -> str:
-    # Token table
-    t_sym_w = max(5, max((len(k) for k in tokens.keys()), default=5))
-    t_addr_w = max(42, max((len(v) for v in tokens.values()), default=42))
-    lines = [f"Assets (@ {now_iso()})", "```"]
-    lines.append("TOKENS".ljust(t_sym_w) + "  " + "ADDRESS".ljust(t_addr_w))
-    lines.append("-" * (t_sym_w + 2 + t_addr_w))
-    for s, a in sorted(tokens.items()):
-        lines.append(s.ljust(t_sym_w) + "  " + a.ljust(t_addr_w))
-    lines.append("")
-    # Wallet table
-    w_name_w = max(10, max((len(k) for k in wallets.keys()), default=10))
-    w_addr_w = max(42, max((len(v) for v in wallets.values()), default=42))
-    lines.append("WALLETS".ljust(w_name_w) + "  " + "ADDRESS".ljust(w_addr_w))
-    lines.append("-" * (w_name_w + 2 + w_addr_w))
-    for s, a in sorted(wallets.items()):
-        lines.append(s.ljust(w_name_w) + "  " + a.ljust(w_addr_w))
-    lines.append("```")
-    return "\n".join(lines)
-
-# ---------- Meta logging ----------
+# ---------- basic logging ----------
 def _log_update(update: Update, context: CallbackContext):
     try:
         uid = update.effective_user.id if update.effective_user else "?"
@@ -246,7 +179,7 @@ def _log_update(update: Update, context: CallbackContext):
 def _log_error(update: object, context: CallbackContext):
     log.exception("Handler error")
 
-# ---------- Commands (meta/system) ----------
+# ---------- commands ----------
 def cmd_start(update: Update, context: CallbackContext):
     update.message.reply_text(
         "TECBot online.\n"
@@ -265,7 +198,7 @@ def cmd_help(update: Update, context: CallbackContext):
         "  /cooldowns [bot|route] — show cooldowns\n"
         "  /prices [SYMS…] — on-chain quotes in USDC (e.g. /prices 1ETH TEC)\n"
         "  /balances — per-wallet balances (ERC-20 + native ONE)\n"
-        "  /slippage <IN> [AMOUNT] [OUT] — live quote/minOut (default OUT=1USDC, AMOUNT=1)\n"
+        "  /slippage <IN> [AMOUNT] [OUT] — live impact/minOut (default OUT=1USDC, AMOUNT=1)\n"
         "  /assets — configured tokens & wallets\n"
         "  /version — code version\n"
         "  /sanity — config/modules sanity"
@@ -298,52 +231,106 @@ def cmd_sanity(update: Update, context: CallbackContext):
 def cmd_assets(update: Update, context: CallbackContext):
     tokens = getattr(C, "TOKENS", {})
     wallets = getattr(C, "WALLETS", {})
-    update.message.reply_text(_render_assets(tokens, wallets), parse_mode=ParseMode.MARKDOWN)
+    lines = ["Assets:", "Tokens:"]
+    for sym, addr in tokens.items():
+        lines.append(f"  {sym}: {addr}")
+    lines.append("Wallets:")
+    for name, addr in wallets.items():
+        lines.append(f"  {name}: {addr}")
+    update.message.reply_text("\n".join(lines))
 
-# ---------- Commands (on-chain) ----------
+# -------- /prices (LP + Coinbase compare) --------
+def _pretty_money(x: Optional[Decimal]) -> str:
+    if x is None:
+        return "—"
+    # 4 decimals for “stable-ish”, 2 for big numbers
+    if x >= 100:
+        return f"${x:,.2f}"
+    return f"${x:,.6f}" if x < Decimal("0.1") else f"${x:,.4f}"
+
+def _coinbase_eth_usd() -> Optional[Decimal]:
+    if CB is None:
+        return None
+    try:
+        # expects your coinbase_client.get_spot("ETH-USD") -> Decimal
+        px = CB.get_spot("ETH-USD")
+        return Decimal(str(px))
+    except Exception:
+        return None
+
 def cmd_prices(update: Update, context: CallbackContext):
     if PR is None:
         update.message.reply_text("Prices unavailable (module not loaded)."); return
+
+    # default symbols list
     args = (context.args or [])
-    syms = [s.upper() for s in args] if args else list(getattr(C, "TOKENS", {}).keys())
-    # cap to something readable in chat
-    if len(syms) > 8:
-        syms = syms[:8]
-    lines = [f"Prices (@ {now_iso()}) — USD per 1 token"]
-    try:
-        for s in syms:
-            try:
-                px = PR.price_usd(s, Decimal("1"))
-                lines.append(f"  {s}: {'—' if px is None else f'${px}'}")
-            except Exception as e:
-                lines.append(f"  {s}: error ({e})")
-    except Exception as e:
-        log.exception("prices failure")
-        update.message.reply_text(f"Prices error: {e}"); return
+    syms = [s.upper() for s in args] if args else ["ONE", "1USDC", "1sDAI", "TEC", "1ETH"]
+
+    # Compute LP prices
+    lp: dict = {}
+    notes: List[str] = []
+    for s in syms:
+        try:
+            val = PR.price_usd(s, Decimal("1"))
+            lp[s] = val
+        except Exception as e:
+            lp[s] = None
+            notes.append(f"{s}: error ({e})")
+
+    # Build header
+    lines = ["LP Prices"]
+    # Prefer a stable order
+    order = [x for x in ["ONE","WONE","1USDC","1sDAI","TEC","1ETH"] if x in lp] + [s for s in syms if s not in ("ONE","WONE","1USDC","1sDAI","TEC","1ETH")]
+    for s in order:
+        # Hide raw ONE if it isn’t priced; but our prices.py maps ONE->WONE, so it should now show
+        if s == "ONE" and lp.get(s) is None:
+            continue
+        lines.append(f"  {s:<6} {_pretty_money(lp.get(s))}")
+
+    # ETH LP vs Coinbase
+    lp_eth = lp.get("1ETH")
+    cb_eth = _coinbase_eth_usd()
+    if lp_eth is not None and cb_eth is not None:
+        try:
+            diff = (lp_eth - cb_eth) / cb_eth * Decimal("100")
+            lines += [
+                "",
+                "ETH: Harmony LP vs Coinbase",
+                f"  LP:       {_pretty_money(lp_eth)}",
+                f"  Coinbase: {_pretty_money(cb_eth)}",
+                f"  Diff:     {diff:.2f}%"
+            ]
+        except Exception:
+            pass
+
+    if notes:
+        lines += ["", "Notes:"] + [f"  - {n}" for n in notes]
+
     update.message.reply_text("\n".join(lines))
 
+# -------- /balances (prettier) --------
 def cmd_balances(update: Update, context: CallbackContext):
     if BL is None:
         update.message.reply_text("Balances unavailable (module not loaded)."); return
     try:
-        data = BL.all_balances()
+        table = BL.all_balances()
     except Exception as e:
         log.exception("balances failure")
         update.message.reply_text(f"Balances error: {e}"); return
-    update.message.reply_text(_render_balances_table(data), parse_mode=ParseMode.MARKDOWN)
+    lines = [f"Balances (@ {now_iso()} UTC)"]
+    for w_name, row in table.items():
+        lines.append(f"\n{w_name}:")
+        for sym, amt in row.items():
+            # Drop scientific zeros; align a bit
+            v = f"{amt:.8f}" if hasattr(amt, 'quantize') or isinstance(amt, Decimal) else str(amt)
+            if v.upper() == "0E-8":
+                v = "0"
+            lines.append(f"  {sym:<9} {v}")
+    update.message.reply_text("\n".join(lines))
 
-def _parse_decimal(s: str, default: Decimal) -> Decimal:
-    try:
-        return Decimal(s)
-    except (InvalidOperation, ValueError):
-        return default
-
+# -------- /slippage (curve-style summary) --------
 def cmd_slippage(update: Update, context: CallbackContext):
-    if SL is None:
-        update.message.reply_text("Slippage unavailable (module not loaded)."); return
     args = context.args or []
-    default_bps = int(getattr(C, "SLIPPAGE_DEFAULT_BPS", 30))
-
     if not args:
         update.message.reply_text(
             "Usage: /slippage <TOKEN_IN> [AMOUNT] [TOKEN_OUT]\n"
@@ -353,30 +340,60 @@ def cmd_slippage(update: Update, context: CallbackContext):
         ); return
 
     token_in = args[0].upper()
-    amount = _parse_decimal(args[1], Decimal("1")) if len(args) >= 2 else Decimal("1")
+    amount_in = Decimal(args[1]) if len(args) >= 2 else Decimal("1")
     token_out = args[2].upper() if len(args) >= 3 else "1USDC"
 
+    # Mid price (LP) to express slippage vs mid
     try:
-        res = SL.compute_slippage(token_in, token_out, amount, default_bps)
-    except Exception as e:
-        log.exception("slippage failure")
-        update.message.reply_text(f"Slippage error: {e}"); return
-    if not res:
-        update.message.reply_text(f"No route for {token_in} → {token_out}. Check POOLS_V3."); return
+        mid_usd = PR.price_usd(token_in, Decimal("1"))
+    except Exception:
+        mid_usd = None
 
-    # res keys from app/slippage.py: amount_out_fmt, min_out_fmt, impact_bps, slippage_bps, path_text
-    lines = [
-        f"Slippage — {token_in} → {token_out}",
-        f"Size     : {amount} {token_in}",
-        f"Route    : {res.get('path_text','')}",
-        f"QuoteOut : {res['amount_out_fmt']} {token_out}",
-        f"minOut   : {res['min_out_fmt']} {token_out}  (tolerance {res['slippage_bps']} bps)",
-    ]
-    if res.get("impact_bps") is not None:
-        lines.append(f"Impact   : {res['impact_bps']} bps")
+    # If slippage module has a helper, use it once for the user-requested size
+    summary_line = None
+    if SL and hasattr(SL, "compute_slippage"):
+        try:
+            res = SL.compute_slippage(token_in, token_out, amount_in, int(getattr(C, "SLIPPAGE_DEFAULT_BPS", 30)))
+            if res:
+                summary_line = f"Size {amount_in} {token_in}: price { (res['amount_out']/amount_in) if amount_in else Decimal('0') :.2f} {token_out}/{token_in} · impact {res['impact_bps']} bps"
+        except Exception:
+            pass
+
+    # Build a lightweight curve (target out sizes in USDC, estimated via mid)
+    targets = [Decimal("10"), Decimal("100"), Decimal("1000"), Decimal("10000")]
+    rows: List[Tuple[str,str,str,str]] = []
+    for usdc in targets:
+        # estimate amount_in by mid price if available; else use user amount scaled
+        if mid_usd and mid_usd > 0:
+            est_in = (usdc / mid_usd).quantize(Decimal("0.000001"))
+        else:
+            est_in = amount_in
+        try:
+            px_usd = PR.price_usd(token_in, est_in)
+            if px_usd is None or est_in is None:
+                raise ValueError("no quote")
+            eff_price = (px_usd / est_in) if est_in > 0 else None  # USDC per 1 token
+            if mid_usd and eff_price:
+                slip = (eff_price - mid_usd) / mid_usd * Decimal("100")
+                slip_txt = f"{slip:+.2f}%"
+            else:
+                slip_txt = "—"
+            rows.append((f"{usdc:>8,.0f}", f"{est_in:.6f}", f"${eff_price:,.2f}" if eff_price else "—", slip_txt))
+        except Exception:
+            rows.append((f"{usdc:>8,.0f}", "—", "—", "—"))
+
+    lines = [f"Slippage curve: {token_in} → {token_out}"]
+    if mid_usd:
+        lines.append(f"Baseline (mid): ${mid_usd:,.2f} per 1{token_in}")
+    if summary_line:
+        lines.append(summary_line)
+    lines.append("")
+    lines.append(f"{'Size (USDC)':>12} | {'Amount In (sym)':>16} | {'Eff. Price':>11} | {'Slippage vs mid':>15}")
+    for a,b,c,d in rows:
+        lines.append(f"{a:>12} | {b:>16} | {c:>11} | {d:>15}")
     update.message.reply_text("\n".join(lines))
 
-# ---------- Commands (planner/runner) ----------
+# -------- planner/runner --------
 def cmd_ping(update: Update, context: CallbackContext):
     ip_txt = "unknown"
     try:
@@ -463,7 +480,7 @@ def on_exec_cancel(update: Update, context: CallbackContext):
     q.edit_message_text("Canceled. No transaction sent.")
     q.answer()
 
-# ---------- Main ----------
+# ---------- main ----------
 def main():
     token = os.environ.get("TELEGRAM_BOT_TOKEN") or getattr(C, "TELEGRAM_BOT_TOKEN", None)
     if not token:
@@ -472,13 +489,12 @@ def main():
     up = Updater(token=token, use_context=True)
     dp = up.dispatcher
 
-    # Core & on-chain
     dp.add_handler(CommandHandler("start", cmd_start))
-    dp.add_handler(CommandHandler("strat", cmd_start))  # alias
     dp.add_handler(CommandHandler("help", cmd_help))
     dp.add_handler(CommandHandler("version", cmd_version))
     dp.add_handler(CommandHandler("sanity", cmd_sanity))
     dp.add_handler(CommandHandler("assets", cmd_assets))
+
     dp.add_handler(CommandHandler("prices", cmd_prices))
     dp.add_handler(CommandHandler("balances", cmd_balances))
     dp.add_handler(CommandHandler("slippage", cmd_slippage, pass_args=True))
@@ -488,7 +504,6 @@ def main():
     dp.add_handler(CommandHandler("dryrun", cmd_dryrun))
     dp.add_handler(CommandHandler("cooldowns", cmd_cooldowns, pass_args=True))
 
-    # Callbacks & diagnostics
     dp.add_handler(CallbackQueryHandler(on_exec_button, pattern=r"^exec:[A-Za-z0-9_\-]+$"))
     dp.add_handler(CallbackQueryHandler(on_exec_confirm, pattern=r"^exec_go:[A-Za-z0-9_\-]+$"))
     dp.add_handler(CallbackQueryHandler(on_exec_cancel, pattern=r"^exec_cancel$"))
@@ -496,7 +511,7 @@ def main():
     dp.add_handler(MessageHandler(Filters.all, _log_update), group=-1)
 
     log.info("Handlers registered: /start /strat /help /version /sanity /assets /prices /balances /slippage /ping /plan /dryrun /cooldowns")
-    up.start_polling(clean=True)  # deprecation warning is harmless on v13
+    up.start_polling(clean=True)
     log.info("Telegram bot started")
     up.idle()
 
