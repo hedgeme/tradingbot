@@ -1,78 +1,120 @@
-# app/slippage.py — slippage/impact using QuoterV2.quoteExactInput(path, amountIn)
-from decimal import Decimal, ROUND_DOWN
-from typing import Dict, List, Tuple, Optional
+# Slippage / minOut calculator using QuoterV2 (path-based)
+# Exposes: compute_slippage(token_in, token_out, amount_in: Decimal, slippage_bps: int=30) -> dict|None
 
-# Always import from app.* (chain.py lives in app/)
-from app import config as C
-from app import prices as PR
+from decimal import Decimal
+from typing import List, Tuple, Optional
 
-DEFAULT_BPS = int(getattr(C, "SLIPPAGE_DEFAULT_BPS", 30))  # 0.30% default
+# tolerant imports
+try:
+    from app import config as C
+except Exception:
+    import config as C  # type: ignore
 
-def _path_between(sym_in: str, sym_out: str) -> Optional[List[Tuple[str,int,str]]]:
-    a, b = sym_in.upper(), sym_out.upper()
+try:
+    from app.chain import get_ctx
+except Exception:
+    from chain import get_ctx  # type: ignore
 
-    # direct pool?
-    fee = PR._find_pool(a, b)
-    if fee:
-        return [(a, fee, b)]
+from web3 import Web3
+from app import prices as PR  # reuse addr/dec/_find_pool/_quote_path
 
-    # Known 2-hop combos (per verified pools)
-    if (a, b) == ("1ETH", "1USDC"):
-        return [("1ETH", 3000, "WONE"), ("WONE", 3000, "1USDC")]
-    if (a, b) == ("TEC", "1USDC"):
-        return [("TEC", 10000, "1sDAI"), ("1sDAI", 500, "1USDC")]
-    if (a, b) == ("1sDAI", "1USDC"):
-        return [("1sDAI", 500, "1USDC")]
-    if (a, b) == ("WONE", "1USDC"):
-        return [("WONE", 3000, "1USDC")]
-    if (a, b) == ("1ETH", "WONE"):
-        return [("1ETH", 3000, "WONE")]
+# QuoterV2 ABI (only method we need)
+_QUOTER_V2_ABI = [{
+    "inputs":[
+        {"internalType":"bytes","name":"path","type":"bytes"},
+        {"internalType":"uint256","name":"amountIn","type":"uint256"}
+    ],
+    "name":"quoteExactInput",
+    "outputs":[
+        {"internalType":"uint256","name":"amountOut","type":"uint256"},
+        {"internalType":"uint160","name":"sqrtPriceX96After","type":"uint160"},
+        {"internalType":"uint32","name":"initializedTicksCrossed","type":"uint32"},
+        {"internalType":"uint256","name":"gasEstimate","type":"uint256"}],
+    "stateMutability":"nonpayable","type":"function"
+}]
 
-    # try reverse fee (direction still tokenIn→tokenOut)
-    fee_rev = PR._find_pool(b, a)
-    if fee_rev:
-        return [(a, fee_rev, b)]
+def _ctx():
+    return get_ctx(getattr(C, "HARMONY_RPC", "https://api.s0.t.hmny.io"))
+
+def _quoter():
+    return _ctx().w3.eth.contract(address=Web3.to_checksum_address(C.QUOTER_ADDR), abi=_QUOTER_V2_ABI)
+
+def _fee3(fee: int) -> bytes:
+    return int(fee).to_bytes(3, "big")
+
+def _build_path(hops: List[Tuple[str,int,str]]) -> bytes:
+    b = b""
+    for i,(src,fee,dst) in enumerate(hops):
+        if i == 0:
+            b += Web3.to_bytes(hexstr=Web3.to_checksum_address(PR._addr(src)))
+        b += _fee3(fee) + Web3.to_bytes(hexstr=Web3.to_checksum_address(PR._addr(dst)))
+    return b
+
+def _route(a: str, b: str) -> Optional[List[Tuple[str,int,str]]]:
+    """Find up to 2-hop route between a and b using verified pools."""
+    a = a.upper(); b = b.upper()
+    if a == b:
+        return []
+
+    f = PR._find_pool(a,b)
+    if f:
+        return [(a,f,b)]
+
+    # try via common bridges
+    bridges = ["WONE", "1USDC", "1sDAI"]
+    for mid in bridges:
+        f1 = PR._find_pool(a, mid)
+        f2 = PR._find_pool(mid, b)
+        if f1 and f2:
+            return [(a,f1,mid),(mid,f2,b)]
     return None
 
-def compute_slippage(token_in: str, token_out: str, amount_in: Decimal, slippage_bps: Optional[int]=None) -> Optional[Dict]:
-    """
-    Returns dict with:
-      amount_out_wei, amount_out_fmt, min_out_wei, min_out_fmt, impact_bps, slippage_bps, path_text
-    or None on failure.
-    """
-    path = _path_between(token_in, token_out)
-    if not path:
+def _fmt_amt(wei: int, sym: str) -> str:
+    dec = PR._dec(sym)
+    return str(Decimal(wei) / (Decimal(10) ** dec))
+
+def compute_slippage(token_in: str, token_out: str, amount_in: Decimal, slippage_bps: int = 30):
+    a = token_in.upper().strip()
+    b = token_out.upper().strip()
+    route = _route(a, b)
+    if route is None:
         return None
 
-    dec_in = PR._dec(token_in)
-    amt_wei = int((amount_in * (Decimal(10) ** dec_in)).to_integral_value(rounding=ROUND_DOWN))
-    out_wei = PR._quote_path(path, amt_wei)
-    if out_wei is None:
+    dec_in = PR._dec(a)
+    wei_in = int(Decimal(amount_in) * (Decimal(10) ** dec_in))
+
+    # quote path
+    q = _quoter()
+    try:
+        amount_out, *_ = q.functions.quoteExactInput(_build_path(route), wei_in).call()
+    except Exception:
         return None
 
-    dec_out = PR._dec(token_out)
-    out_amt = (Decimal(out_wei) / (Decimal(10) ** dec_out))
-    bps = int(DEFAULT_BPS if slippage_bps is None else slippage_bps)
-    min_out = (out_amt * (Decimal(1) - Decimal(bps) / Decimal(10_000))).quantize(Decimal("0.000001"))
+    dec_out = PR._dec(b)
+    amt_out = Decimal(amount_out) / (Decimal(10) ** dec_out)
 
-    impact_bps = None  # precise impact requires pool liquidity math; optional later
+    # naive impact estimate: re-quote half size and compare per-unit
+    try:
+        half_out, *_ = q.functions.quoteExactInput(_build_path(route), wei_in // 2).call()
+        pu_full = amt_out / Decimal(amount_in) if amount_in > 0 else Decimal(0)
+        pu_half = (Decimal(half_out) / (Decimal(10) ** dec_out)) / (Decimal(amount_in) / 2) if amount_in > 0 else Decimal(0)
+        impact_bps = int((max(Decimal(0), pu_half - pu_full) / pu_half) * Decimal(1_0000)) if pu_half > 0 else None
+    except Exception:
+        impact_bps = None
 
-    # build human path text: A@fee → B → C…
-    parts = []
-    for i, (a, fee, b) in enumerate(path):
-        if i < len(path) - 1:
-            parts.append(f"{a}@{fee}")
-        else:
-            parts.append(b)
-    path_text = " → ".join(parts)
+    # minOut using tolerance
+    min_out = amt_out * (Decimal(1) - Decimal(slippage_bps) / Decimal(10_000))
+
+    # human path text
+    path_text = " → ".join([route[0][0]] + [h[2] for h in route])
 
     return {
-        "amount_out_wei": out_wei,
-        "amount_out_fmt": f"{out_amt}",
-        "min_out_wei": int((min_out * (Decimal(10) ** dec_out)).to_integral_value(rounding=ROUND_DOWN)),
-        "min_out_fmt": f"{min_out}",
+        "amount_out": amt_out,
+        "amount_out_fmt": f"{amt_out:.8f}",
+        "min_out": min_out,
+        "min_out_fmt": f"{min_out:.8f}",
+        "slippage_bps": int(slippage_bps),
         "impact_bps": impact_bps,
-        "slippage_bps": bps,
         "path_text": path_text,
     }
 
