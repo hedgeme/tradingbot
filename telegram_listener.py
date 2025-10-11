@@ -3,7 +3,7 @@
 
 import os, sys, logging, subprocess, shlex
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Optional, List, Tuple
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ParseMode, Update
@@ -69,7 +69,7 @@ except Exception:
         log.warning("runner module not available: %s", e)
         runner = None
 
-# Optional Coinbase spot
+# Optional Coinbase spot (uses your local coinbase_client.py if present)
 CB = None
 try:
     import coinbase_client as CB  # should expose: get_spot("ETH-USD")->float/Decimal
@@ -96,7 +96,10 @@ def is_admin(user_id: int) -> bool:
 def _fmt_money(x: Optional[Decimal]) -> str:
     if x is None:
         return "—"
-    x = Decimal(x)
+    try:
+        x = Decimal(x)
+    except Exception:
+        return "—"
     if x >= 100:
         return f"${x:,.2f}"
     if x < Decimal("0.1"):
@@ -256,15 +259,12 @@ def cmd_balances(update: Update, context: CallbackContext):
         update.message.reply_text(f"Balances error: {e}"); return
 
     cols = ["ONE(native)","1ETH","1USDC","1sDAI","ONE","TEC","WONE"]
-    h1 = f"Balances (@ {now_iso()} )"
-    hdr = "Wallet           " + "  ".join(f"{c:>12}" for c in cols)
+    h1 = f"Balances (@ {now_iso()} UTC)"
+    hdr = "Wallet            " + "  ".join(f"{c:>12}" for c in cols)
     sep = "-" * len(hdr)
     lines = [h1, hdr, sep]
 
     def fmt(x):
-        if isinstance(x, Decimal):
-            s = f"{x:.8f}"
-            return "0.00000000" if s.upper() == "0E-8" else s
         try:
             d = Decimal(str(x))
             s = f"{d:.8f}"
@@ -275,13 +275,12 @@ def cmd_balances(update: Update, context: CallbackContext):
     for w_name in sorted(table.keys()):
         row = table[w_name]
         vals = [fmt(row.get(c, 0)) for c in cols]
-        lines.append(f"{w_name:<15} " + "  ".join(f"{v:>12}" for v in vals))
+        lines.append(f"{w_name:<16}" + "  ".join(f"{v:>12}" for v in vals))
 
-    lines.append("")
     # Append tokens & wallets block (as you liked)
     tokens = {k.upper(): v for k, v in getattr(C, "TOKENS", {}).items()}
     wallets = getattr(C, "WALLETS", {})
-    lines.append("")
+    lines.append("\n")
     lines.append("TOKENS  ADDRESS                                   ")
     lines.append("-------------------------------------------------")
     for k in sorted(tokens.keys()):
@@ -293,10 +292,12 @@ def cmd_balances(update: Update, context: CallbackContext):
         lines.append(f"{k:<12} {wallets[k]}")
     update.message.reply_text("\n".join(lines))
 
-# ---- ETH forward vs reverse tiny-probe (for Notes only) ----
+# ---- ETH forward vs reverse tiny-probe (Notes only; price logic unchanged) ----
 def _eth_forward_reverse_notes() -> List[str]:
-    """Non-invasive diagnostics: forward vs reverse probes for ETH using QuoterV2 (no changes to prices.py)."""
+    """Forward vs reverse probes for ETH using QuoterV2 to explain the note line."""
     notes = []
+    if PR is None:
+        return notes
     try:
         from web3 import Web3
         from app.chain import get_ctx
@@ -314,7 +315,7 @@ def _eth_forward_reverse_notes() -> List[str]:
         def addr(s): return Web3.to_checksum_address(PR._addr(s))
         def fee3(f): return int(f).to_bytes(3, "big")
 
-        # forward: 0.10 ETH
+        # forward: 0.10 ETH -> USDC via WONE
         amt_eth = Decimal("0.10")
         dec_e = PR._dec("1ETH"); dec_u = PR._dec("1USDC")
         wei_in = int(amt_eth * (Decimal(10)**dec_e))
@@ -322,9 +323,9 @@ def _eth_forward_reverse_notes() -> List[str]:
                     Web3.to_bytes(hexstr=addr("WONE")) + fee3(3000) +
                     Web3.to_bytes(hexstr=addr("1USDC")))
         out_f = q.functions.quoteExactInput(path_fwd, wei_in).call()[0]
-        fwd_px = (Decimal(out_f) / (Decimal(10)**dec_u)) / amt_eth  # USDC per ETH
+        fwd_px = (Decimal(out_f) / (Decimal(10)**dec_u)) / amt_eth  # USDC per 1ETH (sell ETH)
 
-        # reverse: 500 USDC
+        # reverse: 500 USDC -> ETH via WONE
         amt_usdc = Decimal("500")
         wei_usdc = int(amt_usdc * (Decimal(10)**dec_u))
         path_rev = (Web3.to_bytes(hexstr=addr("1USDC")) + fee3(3000) +
@@ -332,9 +333,15 @@ def _eth_forward_reverse_notes() -> List[str]:
                     Web3.to_bytes(hexstr=addr("1ETH")))
         out_r = q.functions.quoteExactInput(path_rev, wei_usdc).call()[0]
         eth_out = Decimal(out_r) / (Decimal(10)**dec_e)
-        rev_px = (amt_usdc / eth_out) if eth_out > 0 else None
+        rev_px = (amt_usdc / eth_out) if eth_out > 0 else None  # USDC per 1ETH (buy ETH)
 
         if rev_px is not None:
+            notes.append(
+                "We compute price two ways: selling 1ETH into USDC (forward) "
+                f"and buying 1ETH with USDC (reverse). Forward={fwd_px:,.6f}, Reverse={rev_px:,.6f}. "
+                "When they differ a lot we prefer the reverse (buy) side as more representative."
+            )
+            # Keep your concise diagnostic line too:
             notes.append(f"1ETH: forward {fwd_px:,.6f} vs reverse {rev_px:,.6f} diverged; using reverse")
         else:
             notes.append(f"1ETH: forward {fwd_px:,.6f} (reverse probe failed)")
@@ -349,7 +356,7 @@ def cmd_prices(update: Update, context: CallbackContext):
     # Your preferred order
     syms = ["ONE","1USDC","1sDAI","TEC","1ETH"]
     vals = {}
-    notes: List[str] = []
+    errors: List[str] = []
     for s in syms:
         try:
             v = PR.price_usd(s, Decimal("1"))
@@ -359,7 +366,7 @@ def cmd_prices(update: Update, context: CallbackContext):
             vals[s] = v
         except Exception as e:
             vals[s] = None
-            notes.append(f"{s}: error ({e})")
+            errors.append(f"{s}: error ({e})")
 
     # Header block exactly like you had it
     out = ["LP Prices"]
@@ -382,12 +389,15 @@ def cmd_prices(update: Update, context: CallbackContext):
             except Exception:
                 pass
 
-    # Add forward/reverse diagnostic note for 1ETH (no price logic changed)
-    out.append("")
-    out.append("Notes:")
-    out.extend([f"  - {n}" for n in _eth_forward_reverse_notes()])
-    for n in notes:
-        out.append(f"  - {n}")
+    # Add forward/reverse explanatory note (no change to price logic)
+    notes = _eth_forward_reverse_notes()
+    if errors:
+        notes.extend(errors)
+
+    if notes:
+        out.append("")
+        out.append("Notes:")
+        out.extend([f"  - {n}" for n in notes])
 
     update.message.reply_text("\n".join(out))
 
@@ -397,64 +407,114 @@ def cmd_slippage(update: Update, context: CallbackContext):
         update.message.reply_text(
             "Usage: /slippage <TOKEN_IN> [AMOUNT] [TOKEN_OUT]\n"
             "Examples:\n"
-            "  /slippage 1ETH            (defaults: 1 unit to 1USDC)\n"
-            "  /slippage 1ETH 0.5 1USDC  (0.5 1ETH to 1USDC)"
+            "  /slippage 1ETH            (curve to 1USDC)\n"
+            "  /slippage 1ETH 0.5 1USDC  (single-size quote, 0.5 1ETH)"
         ); return
 
     token_in = args[0].upper()
-    amount_in = Decimal(args[1]) if len(args) >= 2 else Decimal("1")
-    token_out = args[2].upper() if len(args) >= 3 else "1USDC"
+    token_out = "1USDC"
+    amount_in = None
 
-    # Mid
+    # Parse optional amount and token_out
+    if len(args) >= 2:
+        try:
+            amount_in = Decimal(args[1])
+        except (InvalidOperation, ValueError):
+            amount_in = None
+    if len(args) >= 3:
+        token_out = args[2].upper()
+
+    # Baseline mid (USDC per 1 token_in if token_out==1USDC; otherwise synthetic)
     try:
-        mid = PR.price_usd(token_in, Decimal("1"))
+        if token_out == "1USDC":
+            mid = PR.price_usd(token_in, Decimal("1"))
+        else:
+            pa = PR.price_usd(token_in, Decimal("1"))
+            pb = PR.price_usd(token_out, Decimal("1"))
+            mid = (pa / pb) if (pa and pb and pb > 0) else None
     except Exception:
         mid = None
 
-    # Headline at requested size (if SL available)
-    headline = None
-    if SL and hasattr(SL, "compute_slippage"):
-        try:
-            res = SL.compute_slippage(token_in, token_out, amount_in, int(getattr(C, "SLIPPAGE_DEFAULT_BPS", 30)))
-            if res:
-                px = (res["amount_out"]/amount_in) if amount_in > 0 else None
-                headline = f"Size {amount_in} {token_in}: price {(px.quantize(Decimal('0.01')) if px else '—')} {token_out}/{token_in} · impact {res['impact_bps']} bps"
-        except Exception:
-            pass
+    chunks = [f"Slippage curve: {token_in} → {token_out}"]
+    if mid:
+        chunks.append(f"Baseline (mid): {_fmt_money(mid)} per 1 {token_in}")
 
-    # Curve (USDC targets), aligned table
-    targets = [Decimal("10"), Decimal("100"), Decimal("1000"), Decimal("10000")]
-    rows = []
-    for usdc in targets:
-        if mid and mid > 0:
-            est_in = (usdc / mid).quantize(Decimal("0.000001"))
-        else:
-            est_in = Decimal("0")
+    # Preferred: true curve via SL if available
+    curve_rows = None
+    route_text = None
+    if SL and hasattr(SL, "slippage_curve_usdc_sizes"):
         try:
-            px_usd = PR.price_usd(token_in, est_in)
-            eff = (px_usd / est_in) if (px_usd and est_in > 0) else None
-            slip = ((eff - mid) / mid * Decimal("100")) if (eff and mid) else None
-            rows.append((f"{usdc:,.0f}", f"{est_in:.6f}", f"{eff:,.2f}" if eff else "—", f"{slip:+.2f}%" if slip is not None else "—"))
+            sizes = [Decimal("10"), Decimal("100"), Decimal("1000"), Decimal("10000")]
+            curve = SL.slippage_curve_usdc_sizes(token_in, token_out, sizes)
+            if curve:
+                route_text = curve.get("path_text")
+                curve_rows = curve.get("rows", None)
         except Exception:
-            rows.append((f"{usdc:,.0f}", "—", "—", "—"))
+            log.exception("slippage curve failure")
 
-    # Build pretty table
+    # Fallback: estimate using price_usd (less accurate, but never crashes)
+    if curve_rows is None:
+        sizes = [Decimal("10"), Decimal("100"), Decimal("1000"), Decimal("10000")]
+        curve_rows = []
+        for S in sizes:
+            if not mid or mid <= 0:
+                curve_rows.append((S, None, None, None))
+                continue
+            est_in = (S / mid).quantize(Decimal("0.000001"))
+            try:
+                px_usd = PR.price_usd(token_in, est_in)  # USDC amount for est_in
+                eff = (px_usd / est_in) if (px_usd and est_in > 0) else None
+                slip = ((eff - mid) / mid * Decimal(100)) if (eff and mid) else None
+                curve_rows.append((S, est_in, eff, slip))
+            except Exception:
+                curve_rows.append((S, None, None, None))
+
+    # Render table
     col1, col2, col3, col4 = "Size (USDC)", "Amount In (sym)", "Eff. Price", "Slippage vs mid"
     w1, w2, w3, w4 = 12, 16, 12, 16
     line_hdr = f"{col1:>{w1}} | {col2:>{w2}} | {col3:>{w3}} | {col4:>{w4}}"
     line_sep = "-" * len(line_hdr)
     tbl = [line_hdr, line_sep]
-    for a,b,c,d in rows:
-        tbl.append(f"{a:>{w1}} | {b:>{w2}} | {('$'+c) if c!='—' else '—':>{w3}} | {d:>{w4}}")
+    for item in curve_rows:
+        # item can be dict (from SL) or tuple (fallback)
+        if isinstance(item, dict):
+            S = item.get("size_usdc"); ai = item.get("amt_in"); px = item.get("eff_px"); sp = item.get("slippage_pct")
+        else:
+            (S, ai, px, sp) = item
+        S_str = f"{S:,.0f}" if isinstance(S, Decimal) else str(S)
+        ai_str = f"{ai:.6f}" if isinstance(ai, Decimal) else "—"
+        if isinstance(px, Decimal):
+            px_str = _fmt_money(px) if token_out == "1USDC" else f"{px:,.6f}"
+        else:
+            px_str = "—"
+        sp_str = (f"{sp:+.2f}%" if isinstance(sp, Decimal) else "—")
+        tbl.append(f"{S_str:>{w1}} | {ai_str:>{w2}} | {px_str:>{w3}} | {sp_str:>{w4}}")
 
-    out = [f"Slippage curve: {token_in} → {token_out}"]
-    if mid:
-        out.append(f"Baseline (mid): ${mid:,.2f} per 1{token_in}")
-    if headline:
-        out.append(headline)
-    out.append("")
-    out.extend(tbl)
-    update.message.reply_text("\n".join(out))
+    chunks.append("")
+    chunks.extend(tbl)
+    if route_text:
+        chunks.append(f"\nRoute: {route_text}")
+
+    # Optional single-size block (legacy)
+    if amount_in is not None and SL and hasattr(SL, "compute_slippage"):
+        try:
+            res = SL.compute_slippage(token_in, token_out, amount_in, int(getattr(C, "SLIPPAGE_DEFAULT_BPS", 30)))
+            if res:
+                px = (res["amount_out"] / amount_in) if amount_in > 0 else None
+                px_str = _fmt_money(px) if (px and token_out == "1USDC") else (f"{px:.6f}" if px else "—")
+                chunks.append(
+                    "\nSingle-size quote:\n"
+                    f"  Size     : {amount_in} {token_in}\n"
+                    f"  QuoteOut : {res['amount_out_fmt']} {token_out}\n"
+                    f"  Impact   : {res['impact_bps']} bps\n"
+                    f"  minOut   : {res['min_out_fmt']} {token_out}  (tolerance {res['slippage_bps']} bps)\n"
+                    f"  Route    : {res['path_text']}\n"
+                    f"  Eff Px   : {px_str} {token_out}/{token_in}"
+                )
+        except Exception:
+            log.exception("single-size slippage failed")
+
+    update.message.reply_text("\n".join(chunks))
 
 def cmd_ping(update: Update, context: CallbackContext):
     ip_txt = "unknown"
