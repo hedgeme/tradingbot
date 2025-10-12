@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-# TECBot Telegram Listener — balances Option C (5dp), Coinbase fix, clearer price notes
+# TECBot Telegram Listener — formatting tuned; Coinbase hook tightened
 
 import os, sys, logging, subprocess, shlex
 from datetime import datetime, timezone
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 from typing import Optional, List
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ParseMode, Update
@@ -14,7 +14,7 @@ from telegram.ext import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
 log = logging.getLogger("telegram_listener")
 
-# Ensure /bot on sys.path so both root modules and app.* work
+# Ensure /bot on path
 if "/bot" not in sys.path:
     sys.path.insert(0, "/bot")
 
@@ -69,6 +69,23 @@ except Exception:
         log.warning("runner module not available: %s", e)
         runner = None
 
+# Optional Coinbase spot (prefer your repo helper)
+def _coinbase_eth() -> Optional[Decimal]:
+    # 1) prefer coinbase_client.fetch_eth_usd_price()
+    try:
+        import coinbase_client
+        px = coinbase_client.fetch_eth_usd_price()
+        if px is not None:
+            return Decimal(str(px))
+    except Exception:
+        pass
+    # 2) optional legacy get_spot
+    try:
+        import coinbase_client as CB
+        return Decimal(str(CB.get_spot("ETH-USD")))
+    except Exception:
+        return None
+
 # ---------- utils ----------
 def now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -89,28 +106,12 @@ def is_admin(user_id: int) -> bool:
 def _fmt_money(x: Optional[Decimal]) -> str:
     if x is None:
         return "—"
-    try:
-        x = Decimal(x)
-    except InvalidOperation:
-        return "—"
+    x = Decimal(x)
     if x >= 100:
         return f"${x:,.2f}"
     if x < Decimal("0.1"):
         return f"${x:,.6f}"
     return f"${x:,.4f}"
-
-def _coinbase_eth() -> Optional[Decimal]:
-    """
-    Fetch ETH/USD from Coinbase using your repo's coinbase_client.py
-    (function: fetch_eth_usd_price()).
-    """
-    try:
-        import coinbase_client as _cb
-        px = _cb.fetch_eth_usd_price()
-        return Decimal(str(px)) if px is not None else None
-    except Exception as e:
-        log.debug("coinbase fetch failed: %s", e)
-        return None
 
 # ---------- logging ----------
 def _log_update(update: Update, context: CallbackContext):
@@ -245,10 +246,10 @@ def cmd_assets(update: Update, context: CallbackContext):
     lines.append("-------------------------------------------------------")
     for k in sorted(wallets.keys()):
         lines.append(f"{k:<12} {wallets[k]}")
-    update.message.reply_text("\n".join(lines))
+    update.message.reply_text("<pre>" + "\n".join(lines) + "</pre>", parse_mode=ParseMode.HTML)
 
-# ---------- balances (Option C, 5 decimals, fixed-width) ----------
 def cmd_balances(update: Update, context: CallbackContext):
+    """Monospace table in Telegram; 5 decimals; no duplicate ONE/WONE columns."""
     if BL is None:
         update.message.reply_text("Balances unavailable (module not loaded)."); return
     try:
@@ -257,36 +258,34 @@ def cmd_balances(update: Update, context: CallbackContext):
         log.exception("balances failure")
         update.message.reply_text(f"Balances error: {e}"); return
 
-    # Display order you requested
-    cols = ["ONE(native)","1USDC","1ETH","TEC","1sDAI","WONE","ONE"]
+    # Show only relevant columns (drop duplicate wrapped ONE & ERC-20 ONE)
+    cols = ["ONE(native)", "1USDC", "1ETH", "TEC", "1sDAI"]
+    # header
+    ts = now_iso()
+    hdr = f"Balances (@ {ts})"
+    head_row = "Wallet             " + "  ".join(f"{c:>12}" for c in cols)
+    sep = "-" * len(head_row)
 
-    def fmt5(x):
+    def fmt(v):
         try:
-            d = Decimal(str(x))
-            s = f"{d:.5f}"
-            return "0.00000" if s.upper() == "0E-8" else s
+            d = Decimal(str(v))
+            q = d.quantize(Decimal("0.00001"))
+            s = f"{q:.5f}"
+            return "0.00000" if q == 0 else s
         except Exception:
-            return str(x)
+            return str(v)
 
-    lines = [f"Balances (@ {now_iso()})"]
-    # Per-wallet blocks, single line each (Option C)
+    lines = [hdr, head_row, sep]
     for w_name in sorted(table.keys()):
         row = table[w_name]
-        parts = [f"{c} {fmt5(row.get(c, 0))}" for c in cols]
-        lines.append(f"{w_name}")
-        lines.append("  " + "   ".join(parts))
-        lines.append("")  # blank line between wallets
+        vals = [fmt(row.get(c, 0)) for c in cols]
+        lines.append(f"{w_name:<18}" + "  ".join(f"{v:>12}" for v in vals))
 
-    # Wrap in <pre> so Telegram keeps monospaced alignment
-    body = "\n".join(lines).rstrip()
-    update.message.reply_text(f"<pre>{body}</pre>", parse_mode=ParseMode.HTML)
+    update.message.reply_text("<pre>" + "\n".join(lines) + "</pre>", parse_mode=ParseMode.HTML)
 
-# ---- ETH forward vs reverse tiny-probe (for Notes) ----
-def _eth_forward_reverse_note() -> str:
-    """
-    Probe 1ETH↔USDC both directions via WONE using QuoterV2.
-    Returns one concise line for /prices Notes.
-    """
+# ---- ETH forward vs reverse tiny-probe (for Notes only) ----
+def _eth_forward_reverse_notes() -> List[str]:
+    notes = []
     try:
         from web3 import Web3
         from app.chain import get_ctx
@@ -304,18 +303,18 @@ def _eth_forward_reverse_note() -> str:
         def addr(s): return Web3.to_checksum_address(PR._addr(s))
         def fee3(f): return int(f).to_bytes(3, "big")
 
-        # forward: sell 1 ETH
-        amt_eth = Decimal("1")
+        # forward: sell 0.10 ETH to USDC
+        amt_eth = Decimal("0.10")
         dec_e = PR._dec("1ETH"); dec_u = PR._dec("1USDC")
         wei_in = int(amt_eth * (Decimal(10)**dec_e))
         path_fwd = (Web3.to_bytes(hexstr=addr("1ETH")) + fee3(3000) +
                     Web3.to_bytes(hexstr=addr("WONE")) + fee3(3000) +
                     Web3.to_bytes(hexstr=addr("1USDC")))
         out_f = q.functions.quoteExactInput(path_fwd, wei_in).call()[0]
-        fwd_px = (Decimal(out_f) / (Decimal(10)**dec_u)) / amt_eth
+        fwd_px = (Decimal(out_f) / (Decimal(10)**dec_u)) / amt_eth  # USDC per ETH
 
-        # reverse: buy ETH with 1,000 USDC (invert)
-        amt_usdc = Decimal("1000")
+        # reverse: buy ETH with 500 USDC
+        amt_usdc = Decimal("500")
         wei_usdc = int(amt_usdc * (Decimal(10)**dec_u))
         path_rev = (Web3.to_bytes(hexstr=addr("1USDC")) + fee3(3000) +
                     Web3.to_bytes(hexstr=addr("WONE")) + fee3(3000) +
@@ -324,52 +323,31 @@ def _eth_forward_reverse_note() -> str:
         eth_out = Decimal(out_r) / (Decimal(10)**dec_e)
         rev_px = (amt_usdc / eth_out) if eth_out > 0 else None
 
-        if rev_px is None:
-            return f"1ETH: forward ${fwd_px:,.6f} (reverse probe failed)"
-        return f"1ETH: forward {fwd_px:,.6f} vs reverse {rev_px:,.6f} — using reverse if they diverge"
+        if rev_px is not None:
+            notes.append(f"1ETH: forward {fwd_px:,.6f} vs reverse {rev_px:,.6f} — using reverse when they diverge")
+        else:
+            notes.append(f"1ETH: forward {fwd_px:,.6f} (reverse probe failed)")
     except Exception as e:
-        return f"1ETH note probe error: {e}"
-
-def _eth_basis_note(lp_eth_usd: Optional[Decimal]) -> Optional[str]:
-    """
-    Adds a clear basis line for the LP ETH price and optional impact vs 'mid' estimate.
-    """
-    try:
-        if lp_eth_usd is None or PR is None:
-            return None
-        # mid estimate from tiny size
-        tiny = Decimal("0.01")
-        tiny_total = PR.price_usd("1ETH", tiny)  # USDC value for 0.01 ETH
-        if not tiny_total:
-            return f"1ETH LP price is a live on-chain quote for trading exactly 1.00000 1ETH via 1ETH → WONE → 1USDC."
-        mid = tiny_total / tiny
-        impact_bps = (Decimal(lp_eth_usd) - mid) / mid * Decimal(10000)
-        return ( "1ETH LP price is a live on-chain quote for trading exactly 1.00000 1ETH via 1ETH → WONE → 1USDC. "
-                 f"(impact vs tiny-size mid ≈ {impact_bps:.0f} bps)" )
-    except Exception:
-        return "1ETH LP price is a live on-chain quote for trading exactly 1.00000 1ETH via 1ETH → WONE → 1USDC."
+        notes.append(f"1ETH note probe error: {e}")
+    return notes
 
 def cmd_prices(update: Update, context: CallbackContext):
     if PR is None:
         update.message.reply_text("Prices unavailable (module not loaded)."); return
 
-    # Your preferred display order
     syms = ["ONE","1USDC","1sDAI","TEC","1ETH"]
     vals = {}
-    err_notes: List[str] = []
-
+    notes: List[str] = []
     for s in syms:
         try:
             v = PR.price_usd(s, Decimal("1"))
             if s == "ONE" and v is None:
-                # If native ONE isn't priced, mirror WONE for display
                 v = PR.price_usd("WONE", Decimal("1"))
             vals[s] = v
         except Exception as e:
             vals[s] = None
-            err_notes.append(f"{s}: error ({e})")
+            notes.append(f"{s}: error ({e})")
 
-    # Header block you like
     out = ["LP Prices"]
     for s in syms:
         if s == "ONE" and vals[s] is None:
@@ -379,25 +357,22 @@ def cmd_prices(update: Update, context: CallbackContext):
     # Coinbase compare (ETH)
     lp_eth = vals.get("1ETH")
     cb_eth = _coinbase_eth()
-    out += ["", "ETH: Harmony LP vs Coinbase"]
-    out.append(f"  LP:       {_fmt_money(lp_eth)}")
-    out.append(f"  Coinbase: {_fmt_money(cb_eth)}")
-    if lp_eth is not None and cb_eth not in (None, Decimal(0)):
-        try:
-            diff = (Decimal(lp_eth) - Decimal(cb_eth)) / Decimal(cb_eth) * Decimal(100)
-            sign = "+" if diff >= 0 else ""
-            out.append(f"  Diff:     {sign}{diff:.2f}%")
-        except Exception:
-            pass
+    if lp_eth is not None or cb_eth is not None:
+        out += ["", "ETH: Harmony LP vs Coinbase"]
+        out.append(f"  LP:       {_fmt_money(lp_eth)}")
+        out.append(f"  Coinbase: {_fmt_money(cb_eth)}")
+        if lp_eth is not None and cb_eth not in (None, Decimal(0)):
+            try:
+                diff = (Decimal(lp_eth) - Decimal(cb_eth)) / Decimal(cb_eth) * Decimal(100)
+                sign = "+" if diff >= 0 else ""
+                out.append(f"  Diff:     {sign}{diff:.2f}%")
+            except Exception:
+                pass
 
-    # Notes: basis + concise forward/reverse
     out.append("")
     out.append("Notes:")
-    basis = _eth_basis_note(lp_eth)
-    if basis:
-        out.append(f"  - {basis}")
-    out.append(f"  - {_eth_forward_reverse_note()}")
-    for n in err_notes:
+    out.extend([f"  - {n}" for n in _eth_forward_reverse_notes()])
+    for n in notes:
         out.append(f"  - {n}")
 
     update.message.reply_text("\n".join(out))
@@ -413,50 +388,41 @@ def cmd_slippage(update: Update, context: CallbackContext):
         ); return
 
     token_in = args[0].upper()
-    try:
-        amount_in = Decimal(args[1]) if len(args) >= 2 else Decimal("1")
-    except InvalidOperation:
-        update.message.reply_text("Bad amount. Example: /slippage 1ETH 0.5 1USDC"); return
+    amount_in = Decimal(args[1]) if len(args) >= 2 else Decimal("1")
     token_out = args[2].upper() if len(args) >= 3 else "1USDC"
 
-    # Mid (per 1 unit of token_in)
     try:
-        mid_total = PR.price_usd(token_in, Decimal("1"))
-        mid = mid_total if isinstance(mid_total, Decimal) else Decimal(str(mid_total)) if mid_total is not None else None
+        mid = PR.price_usd(token_in, Decimal("1"))
     except Exception:
         mid = None
 
-    # Headline at requested size (if SL available)
     headline = None
     if SL and hasattr(SL, "compute_slippage"):
         try:
             res = SL.compute_slippage(token_in, token_out, amount_in, int(getattr(C, "SLIPPAGE_DEFAULT_BPS", 30)))
             if res:
                 px = (res["amount_out"]/amount_in) if amount_in > 0 else None
-                px_txt = f"{px:,.2f}" if px is not None else "—"
-                headline = f"Size {amount_in} {token_in}: price {px_txt} {token_out}/{token_in} · impact {res['impact_bps']} bps"
-        except Exception as e:
-            log.debug("slippage headline calc failed: %s", e)
+                headline = f"Size {amount_in} {token_in}: price {(px.quantize(Decimal('0.01')) if px else '—')} {token_out}/{token_in} · impact {res['impact_bps']} bps"
+        except Exception:
+            pass
 
-    # Curve (USDC targets), aligned table
     targets = [Decimal("10"), Decimal("100"), Decimal("1000"), Decimal("10000")]
     rows = []
     for usdc in targets:
         if mid and mid > 0:
-            est_in = (usdc / mid).quantize(Decimal("0.000001"))
+            est_in = (usdc / mid).quantize(Decimal("0.00001"))
         else:
             est_in = Decimal("0")
         try:
-            px_total = PR.price_usd(token_in, est_in)  # total USDC for est_in
-            eff = (px_total / est_in) if (px_total and est_in > 0) else None
+            px_usd = PR.price_usd(token_in, est_in)
+            eff = (px_usd / est_in) if (px_usd and est_in > 0) else None
             slip = ((eff - mid) / mid * Decimal("100")) if (eff and mid) else None
-            rows.append((f"{usdc:,.0f}", f"{est_in:.6f}", f"{eff:,.2f}" if eff else "—", f"{slip:+.2f}%" if slip is not None else "—"))
+            rows.append((f"{usdc:,.0f}", f"{est_in:.5f}", f"{eff:,.2f}" if eff else "—", f"{slip:+.2f}%" if slip is not None else "—"))
         except Exception:
             rows.append((f"{usdc:,.0f}", "—", "—", "—"))
 
-    # Pretty fixed-width table (monospace) for readability
     col1, col2, col3, col4 = "Size (USDC)", "Amount In (sym)", "Eff. Price", "Slippage vs mid"
-    w1, w2, w3, w4 = 12, 16, 12, 16
+    w1, w2, w3, w4 = 12, 17, 12, 16
     line_hdr = f"{col1:>{w1}} | {col2:>{w2}} | {col3:>{w3}} | {col4:>{w4}}"
     line_sep = "-" * len(line_hdr)
     tbl = [line_hdr, line_sep]
@@ -470,10 +436,7 @@ def cmd_slippage(update: Update, context: CallbackContext):
         out.append(headline)
     out.append("")
     out.extend(tbl)
-
-    # Send monospace so columns line up perfectly
-    body = "\n".join(out)
-    update.message.reply_text(f"<pre>{body}</pre>", parse_mode=ParseMode.HTML)
+    update.message.reply_text("\n".join(out))
 
 def cmd_ping(update: Update, context: CallbackContext):
     ip_txt = "unknown"
@@ -561,7 +524,6 @@ def on_exec_cancel(update: Update, context: CallbackContext):
     q.edit_message_text("Canceled. No transaction sent.")
     q.answer()
 
-# ---------- main ----------
 def main():
     token = os.environ.get("TELEGRAM_BOT_TOKEN") or getattr(C, "TELEGRAM_BOT_TOKEN", None)
     if not token:
