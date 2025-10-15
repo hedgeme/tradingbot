@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-# TECBot Telegram Listener — table formatting + Coinbase compare (no unrelated changes)
+# TECBot Telegram Listener — formats locked; per-unit LP price & slippage fixed (listener-only)
 
 import os, sys, logging, subprocess, shlex
 from datetime import datetime, timezone
-from decimal import Decimal, ROUND_HALF_UP
-from typing import Optional, List, Tuple
+from decimal import Decimal, ROUND_DOWN
+from typing import Optional, List, Tuple, Dict
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ParseMode, Update
 from telegram.ext import (
@@ -14,10 +14,11 @@ from telegram.ext import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
 log = logging.getLogger("telegram_listener")
 
+# Ensure /bot on path
 if "/bot" not in sys.path:
     sys.path.insert(0, "/bot")
 
-# ----- tolerant imports -----
+# ---------- tolerant imports ----------
 try:
     from app import config as C
     log.info("Loaded config from app.config")
@@ -27,7 +28,7 @@ except Exception:
 
 PR = BL = SL = None
 try:
-    from app import prices as PR
+    from app import prices as PR   # we'll still use helpers (_addr, _dec, _find_pool, price_usd)
     log.info("Loaded prices from app.prices")
 except Exception as e:
     log.warning("prices module not available: %s", e)
@@ -68,7 +69,7 @@ except Exception:
         log.warning("runner module not available: %s", e)
         runner = None
 
-# Coinbase spot
+# Optional Coinbase spot (existing file in repo)
 CB = None
 try:
     import coinbase_client as CB  # exposes fetch_eth_usd_price()
@@ -96,33 +97,255 @@ def _fmt_money(x: Optional[Decimal]) -> str:
     if x is None:
         return "—"
     x = Decimal(x)
-    # 5 decimals as requested
-    q = x.quantize(Decimal("0.00001"), rounding=ROUND_HALF_UP)
-    if q >= 100:
-        return f"${q:,.2f}"
-    return f"${q:,.5f}"
+    if x >= 1000:
+        return f"${x:,.2f}"
+    if x >= 1:
+        return f"${x:,.5f}"  # 5 decimals for sub-$1000 per your request
+    return f"${x:,.5f}"
 
 def _coinbase_eth() -> Optional[Decimal]:
     if CB is None:
         return None
     try:
-        px = CB.fetch_eth_usd_price()
-        return Decimal(str(px)) if px is not None else None
+        v = CB.fetch_eth_usd_price()
+        return Decimal(str(v)) if v is not None else None
     except Exception:
         return None
 
-def _table(rows: List[List[str]]) -> str:
-    """Simple monospace table with auto widths."""
-    if not rows:
-        return ""
-    widths = [max(len(r[i]) for r in rows) for i in range(len(rows[0]))]
-    out = []
-    for n, r in enumerate(rows):
-        line = " | ".join(f"{r[i]:<{widths[i]}}" for i in range(len(widths)))
-        out.append(line)
-        if n == 0:
-            out.append("-+-".join("-" * w for w in widths))
-    return "\n".join(out)
+def _qctx():
+    # lazy import only when needed (for quoting tables)
+    from app.chain import get_ctx
+    from web3 import Web3
+    return get_ctx(C.HARMONY_RPC), Web3
+
+# ------------- QUOTER helpers (listener-only) -------------
+# Minimal ABI for QuoterV2.quoteExactInput(bytes path, uint256 amountIn)
+_QUOTER_ABI = [{
+    "inputs":[
+      {"internalType":"bytes","name":"path","type":"bytes"},
+      {"internalType":"uint256","name":"amountIn","type":"uint256"}
+    ],
+    "name":"quoteExactInput",
+    "outputs":[
+      {"internalType":"uint256","name":"amountOut","type":"uint256"},
+      {"internalType":"uint160","name":"sqrtPriceX96After","type":"uint160"},
+      {"internalType":"uint32","name":"initializedTicksCrossed","type":"uint32"},
+      {"internalType":"uint256","name":"gasEstimate","type":"uint256"}],
+    "stateMutability":"nonpayable","type":"function"
+}]
+
+def _fee3(fee: int) -> bytes:
+    return int(fee).to_bytes(3, "big")
+
+def _build_forward_path(sym_in: str, sym_out: str = "1USDC") -> Optional[List[Tuple[str,int,str]]]:
+    """Forward path using only verified pools (sym_in -> ... -> sym_out)."""
+    s = sym_in.upper()
+    if s == sym_out.upper():
+        return []
+    # direct
+    f = PR._find_pool(s, sym_out)
+    if f:
+        return [(s, f, sym_out)]
+    # via WONE
+    f1 = PR._find_pool(s, "WONE"); f2 = PR._find_pool("WONE", sym_out)
+    if f1 and f2:
+        return [(s, f1, "WONE"), ("WONE", f2, sym_out)]
+    # via 1sDAI
+    f1 = PR._find_pool(s, "1sDAI"); f2 = PR._find_pool("1sDAI", sym_out)
+    if f1 and f2:
+        return [(s, f1, "1sDAI"), ("1sDAI", f2, sym_out)]
+    return None
+
+def _build_reverse_path(sym_in: str, sym_out: str = "1USDC") -> Optional[List[Tuple[str,int,str]]]:
+    """Reverse-buy path (sym_out -> ... -> sym_in); we still encode forward bytes path from sym_out to sym_in."""
+    t = sym_in.upper()
+    base = sym_out.upper()
+    # direct
+    f = PR._find_pool(base, t)
+    if f:
+        return [(base, f, t)]
+    # via WONE
+    f1 = PR._find_pool(base, "WONE"); f2 = PR._find_pool("WONE", t)
+    if f1 and f2:
+        return [(base, f1, "WONE"), ("WONE", f2, t)]
+    # via 1sDAI
+    f1 = PR._find_pool(base, "1sDAI"); f2 = PR._find_pool("1sDAI", t)
+    if f1 and f2:
+        return [(base, f1, "1sDAI"), ("1sDAI", f2, t)]
+    return None
+
+def _path_bytes(hops: List[Tuple[str,int,str]], Web3) -> bytes:
+    b = b""
+    for i,(a,fee,bn) in enumerate(hops):
+        if i==0:
+            b += Web3.to_bytes(hexstr=Web3.to_checksum_address(PR._addr(a)))
+        b += _fee3(fee) + Web3.to_bytes(hexstr=Web3.to_checksum_address(PR._addr(bn)))
+    return b
+
+def _quote_exact_input(hops: List[Tuple[str,int,str]], amount_in_wei: int) -> Optional[int]:
+    try:
+        ctx, Web3 = _qctx()
+        q = ctx.w3.eth.contract(address=Web3.to_checksum_address(C.QUOTER_ADDR), abi=_QUOTER_ABI)
+        out = q.functions.quoteExactInput(_path_bytes(hops, Web3), int(amount_in_wei)).call()
+        return int(out[0])
+    except Exception as e:
+        log.debug("quoteExactInput error: %s", e)
+        return None
+
+# ------------- rendering helpers -------------
+def _balances_block(table: Dict[str, Dict[str, Decimal]]) -> str:
+    # Approved style (5 decimals), no duplicate ONE/WONE columns.
+    order = ["ONE(native)", "1USDC", "1ETH", "TEC", "1sDAI"]
+    def fmt(d: Decimal) -> str:
+        try:
+            q = Decimal(d).quantize(Decimal("0.00001"), rounding=ROUND_DOWN)
+            return f"{q:.5f}"
+        except Exception:
+            return str(d)
+    lines = [f"Balances (@ {now_iso()})"]
+    for w_name in sorted(table.keys()):
+        row = table[w_name]
+        parts = []
+        for col in order:
+            v = row.get(col, Decimal("0"))
+            parts.append(f"{col} {fmt(v)}")
+        lines.append(f"{w_name}\n  " + "   ".join(parts) + "\n")
+    return "\n".join(lines).rstrip()
+
+def _prices_table() -> str:
+    # Option C: Asset | LP Price | Quote Basis | Slippage | Route
+    # Per-unit price: price_usd(basis) / basis; Slippage: impact vs tiny probe on the same forward path.
+    syms = ["ONE","1USDC","1sDAI","TEC","1ETH"]
+    basis_map = {"ONE": Decimal("1"), "1USDC": Decimal("1"), "1sDAI": Decimal("1"),
+                 "TEC": Decimal("100"), "1ETH": Decimal("1")}
+    rows = []
+    # Tiny probe sizes (forward) used to approximate "mid-impact" bps
+    tiny_probe = {"ONE": Decimal("0.05"), "1USDC": Decimal("1"),
+                  "1sDAI": Decimal("0.05"), "TEC": Decimal("50"), "1ETH": Decimal("0.01")}
+    for s in syms:
+        try:
+            # Special: ONE priced via WONE forward
+            route_hops = _build_forward_path("WONE" if s=="ONE" else s, "1USDC")
+            route_text = "—" if s=="1USDC" else " → ".join(h[0] for h in route_hops) + f" → {route_hops[-1][2]}" if route_hops else "—"
+            if s=="ONE":
+                # compute via WONE amount = basis
+                basis = basis_map[s]
+                price_total = PR.price_usd("WONE", basis)  # total USDC for basis
+                lp_per_unit = (price_total / basis) if (price_total and basis>0) else None
+                # slippage via tiny probe on WONE
+                dec_in = PR._dec("WONE"); dec_usd = PR._dec("1USDC")
+                probe = tiny_probe[s]
+                wei_in = int(probe * (Decimal(10)**dec_in))
+                wei_out = _quote_exact_input(route_hops, wei_in) if route_hops else None
+                mid = (Decimal(wei_out) / (Decimal(10)**dec_usd) / probe) if (wei_out and probe>0) else None
+                bps = int(((lp_per_unit - mid)/mid*Decimal(10000)).quantize(Decimal("1"))) if (lp_per_unit and mid and mid>0) else 0
+                rows.append(("ONE", lp_per_unit, basis, bps, route_text + " (fwd)"))
+                continue
+
+            # General case
+            basis = basis_map[s]
+            total = PR.price_usd(s, basis)  # USDC total for "basis" units
+            lp_per_unit = (total / basis) if (total and basis>0) else None
+
+            # Forward tiny-probe slippage
+            if s != "1USDC" and route_hops:
+                dec_in = PR._dec("WONE" if s=="ONE" else s); dec_usd = PR._dec("1USDC")
+                probe = tiny_probe[s]
+                wei_in = int(probe * (Decimal(10)**dec_in))
+                wei_out = _quote_exact_input(route_hops, wei_in)
+                mid = (Decimal(wei_out) / (Decimal(10)**dec_usd) / probe) if (wei_out and probe>0) else None
+                bps = int(((lp_per_unit - mid)/mid*Decimal(10000)).quantize(Decimal("1"))) if (lp_per_unit and mid and mid>0) else 0
+            else:
+                bps = 0
+
+            # ETH: annotate (rev) if reverse is tighter (display stays per forward/best already inside prices.py)
+            suffix = ""
+            if s == "1ETH":
+                # forward & reverse per-unit comparison (small basis 1 ETH and buy-1ETH via reverse)
+                # Forward per-unit from lp_per_unit already; compute reverse by buying 1 ETH in USDC and invert
+                rev_hops = _build_reverse_path("1ETH","1USDC")
+                dec_usd = PR._dec("1USDC"); dec_eth = PR._dec("1ETH")
+                # buy 1 ETH: we don't know exact USDC needed; sample 1000 USDC and invert
+                if rev_hops:
+                    wei_in = int(Decimal("1000") * (Decimal(10)**dec_usd))
+                    wei_out = _quote_exact_input(rev_hops, wei_in)
+                    eth_out = Decimal(wei_out) / (Decimal(10)**dec_eth) if wei_out else None
+                    rev_per_unit = (Decimal("1000")/eth_out) if (eth_out and eth_out>0) else None
+                    if lp_per_unit and rev_per_unit:
+                        if rev_per_unit > lp_per_unit * Decimal("1.01"):  # >1% tighter
+                            suffix = " (rev)"
+                            lp_per_unit = rev_per_unit  # display tighter
+                route_text += " (rev)" if suffix else " (fwd)"
+
+            rows.append((s, lp_per_unit, basis, bps, route_text))
+        except Exception as e:
+            rows.append((s, None, basis_map[s], 0, "—"))
+
+    # Format table (fixed-width; Telegram-friendly)
+    header = "LP Prices"
+    colh = "Asset | LP Price  | Quote Basis | Slippage | Route"
+    sep  = "------+-----------+-------------+----------+----------------------------"
+    lines = [header, colh, sep]
+    for a,px,basis,bps,route in rows:
+        pxs = _fmt_money(px)
+        bas = f"{basis:.5f}"
+        slp = f"{bps:>4} bps" if px not in (None,"—") else "  —   "
+        lines.append(f"{a:<5} | {pxs:<9} | {bas:<11} | {slp:<8} | {route}")
+    # Coinbase compare (ETH)
+    eth_lp = next((x[1] for x in rows if x[0]=="1ETH"), None)
+    cb = _coinbase_eth()
+    lines.append("")
+    lines.append("ETH: Harmony LP vs Coinbase")
+    lines.append(f"  LP:       {_fmt_money(eth_lp)}")
+    lines.append(f"  Coinbase: {_fmt_money(cb)}")
+    if eth_lp is not None and cb not in (None, Decimal(0)):
+        diff = (Decimal(eth_lp) - Decimal(cb)) / Decimal(cb) * Decimal(100)
+        lines.append(f"  Diff:     {diff:+.2f}%")
+    return "\n".join(lines)
+
+def _slippage_table(token_in: str, token_out: str) -> str:
+    # Build forward path; if ETH, also compute mid with reverse check but rows are quoted forward on the chosen path.
+    token_in = token_in.upper(); token_out = token_out.upper()
+    if token_out != "1USDC":
+        token_out = "1USDC"  # we only render USDC slippage tables
+    # Choose path
+    if token_in == "ONE":
+        hops = _build_forward_path("WONE", token_out)
+        sym_for_dec = "WONE"
+    else:
+        hops = _build_forward_path(token_in, token_out)
+        sym_for_dec = token_in
+    # Mid (per-unit) using tiny probe on the same forward path
+    dec_in = PR._dec(sym_for_dec); dec_usd = PR._dec("1USDC")
+    probe = Decimal("0.01") if token_in != "TEC" else Decimal("10")
+    wei_in = int(probe * (Decimal(10)**dec_in))
+    wei_out = _quote_exact_input(hops, wei_in) if hops else None
+    mid = (Decimal(wei_out) / (Decimal(10)**dec_usd) / probe) if (hops and wei_out and probe>0) else None
+
+    head = [f"Slippage: {token_in} → {token_out}"]
+    if mid:
+        head.append(f"Baseline (mid): ${mid:,.2f} per 1{token_in}")
+
+    # Targets (USDC) and rows
+    targets = [Decimal("10"), Decimal("100"), Decimal("1000"), Decimal("10000")]
+    colh = " Size (USDC) | Amount In ({}) | Eff. Price | Slippage vs mid".format(token_in)
+    sep  = "------------+-----------------+------------+----------------"
+    rows = [colh, sep]
+    for usdc in targets:
+        if not (hops and mid and mid > 0):
+            rows.append(f"{usdc:>12} | {'—':>15} | {'—':>10} | {'—':>14}")
+            continue
+        est_in = (usdc / mid).quantize(Decimal("0.000001"), rounding=ROUND_DOWN)
+        wei_in = int(est_in * (Decimal(10)**dec_in))
+        wei_out = _quote_exact_input(hops, wei_in)
+        if not wei_out:
+            rows.append(f"{usdc:>12} | {'—':>15} | {'—':>10} | {'—':>14}")
+            continue
+        eff = (Decimal(wei_out) / (Decimal(10)**dec_usd) / est_in) if est_in > 0 else None
+        slip = ((eff - mid)/mid*Decimal(100)) if (eff and mid) else None
+        rows.append(f"{usdc:>12} | {est_in:>15.6f} | ${eff:>9.2f} | {slip:+>13.2f}%")
+
+    return "\n".join(head + [""] + rows)
 
 # ---------- logging ----------
 def _log_update(update: Update, context: CallbackContext):
@@ -151,11 +374,11 @@ def cmd_help(update: Update, context: CallbackContext):
         "Commands:\n"
         "  /ping — health check\n"
         "  /plan — preview proposed actions (planner)\n"
-        "  /dryrun — simulate action(s) (runner)\n"
+        "  /dryrun — simulate current action(s) with Execute button (runner)\n"
         "  /cooldowns [bot|route] — show cooldowns\n"
         "  /prices [SYMS…] — on-chain quotes in USDC (e.g. /prices 1ETH TEC)\n"
-        "  /balances — per-wallet balances (ERC-20 + native ONE)\n"
-        "  /slippage <IN> [AMOUNT] [OUT] — live impact/minOut (default OUT=1USDC)\n"
+        "  /balances — per-wallet balances\n"
+        "  /slippage <IN> [AMOUNT] [OUT] — live impact curve (OUT=1USDC)\n"
         "  /assets — configured tokens & wallets\n"
         "  /version — code version\n"
         "  /sanity — config/modules sanity"
@@ -183,9 +406,10 @@ def cmd_sanity(update: Update, context: CallbackContext):
         "balances_loaded": bool(BL),
         "slippage_loaded": bool(SL),
     }
-    txt = "Sanity:\n" + "\n".join(f"  {k}: {v}" for k,v in details.items())
-    txt += "\n\nModules:\n" + "\n".join(f"  {k}: {v}" for k,v in avail.items())
-    update.message.reply_text(txt)
+    update.message.reply_text(
+        "Sanity:\n  " + "\n  ".join(f"{k}: {v}" for k,v in details.items()) +
+        "\n\nModules:\n  " + "\n  ".join(f"{k}: {v}" for k,v in avail.items())
+    )
 
 def cmd_assets(update: Update, context: CallbackContext):
     tokens = {k.upper(): v for k, v in getattr(C, "TOKENS", {}).items()}
@@ -210,201 +434,25 @@ def cmd_balances(update: Update, context: CallbackContext):
     except Exception as e:
         log.exception("balances failure")
         update.message.reply_text(f"Balances error: {e}"); return
-
-    # Show ONE(native) only; hide duplicate ONE/WONE token rows in the balances view
-    show_syms = ["ONE(native)","1USDC","1ETH","TEC","1sDAI"]  # you can re-order as you like
-    rows = [["Wallet"] + show_syms]
-    for w_name in sorted(table.keys()):
-        row = [w_name]
-        for s in show_syms:
-            v = table[w_name].get(s, Decimal("0"))
-            if isinstance(v, Decimal):
-                v = v.quantize(Decimal("0.00001"))
-            else:
-                try:
-                    v = Decimal(str(v)).quantize(Decimal("0.00001"))
-                except Exception:
-                    pass
-            # normalize 0E-8 prints
-            v = "0.00000" if str(v).upper().startswith("0E-") else f"{v}"
-            row.append(v)
-        rows.append(row)
-
-    txt = f"Balances (@ {now_iso()})\n" + _table(rows)
-    update.message.reply_text(txt)
-
-# ---- prices table (LP) ----
-def _lp_row(sym: str, basis: Decimal) -> Tuple[str,str,str,str,str]:
-    """
-    Returns the row for the LP table:
-      Asset | LP Price | Quote Basis | Slippage | Route
-    Slippage: (price_at_basis - price_at_tiny) / price_at_tiny, in bps
-    Route: textual path; '(rev)' appended if reverse was used by price logic (ETH).
-    """
-    asset = sym
-    # price at basis
-    px_basis = PR.price_usd(sym, basis)
-    # tiny mid (0.01 or 1 for 1USDC)
-    tiny_amt = Decimal("0.01") if sym != "1USDC" else Decimal("1")
-    px_tiny = PR.price_usd(sym, tiny_amt)
-    # slippage bps
-    if px_basis and px_tiny and px_tiny > 0:
-        slip_bps = (Decimal(px_basis) - Decimal(px_tiny)) / Decimal(px_tiny) * Decimal(10000)
-        slip_txt = f"{int(slip_bps):d} bps" if slip_bps is not None else "—"
-    else:
-        slip_txt = "—"
-
-    # route text (best-effort)
-    route_txt = "best path"
-    try:
-        # infer by probing forward routes; if forward and reverse differ a lot, assume '(rev)' used for ETH
-        # We keep it lightweight: only annotate ETH as reverse sometimes
-        if sym == "1ETH":
-            fwd = _safe(PR.price_usd)("1ETH", basis)
-            rev = _safe_rev_price("1ETH", basis)
-            if fwd and rev:
-                # same policy as prices.py (~3% divergence prefers reverse)
-                if fwd > 0 and abs(rev - fwd) / fwd > Decimal("0.03"):
-                    route_txt = "1ETH → WONE → 1USDC (rev)"
-                else:
-                    route_txt = "1ETH → WONE → 1USDC (fwd)"
-            else:
-                route_txt = "1ETH → WONE → 1USDC"
-        elif sym == "TEC":
-            route_txt = "TEC → WONE → 1USDC"
-        elif sym == "1sDAI":
-            route_txt = "1sDAI → 1USDC"
-        elif sym in ("ONE", "WONE"):
-            route_txt = "WONE → 1USDC"
-        elif sym == "1USDC":
-            route_txt = "—"
-    except Exception:
-        pass
-
-    return (asset, _fmt_money(px_basis), f"{basis:.5f}", slip_txt, route_txt)
-
-def _safe(fn):
-    def inner(*a, **kw):
-        try:
-            return fn(*a, **kw)
-        except Exception:
-            return None
-    return inner
-
-def _safe_rev_price(sym: str, amount: Decimal) -> Optional[Decimal]:
-    # Try to infer reverse price by trick: call price twice and perturb; if it moves in direction expected.
-    # Keep it very light-touch; we only need it to label '(rev)' sometimes in the route column.
-    try:
-        return PR.price_usd(sym, amount)  # already uses reverse/forward policy inside
-    except Exception:
-        return None
+    update.message.reply_text(_balances_block(table))
 
 def cmd_prices(update: Update, context: CallbackContext):
     if PR is None:
         update.message.reply_text("Prices unavailable (module not loaded)."); return
-
-    # Table columns you requested
-    rows = [["Asset", "LP Price", "Quote Basis", "Slippage", "Route"]]
-
-    # Chosen per-asset basis
-    basis = {
-        "ONE": Decimal("1"),
-        "1USDC": Decimal("1"),
-        "1sDAI": Decimal("1"),
-        "TEC": Decimal("100"),     # smoother for thin pool
-        "1ETH": Decimal("1"),
-    }
-
-    order = ["ONE","1USDC","1sDAI","TEC","1ETH"]
-
-    # Fill rows
-    for sym in order:
-        try:
-            rows.append(list(_lp_row(sym, basis[sym])))
-        except Exception as e:
-            rows.append([sym, "—", f"{basis[sym]:.5f}", "—", f"error: {e}"])
-
-    # Build output
-    out = ["LP Prices", _table(rows), ""]
-    # Coinbase compare (ETH)
-    lp_eth = None
-    try:
-        lp_eth = PR.price_usd("1ETH", basis["1ETH"])
-    except Exception:
-        lp_eth = None
-    cb_eth = _coinbase_eth()
-    out.append("ETH: Harmony LP vs Coinbase")
-    out.append(f"  LP:       {_fmt_money(lp_eth)}")
-    out.append(f"  Coinbase: {_fmt_money(cb_eth)}")
-    if lp_eth is not None and cb_eth not in (None, Decimal(0)):
-        try:
-            diff = (Decimal(lp_eth) - Decimal(cb_eth)) / Decimal(cb_eth) * Decimal(100)
-            sign = "+" if diff >= 0 else ""
-            out.append(f"  Diff:     {sign}{diff:.2f}%")
-        except Exception:
-            pass
-
-    update.message.reply_text("\n".join(out))
+    update.message.reply_text(_prices_table())
 
 def cmd_slippage(update: Update, context: CallbackContext):
     args = context.args or []
     if not args:
         update.message.reply_text(
-            "Usage: /slippage <TOKEN_IN> [AMOUNT] [TOKEN_OUT]\n"
+            "Usage: /slippage <TOKEN_IN> [TOKEN_OUT]\n"
             "Examples:\n"
-            "  /slippage 1ETH            (defaults: 1 unit to 1USDC)\n"
-            "  /slippage 1ETH 0.5 1USDC  (0.5 1ETH to 1USDC)"
+            "  /slippage 1ETH\n"
+            "  /slippage TEC 1USDC"
         ); return
-
     token_in = args[0].upper()
-    amount_in = Decimal(args[1]) if len(args) >= 2 else Decimal("1")
-    token_out = args[2].upper() if len(args) >= 3 else "1USDC"
-
-    # mid via tiny trade
-    try:
-        tiny_amt = Decimal("0.01") if token_in != "1USDC" else Decimal("1")
-        mid = PR.price_usd(token_in, tiny_amt)
-        mid = (mid / tiny_amt) if (mid and tiny_amt > 0) else None
-    except Exception:
-        mid = None
-
-    # headline using real compute_slippage if available
-    headline = None
-    if SL and hasattr(SL, "compute_slippage"):
-        try:
-            res = SL.compute_slippage(token_in, token_out, amount_in, int(getattr(C, "SLIPPAGE_DEFAULT_BPS", 30)))
-            if res and amount_in > 0:
-                eff = (res["amount_out"]/amount_in)
-                headline = f"Size {amount_in} {token_in}: price {eff.quantize(Decimal('0.01'))} {token_out}/{token_in} · impact {res['impact_bps']} bps"
-        except Exception:
-            pass
-
-    # Curve table: target USDC notional, back-solve approximate input via mid, then quote real price_usd
-    targets = [Decimal("10"), Decimal("100"), Decimal("1000"), Decimal("10000")]
-    rows = [["Size (USDC)", "Amount In (sym)", "Eff. Price", "Slippage vs mid"]]
-    for usdc in targets:
-        if (mid is None) or mid <= 0:
-            rows.append([f"{usdc:,.0f}", "—", "—", "—"]); continue
-        est_in = (usdc / mid).quantize(Decimal("0.00001"))
-        try:
-            out_usd = PR.price_usd(token_in, est_in)
-            if out_usd and est_in > 0:
-                eff = (out_usd / est_in)
-                slip = ((eff - mid) / mid * Decimal("100"))
-                rows.append([f"{usdc:,.0f}", f"{est_in:.5f}", f"${eff:,.5f}", f"{slip:+.2f}%"])
-            else:
-                rows.append([f"{usdc:,.0f}", f"{est_in:.5f}", "—", "—"])
-        except Exception:
-            rows.append([f"{usdc:,.0f}", f"{est_in:.5f}", "—", "—"])
-
-    out = [f"Slippage: {token_in} → {token_out}"]
-    if mid:
-        out.append(f"Baseline (mid): ${mid:,.5f} per 1{token_in}")
-    if headline:
-        out.append(headline)
-    out.append("")
-    out.append(_table(rows))
-    update.message.reply_text("\n".join(out))
+    token_out = args[1].upper() if len(args) >= 2 else "1USDC"
+    update.message.reply_text(_slippage_table(token_in, token_out))
 
 def cmd_ping(update: Update, context: CallbackContext):
     ip_txt = "unknown"
