@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-# TECBot Telegram Listener — formats locked; per-unit LP price & slippage fixed (listener-only)
+# TECBot Telegram Listener — formatting only (Balances=OptA, Prices=OptB, Slippage=OptB)
+# Business logic unchanged; integrates prices.unit_quote() and Coinbase compare.
 
 import os, sys, logging, subprocess, shlex
 from datetime import datetime, timezone
-from decimal import Decimal, ROUND_DOWN
-from typing import Optional, List, Tuple, Dict
+from decimal import Decimal, InvalidOperation
+from typing import Optional, List
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ParseMode, Update
 from telegram.ext import (
@@ -28,7 +29,7 @@ except Exception:
 
 PR = BL = SL = None
 try:
-    from app import prices as PR   # we'll still use helpers (_addr, _dec, _find_pool, price_usd)
+    from app import prices as PR
     log.info("Loaded prices from app.prices")
 except Exception as e:
     log.warning("prices module not available: %s", e)
@@ -69,7 +70,7 @@ except Exception:
         log.warning("runner module not available: %s", e)
         runner = None
 
-# Optional Coinbase spot (existing file in repo)
+# Optional Coinbase spot (uses your repo helper)
 CB = None
 try:
     import coinbase_client as CB  # exposes fetch_eth_usd_price()
@@ -96,256 +97,24 @@ def is_admin(user_id: int) -> bool:
 def _fmt_money(x: Optional[Decimal]) -> str:
     if x is None:
         return "—"
-    x = Decimal(x)
-    if x >= 1000:
-        return f"${x:,.2f}"
-    if x >= 1:
-        return f"${x:,.5f}"  # 5 decimals for sub-$1000 per your request
-    return f"${x:,.5f}"
+    try:
+        d = Decimal(x)
+    except InvalidOperation:
+        return "—"
+    # 5 decimals max for readability (per your request)
+    q = Decimal("0.00001")
+    d = d.quantize(q) if d < 100 else d.quantize(Decimal("0.01"))
+    s = f"{d:,.5f}" if d < 100 else f"{d:,.2f}"
+    return f"${s}"
 
 def _coinbase_eth() -> Optional[Decimal]:
     if CB is None:
         return None
     try:
-        v = CB.fetch_eth_usd_price()
-        return Decimal(str(v)) if v is not None else None
+        p = CB.fetch_eth_usd_price()  # float or None
+        return Decimal(str(p)) if p is not None else None
     except Exception:
         return None
-
-def _qctx():
-    # lazy import only when needed (for quoting tables)
-    from app.chain import get_ctx
-    from web3 import Web3
-    return get_ctx(C.HARMONY_RPC), Web3
-
-# ------------- QUOTER helpers (listener-only) -------------
-# Minimal ABI for QuoterV2.quoteExactInput(bytes path, uint256 amountIn)
-_QUOTER_ABI = [{
-    "inputs":[
-      {"internalType":"bytes","name":"path","type":"bytes"},
-      {"internalType":"uint256","name":"amountIn","type":"uint256"}
-    ],
-    "name":"quoteExactInput",
-    "outputs":[
-      {"internalType":"uint256","name":"amountOut","type":"uint256"},
-      {"internalType":"uint160","name":"sqrtPriceX96After","type":"uint160"},
-      {"internalType":"uint32","name":"initializedTicksCrossed","type":"uint32"},
-      {"internalType":"uint256","name":"gasEstimate","type":"uint256"}],
-    "stateMutability":"nonpayable","type":"function"
-}]
-
-def _fee3(fee: int) -> bytes:
-    return int(fee).to_bytes(3, "big")
-
-def _build_forward_path(sym_in: str, sym_out: str = "1USDC") -> Optional[List[Tuple[str,int,str]]]:
-    """Forward path using only verified pools (sym_in -> ... -> sym_out)."""
-    s = sym_in.upper()
-    if s == sym_out.upper():
-        return []
-    # direct
-    f = PR._find_pool(s, sym_out)
-    if f:
-        return [(s, f, sym_out)]
-    # via WONE
-    f1 = PR._find_pool(s, "WONE"); f2 = PR._find_pool("WONE", sym_out)
-    if f1 and f2:
-        return [(s, f1, "WONE"), ("WONE", f2, sym_out)]
-    # via 1sDAI
-    f1 = PR._find_pool(s, "1sDAI"); f2 = PR._find_pool("1sDAI", sym_out)
-    if f1 and f2:
-        return [(s, f1, "1sDAI"), ("1sDAI", f2, sym_out)]
-    return None
-
-def _build_reverse_path(sym_in: str, sym_out: str = "1USDC") -> Optional[List[Tuple[str,int,str]]]:
-    """Reverse-buy path (sym_out -> ... -> sym_in); we still encode forward bytes path from sym_out to sym_in."""
-    t = sym_in.upper()
-    base = sym_out.upper()
-    # direct
-    f = PR._find_pool(base, t)
-    if f:
-        return [(base, f, t)]
-    # via WONE
-    f1 = PR._find_pool(base, "WONE"); f2 = PR._find_pool("WONE", t)
-    if f1 and f2:
-        return [(base, f1, "WONE"), ("WONE", f2, t)]
-    # via 1sDAI
-    f1 = PR._find_pool(base, "1sDAI"); f2 = PR._find_pool("1sDAI", t)
-    if f1 and f2:
-        return [(base, f1, "1sDAI"), ("1sDAI", f2, t)]
-    return None
-
-def _path_bytes(hops: List[Tuple[str,int,str]], Web3) -> bytes:
-    b = b""
-    for i,(a,fee,bn) in enumerate(hops):
-        if i==0:
-            b += Web3.to_bytes(hexstr=Web3.to_checksum_address(PR._addr(a)))
-        b += _fee3(fee) + Web3.to_bytes(hexstr=Web3.to_checksum_address(PR._addr(bn)))
-    return b
-
-def _quote_exact_input(hops: List[Tuple[str,int,str]], amount_in_wei: int) -> Optional[int]:
-    try:
-        ctx, Web3 = _qctx()
-        q = ctx.w3.eth.contract(address=Web3.to_checksum_address(C.QUOTER_ADDR), abi=_QUOTER_ABI)
-        out = q.functions.quoteExactInput(_path_bytes(hops, Web3), int(amount_in_wei)).call()
-        return int(out[0])
-    except Exception as e:
-        log.debug("quoteExactInput error: %s", e)
-        return None
-
-# ------------- rendering helpers -------------
-def _balances_block(table: Dict[str, Dict[str, Decimal]]) -> str:
-    # Approved style (5 decimals), no duplicate ONE/WONE columns.
-    order = ["ONE(native)", "1USDC", "1ETH", "TEC", "1sDAI"]
-    def fmt(d: Decimal) -> str:
-        try:
-            q = Decimal(d).quantize(Decimal("0.00001"), rounding=ROUND_DOWN)
-            return f"{q:.5f}"
-        except Exception:
-            return str(d)
-    lines = [f"Balances (@ {now_iso()})"]
-    for w_name in sorted(table.keys()):
-        row = table[w_name]
-        parts = []
-        for col in order:
-            v = row.get(col, Decimal("0"))
-            parts.append(f"{col} {fmt(v)}")
-        lines.append(f"{w_name}\n  " + "   ".join(parts) + "\n")
-    return "\n".join(lines).rstrip()
-
-def _prices_table() -> str:
-    # Option C: Asset | LP Price | Quote Basis | Slippage | Route
-    # Per-unit price: price_usd(basis) / basis; Slippage: impact vs tiny probe on the same forward path.
-    syms = ["ONE","1USDC","1sDAI","TEC","1ETH"]
-    basis_map = {"ONE": Decimal("1"), "1USDC": Decimal("1"), "1sDAI": Decimal("1"),
-                 "TEC": Decimal("100"), "1ETH": Decimal("1")}
-    rows = []
-    # Tiny probe sizes (forward) used to approximate "mid-impact" bps
-    tiny_probe = {"ONE": Decimal("0.05"), "1USDC": Decimal("1"),
-                  "1sDAI": Decimal("0.05"), "TEC": Decimal("50"), "1ETH": Decimal("0.01")}
-    for s in syms:
-        try:
-            # Special: ONE priced via WONE forward
-            route_hops = _build_forward_path("WONE" if s=="ONE" else s, "1USDC")
-            route_text = "—" if s=="1USDC" else " → ".join(h[0] for h in route_hops) + f" → {route_hops[-1][2]}" if route_hops else "—"
-            if s=="ONE":
-                # compute via WONE amount = basis
-                basis = basis_map[s]
-                price_total = PR.price_usd("WONE", basis)  # total USDC for basis
-                lp_per_unit = (price_total / basis) if (price_total and basis>0) else None
-                # slippage via tiny probe on WONE
-                dec_in = PR._dec("WONE"); dec_usd = PR._dec("1USDC")
-                probe = tiny_probe[s]
-                wei_in = int(probe * (Decimal(10)**dec_in))
-                wei_out = _quote_exact_input(route_hops, wei_in) if route_hops else None
-                mid = (Decimal(wei_out) / (Decimal(10)**dec_usd) / probe) if (wei_out and probe>0) else None
-                bps = int(((lp_per_unit - mid)/mid*Decimal(10000)).quantize(Decimal("1"))) if (lp_per_unit and mid and mid>0) else 0
-                rows.append(("ONE", lp_per_unit, basis, bps, route_text + " (fwd)"))
-                continue
-
-            # General case
-            basis = basis_map[s]
-            total = PR.price_usd(s, basis)  # USDC total for "basis" units
-            lp_per_unit = (total / basis) if (total and basis>0) else None
-
-            # Forward tiny-probe slippage
-            if s != "1USDC" and route_hops:
-                dec_in = PR._dec("WONE" if s=="ONE" else s); dec_usd = PR._dec("1USDC")
-                probe = tiny_probe[s]
-                wei_in = int(probe * (Decimal(10)**dec_in))
-                wei_out = _quote_exact_input(route_hops, wei_in)
-                mid = (Decimal(wei_out) / (Decimal(10)**dec_usd) / probe) if (wei_out and probe>0) else None
-                bps = int(((lp_per_unit - mid)/mid*Decimal(10000)).quantize(Decimal("1"))) if (lp_per_unit and mid and mid>0) else 0
-            else:
-                bps = 0
-
-            # ETH: annotate (rev) if reverse is tighter (display stays per forward/best already inside prices.py)
-            suffix = ""
-            if s == "1ETH":
-                # forward & reverse per-unit comparison (small basis 1 ETH and buy-1ETH via reverse)
-                # Forward per-unit from lp_per_unit already; compute reverse by buying 1 ETH in USDC and invert
-                rev_hops = _build_reverse_path("1ETH","1USDC")
-                dec_usd = PR._dec("1USDC"); dec_eth = PR._dec("1ETH")
-                # buy 1 ETH: we don't know exact USDC needed; sample 1000 USDC and invert
-                if rev_hops:
-                    wei_in = int(Decimal("1000") * (Decimal(10)**dec_usd))
-                    wei_out = _quote_exact_input(rev_hops, wei_in)
-                    eth_out = Decimal(wei_out) / (Decimal(10)**dec_eth) if wei_out else None
-                    rev_per_unit = (Decimal("1000")/eth_out) if (eth_out and eth_out>0) else None
-                    if lp_per_unit and rev_per_unit:
-                        if rev_per_unit > lp_per_unit * Decimal("1.01"):  # >1% tighter
-                            suffix = " (rev)"
-                            lp_per_unit = rev_per_unit  # display tighter
-                route_text += " (rev)" if suffix else " (fwd)"
-
-            rows.append((s, lp_per_unit, basis, bps, route_text))
-        except Exception as e:
-            rows.append((s, None, basis_map[s], 0, "—"))
-
-    # Format table (fixed-width; Telegram-friendly)
-    header = "LP Prices"
-    colh = "Asset | LP Price  | Quote Basis | Slippage | Route"
-    sep  = "------+-----------+-------------+----------+----------------------------"
-    lines = [header, colh, sep]
-    for a,px,basis,bps,route in rows:
-        pxs = _fmt_money(px)
-        bas = f"{basis:.5f}"
-        slp = f"{bps:>4} bps" if px not in (None,"—") else "  —   "
-        lines.append(f"{a:<5} | {pxs:<9} | {bas:<11} | {slp:<8} | {route}")
-    # Coinbase compare (ETH)
-    eth_lp = next((x[1] for x in rows if x[0]=="1ETH"), None)
-    cb = _coinbase_eth()
-    lines.append("")
-    lines.append("ETH: Harmony LP vs Coinbase")
-    lines.append(f"  LP:       {_fmt_money(eth_lp)}")
-    lines.append(f"  Coinbase: {_fmt_money(cb)}")
-    if eth_lp is not None and cb not in (None, Decimal(0)):
-        diff = (Decimal(eth_lp) - Decimal(cb)) / Decimal(cb) * Decimal(100)
-        lines.append(f"  Diff:     {diff:+.2f}%")
-    return "\n".join(lines)
-
-def _slippage_table(token_in: str, token_out: str) -> str:
-    # Build forward path; if ETH, also compute mid with reverse check but rows are quoted forward on the chosen path.
-    token_in = token_in.upper(); token_out = token_out.upper()
-    if token_out != "1USDC":
-        token_out = "1USDC"  # we only render USDC slippage tables
-    # Choose path
-    if token_in == "ONE":
-        hops = _build_forward_path("WONE", token_out)
-        sym_for_dec = "WONE"
-    else:
-        hops = _build_forward_path(token_in, token_out)
-        sym_for_dec = token_in
-    # Mid (per-unit) using tiny probe on the same forward path
-    dec_in = PR._dec(sym_for_dec); dec_usd = PR._dec("1USDC")
-    probe = Decimal("0.01") if token_in != "TEC" else Decimal("10")
-    wei_in = int(probe * (Decimal(10)**dec_in))
-    wei_out = _quote_exact_input(hops, wei_in) if hops else None
-    mid = (Decimal(wei_out) / (Decimal(10)**dec_usd) / probe) if (hops and wei_out and probe>0) else None
-
-    head = [f"Slippage: {token_in} → {token_out}"]
-    if mid:
-        head.append(f"Baseline (mid): ${mid:,.2f} per 1{token_in}")
-
-    # Targets (USDC) and rows
-    targets = [Decimal("10"), Decimal("100"), Decimal("1000"), Decimal("10000")]
-    colh = " Size (USDC) | Amount In ({}) | Eff. Price | Slippage vs mid".format(token_in)
-    sep  = "------------+-----------------+------------+----------------"
-    rows = [colh, sep]
-    for usdc in targets:
-        if not (hops and mid and mid > 0):
-            rows.append(f"{usdc:>12} | {'—':>15} | {'—':>10} | {'—':>14}")
-            continue
-        est_in = (usdc / mid).quantize(Decimal("0.000001"), rounding=ROUND_DOWN)
-        wei_in = int(est_in * (Decimal(10)**dec_in))
-        wei_out = _quote_exact_input(hops, wei_in)
-        if not wei_out:
-            rows.append(f"{usdc:>12} | {'—':>15} | {'—':>10} | {'—':>14}")
-            continue
-        eff = (Decimal(wei_out) / (Decimal(10)**dec_usd) / est_in) if est_in > 0 else None
-        slip = ((eff - mid)/mid*Decimal(100)) if (eff and mid) else None
-        rows.append(f"{usdc:>12} | {est_in:>15.6f} | ${eff:>9.2f} | {slip:+>13.2f}%")
-
-    return "\n".join(head + [""] + rows)
 
 # ---------- logging ----------
 def _log_update(update: Update, context: CallbackContext):
@@ -358,6 +127,64 @@ def _log_update(update: Update, context: CallbackContext):
 
 def _log_error(update: object, context: CallbackContext):
     log.exception("Handler error")
+
+# ---------- plan/dryrun rendering ----------
+def render_plan(actions_by_bot) -> str:
+    if not actions_by_bot or not any(actions_by_bot.values()):
+        return f"Plan (preview @ {now_iso()})\nNo actions proposed."
+    lines = [f"Plan (preview @ {now_iso()})"]
+    for bot, actions in actions_by_bot.items():
+        if not actions:
+            continue
+        lines.append(f"\nBot: {bot}")
+        for a in actions:
+            aid = getattr(a, "action_id", "NA")
+            prio = getattr(a, "priority", "-")
+            route = getattr(a, "route_human", "(route)")
+            amt  = getattr(a, "amount_in_text", "(amount)")
+            reason = getattr(a, "reason", "n/a")
+            limits = getattr(a, "limits_text", "n/a")
+            lines.append(
+                f"- Action #{aid}  PRIORITY:{prio}\n"
+                f"  Route : {route}\n"
+                f"  Size  : {amt}\n"
+                f"  Rationale:\n    • {reason}\n"
+                f"  Limits:\n    • {limits}"
+            )
+    return "\n".join(lines)
+
+def render_dryrun(results):
+    if not results:
+        return f"Dry-run (@ {now_iso()}): no executable actions."
+    lines = [f"Dry-run (tick @ {now_iso()})\n"]
+    for r in results:
+        aid = getattr(r, "action_id", "NA")
+        bot = getattr(r, "bot", "NA")
+        path = getattr(r, "path_text", "(path)")
+        ain  = getattr(r, "amount_in_text", "(amount)")
+        qout = getattr(r, "quote_out_text", "(quote)")
+        imp  = getattr(r, "impact_bps", None)
+        slip = getattr(r, "slippage_bps", None)
+        mino = getattr(r, "min_out_text", "(minOut)")
+        gas  = getattr(r, "gas_estimate", "—")
+        allow = getattr(r, "allowance_ok", False)
+        nonce = getattr(r, "nonce", "—")
+        txp  = getattr(r, "tx_preview_text", "(tx preview)")
+        lines.append(
+            f"Action #{aid} — {bot}\n"
+            f"Path     : {path}\n"
+            f"AmountIn : {ain}\n"
+            f"QuoteOut : {qout}"
+        )
+        lines.append(f"Impact   : {imp:.2f} bps" if imp is not None else "Impact   : —")
+        lines.append(f"Slippage : {slip} bps → minOut {mino}" if slip is not None else f"minOut   : {mino}")
+        lines.append(
+            f"Gas Est  : {gas}\n"
+            f"Allowance: {'OK' if allow else 'NEEDED'}\n"
+            f"Nonce    : {nonce}\n"
+            f"Would send:\n{txp}\n"
+        )
+    return "\n".join(lines).strip()
 
 # ---------- commands ----------
 def cmd_start(update: Update, context: CallbackContext):
@@ -377,8 +204,8 @@ def cmd_help(update: Update, context: CallbackContext):
         "  /dryrun — simulate current action(s) with Execute button (runner)\n"
         "  /cooldowns [bot|route] — show cooldowns\n"
         "  /prices [SYMS…] — on-chain quotes in USDC (e.g. /prices 1ETH TEC)\n"
-        "  /balances — per-wallet balances\n"
-        "  /slippage <IN> [AMOUNT] [OUT] — live impact curve (OUT=1USDC)\n"
+        "  /balances — per-wallet balances (ERC-20 + ONE)\n"
+        "  /slippage <IN> [AMOUNT] [OUT] — live impact/minOut (default OUT=1USDC, AMOUNT=1)\n"
         "  /assets — configured tokens & wallets\n"
         "  /version — code version\n"
         "  /sanity — config/modules sanity"
@@ -406,10 +233,8 @@ def cmd_sanity(update: Update, context: CallbackContext):
         "balances_loaded": bool(BL),
         "slippage_loaded": bool(SL),
     }
-    update.message.reply_text(
-        "Sanity:\n  " + "\n  ".join(f"{k}: {v}" for k,v in details.items()) +
-        "\n\nModules:\n  " + "\n  ".join(f"{k}: {v}" for k,v in avail.items())
-    )
+    update.message.reply_text("Sanity:\n  " + "\n  ".join(f"{k}: {v}" for k,v in details.items())
+                              + "\n\nModules:\n  " + "\n  ".join(f"{k}: {v}" for k,v in avail.items()))
 
 def cmd_assets(update: Update, context: CallbackContext):
     tokens = {k.upper(): v for k, v in getattr(C, "TOKENS", {}).items()}
@@ -426,6 +251,7 @@ def cmd_assets(update: Update, context: CallbackContext):
         lines.append(f"{k:<12} {wallets[k]}")
     update.message.reply_text("\n".join(lines))
 
+# -------- Balances (Option A; tight, aligned; drop '(native)') --------
 def cmd_balances(update: Update, context: CallbackContext):
     if BL is None:
         update.message.reply_text("Balances unavailable (module not loaded)."); return
@@ -434,25 +260,158 @@ def cmd_balances(update: Update, context: CallbackContext):
     except Exception as e:
         log.exception("balances failure")
         update.message.reply_text(f"Balances error: {e}"); return
-    update.message.reply_text(_balances_block(table))
 
+    cols = ["ONE", "1USDC", "1ETH", "TEC", "1sDAI"]
+    title = f"Balances (@ {now_iso()})"
+    # widths tuned for Telegram monospaced; 2 spaces between cols
+    w_wallet = 14
+    w_col = 10
+
+    lines = [title]
+    header = "Wallet".ljust(w_wallet) + "  " + "  ".join(c.rjust(w_col) for c in cols)
+    lines.append(header)
+    lines.append("-" * len(header))
+
+    def fmt_amt(x):
+        try:
+            d = Decimal(str(x))
+            d = d.quantize(Decimal("0.00001"))
+            s = f"{d:.5f}"
+            return s
+        except Exception:
+            return str(x)
+
+    for w_name in sorted(table.keys()):
+        row = table[w_name]
+        vals = [fmt_amt(row.get(c, 0)) for c in cols]
+        line = w_name.ljust(w_wallet) + "  " + "  ".join(v.rjust(w_col) for v in vals)
+        lines.append(line)
+
+    update.message.reply_text("\n".join(lines))
+
+# -------- Prices (Option B; uses prices.unit_quote + Coinbase compare) --------
 def cmd_prices(update: Update, context: CallbackContext):
     if PR is None:
         update.message.reply_text("Prices unavailable (module not loaded)."); return
-    update.message.reply_text(_prices_table())
 
+    syms = ["ONE", "1USDC", "1sDAI", "TEC", "1ETH"]
+
+    # Table header
+    title = "LP Prices"
+    col_names = ["Asset", "LP Price", "Quote Basis", "Slippage", "Route"]
+    w = [5, 10, 12, 9, 26]  # column widths for Telegram
+    def rowfmt(A,B,C,D,E):
+        return f"{A:<{w[0]}} | {B:>{w[1]}} | {C:>{w[2]}} | {D:>{w[3]}} | {E:<{w[4]}}"
+
+    out = [title, rowfmt(*col_names), "-" * (sum(w) + 12)]
+
+    # rows
+    for s in syms:
+        try:
+            uq = PR.unit_quote(s)  # dict or None
+        except Exception as e:
+            uq = None
+            log.warning("unit_quote error for %s: %s", s, e)
+
+        if not uq:
+            out.append(rowfmt(s, "—", "—", "—", "—"))
+            continue
+
+        price = _fmt_money(Decimal(uq["unit_price"]))  # USDC per 1
+        basis = f"{Decimal(uq['basis']):.5f}"
+        slip  = f"{int(uq['slippage_bps']):d} bps"
+        route = uq["route"]
+
+        out.append(rowfmt(s, price, basis, slip, route))
+
+    # Coinbase comparison for ETH
+    lp_eth = None
+    try:
+        uq_eth = PR.unit_quote("1ETH")
+        lp_eth = Decimal(uq_eth["unit_price"]) if uq_eth else None
+    except Exception:
+        pass
+    cb_eth = _coinbase_eth()
+
+    out.append("")
+    out.append("ETH: Harmony LP vs Coinbase")
+    out.append(f"  LP:       {_fmt_money(lp_eth)}")
+    out.append(f"  Coinbase: {_fmt_money(cb_eth)}")
+    if lp_eth is not None and cb_eth not in (None, Decimal(0)):
+        try:
+            diff = (lp_eth - cb_eth) / cb_eth * Decimal(100)
+            out.append(f"  Diff:     {diff:+.2f}%")
+        except Exception:
+            pass
+
+    update.message.reply_text("\n".join(out))
+
+# -------- Slippage (Option B; aligned table; price logic unchanged) --------
 def cmd_slippage(update: Update, context: CallbackContext):
     args = context.args or []
     if not args:
         update.message.reply_text(
-            "Usage: /slippage <TOKEN_IN> [TOKEN_OUT]\n"
+            "Usage: /slippage <TOKEN_IN> [AMOUNT] [TOKEN_OUT]\n"
             "Examples:\n"
-            "  /slippage 1ETH\n"
-            "  /slippage TEC 1USDC"
+            "  /slippage 1ETH            (defaults: 1 unit to 1USDC)\n"
+            "  /slippage 1ETH 0.5 1USDC  (0.5 1ETH to 1USDC)"
         ); return
+
     token_in = args[0].upper()
-    token_out = args[1].upper() if len(args) >= 2 else "1USDC"
-    update.message.reply_text(_slippage_table(token_in, token_out))
+    amount_in = Decimal(args[1]) if len(args) >= 2 else Decimal("1")
+    token_out = args[2].upper() if len(args) >= 3 else "1USDC"
+
+    # Mid (per 1 unit) via prices.unit_quote for consistency with /prices display
+    mid = None
+    try:
+        uq = PR.unit_quote(token_in)
+        if uq:
+            mid = Decimal(uq["unit_price"])
+    except Exception:
+        pass
+
+    # Build size targets in OUT=USDC terms (10 / 100 / 1000 / 10000)
+    targets = [Decimal("10"), Decimal("100"), Decimal("1000"), Decimal("10000")]
+
+    # Helper for total->per-unit eff price using legacy price_usd to honor existing path logic
+    def eff_price_for_usdc_target(usdc_target: Decimal) -> (Optional[Decimal], Optional[Decimal]):
+        """Return (amount_in_est, eff_price_per_unit)"""
+        if not mid or mid <= 0:
+            return None, None
+        # naive estimate, then recompute via price_usd
+        est_in = (usdc_target / mid).quantize(Decimal("0.000001"))
+        try:
+            total_out = PR.price_usd(token_in, est_in)
+            eff = (total_out / est_in) if (total_out and est_in > 0) else None
+            return est_in, eff
+        except Exception:
+            return est_in, None
+
+    # Table
+    title = f"Slippage curve: {token_in} → {token_out}"
+    lines = [title]
+    if mid:
+        lines.append(f"Baseline (mid): {_fmt_money(mid)} per 1{token_in}")
+
+    # header widths tuned for Telegram
+    w = [12, 16, 12, 16]
+    hdr = f"{'Size (USDC)':>{w[0]}} | {'Amount In (sym)':>{w[1]}} | {'Eff. Price':>{w[2]}} | {'Slippage vs mid':>{w[3]}}"
+    lines.append("")
+    lines.append(hdr)
+    lines.append("-" * len(hdr))
+
+    for t in targets:
+        ain, eff = eff_price_for_usdc_target(t)
+        eff_s = _fmt_money(eff) if eff else "—"
+        if eff and mid:
+            slip = ((eff - mid) / mid * Decimal(100)).quantize(Decimal("0.01"))
+            slip_s = f"{slip:+.2f}%"
+        else:
+            slip_s = "—"
+        ain_s = f"{ain:.6f}" if ain else "—"
+        lines.append(f"{format(t, ',.0f'):>{w[0]}} | {ain_s:>{w[1]}} | {eff_s:>{w[2]}} | {slip_s:>{w[3]}}")
+
+    update.message.reply_text("\n".join(lines))
 
 def cmd_ping(update: Update, context: CallbackContext):
     ip_txt = "unknown"
@@ -473,30 +432,6 @@ def cmd_plan(update: Update, context: CallbackContext):
         log.exception("plan failure")
         update.message.reply_text(f"Plan error: {e}"); return
     update.message.reply_text(render_plan(snap))
-
-def render_plan(actions_by_bot) -> str:
-    if not actions_by_bot or not any(actions_by_bot.values()):
-        return f"Plan (preview @ {now_iso()})\nNo actions proposed."
-    lines = [f"Plan (preview @ {now_iso()})"]
-    for bot, actions in actions_by_bot.items():
-        if not actions:
-            continue
-        lines.append(f"\nBot: {bot}")
-        for a in actions:
-            aid = getattr(a, "action_id", "NA")
-            prio = getattr(a, "priority", "-")
-            route = getattr(a, "route_human", "(route)")
-            amt  = getattr(a, "amount_in_text", "(amount)")
-            reason = getattr(a, "reason", "n/a")
-            limits = getattr(a, "limits_text", "n/a")
-            lines.append(
-                f"- Action #{aid}  PRIORITY:{prio}\n"
-                f"  Route : {route}\n"
-                f"  Size  : {amt}\n"
-                f"  Rationale:\n    • {reason}\n"
-                f"  Limits:\n    • {limits}"
-            )
-    return "\n".join(lines)
 
 def cmd_cooldowns(update: Update, context: CallbackContext):
     defaults = getattr(C, "COOLDOWNS_DEFAULTS", {"price_refresh": 15, "trade_retry": 30, "alert_throttle": 60})
@@ -531,39 +466,6 @@ def cmd_dryrun(update: Update, context: CallbackContext):
     kb = [[InlineKeyboardButton(f"▶️ Execute {getattr(r,'action_id','?')}", callback_data=f"exec:{getattr(r,'action_id','?')}")] for r in results]
     kb.append([InlineKeyboardButton("❌ Cancel", callback_data="exec_cancel")])
     update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
-
-def render_dryrun(results):
-    if not results:
-        return f"Dry-run (@ {now_iso()}): no executable actions."
-    lines = [f"Dry-run (tick @ {now_iso()})\n"]
-    for r in results:
-        aid = getattr(r, "action_id", "NA")
-        bot = getattr(r, "bot", "NA")
-        path = getattr(r, "path_text", "(path)")
-        ain  = getattr(r, "amount_in_text", "(amount)")
-        qout = getattr(r, "quote_out_text", "(quote)")
-        imp  = getattr(r, "impact_bps", None)
-        slip = getattr(r, "slippage_bps", None)
-        mino = getattr(r, "min_out_text", "(minOut)")
-        gas  = getattr(r, "gas_estimate", "—")
-        allow = getattr(r, "allowance_ok", False)
-        nonce = getattr(r, "nonce", "—")
-        txp  = getattr(r, "tx_preview_text", "(tx preview)")
-        lines.append(
-            f"Action #{aid} — {bot}\n"
-            f"Path     : {path}\n"
-            f"AmountIn : {ain}\n"
-            f"QuoteOut : {qout}"
-        )
-        lines.append(f"Impact   : {imp:.2f} bps" if imp is not None else "Impact   : —")
-        lines.append(f"Slippage : {slip} bps → minOut {mino}" if slip is not None else f"minOut   : {mino}")
-        lines.append(
-            f"Gas Est  : {gas}\n"
-            f"Allowance: {'OK' if allow else 'NEEDED'}\n"
-            f"Nonce    : {nonce}\n"
-            f"Would send:\n{txp}\n"
-        )
-    return "\n".join(lines).strip()
 
 def on_exec_button(update: Update, context: CallbackContext):
     q = update.callback_query; data = q.data or ""
