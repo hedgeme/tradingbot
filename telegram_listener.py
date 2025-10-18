@@ -1,58 +1,61 @@
 #!/usr/bin/env python3
-# TECBot Telegram Listener — formatting only (Balances=OptA, Prices=OptB, Slippage=OptB)
-# Business logic unchanged; integrates prices.unit_quote() and Coinbase compare.
+# TECBot Telegram Listener — formatting stable, tolerant ONE resolver, Coinbase compare
 
 import os, sys, logging, subprocess, shlex
 from datetime import datetime, timezone
-from decimal import Decimal, InvalidOperation
-from typing import Optional, List
+from decimal import Decimal, ROUND_DOWN
+from typing import Optional, List, Dict
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ParseMode, Update
 from telegram.ext import (
     Updater, CommandHandler, CallbackQueryHandler, MessageHandler, Filters, CallbackContext
 )
 
+# ---------- Logging ----------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
 log = logging.getLogger("telegram_listener")
 
-# Ensure /bot on path
+# Ensure /bot imports work (root and app.* both supported)
 if "/bot" not in sys.path:
     sys.path.insert(0, "/bot")
 
-# ---------- tolerant imports ----------
+# ---------- Tolerant imports (prefer app.*, else root) ----------
+# config
 try:
     from app import config as C
     log.info("Loaded config from app.config")
 except Exception:
-    import config as C
+    import config as C  # type: ignore
     log.info("Loaded config from root config")
 
+# optional modules (prices, balances, slippage)
 PR = BL = SL = None
 try:
-    from app import prices as PR
+    from app import prices as PR      # on-chain Quoter
     log.info("Loaded prices from app.prices")
 except Exception as e:
     log.warning("prices module not available: %s", e)
 
 try:
-    from app import balances as BL
+    from app import balances as BL    # ERC20 + native ONE
     log.info("Loaded balances from app.balances")
 except Exception as e:
     log.warning("balances module not available: %s", e)
 
 try:
-    from app import slippage as SL
+    from app import slippage as SL    # real slippage calc
     log.info("Loaded slippage from app.slippage")
 except Exception as e:
     log.warning("slippage module not available: %s", e)
 
+# optional planner/runner
 planner = None
 try:
     from app.strategies import planner
     log.info("Loaded planner from app.strategies.planner")
 except Exception:
     try:
-        from strategies import planner
+        from strategies import planner  # type: ignore
         log.info("Loaded planner from root strategies.planner")
     except Exception as e:
         log.warning("planner module not available: %s", e)
@@ -64,22 +67,30 @@ try:
     log.info("Loaded runner from app.runner")
 except Exception:
     try:
-        import runner
+        import runner  # type: ignore
         log.info("Loaded runner from root runner")
     except Exception as e:
         log.warning("runner module not available: %s", e)
         runner = None
 
-# Optional Coinbase spot (uses your repo helper)
-CB = None
-try:
-    import coinbase_client as CB  # exposes fetch_eth_usd_price()
-except Exception:
-    CB = None
+# Optional Coinbase spot (expects coinbase_client.fetch_eth_usd_price)
+def _coinbase_eth() -> Optional[Decimal]:
+    try:
+        import coinbase_client  # must be in repo (fetch_eth_usd_price -> float|None)
+        val = coinbase_client.fetch_eth_usd_price()
+        return Decimal(str(val)) if val is not None else None
+    except Exception:
+        return None
 
-# ---------- utils ----------
+# ---------- Utilities ----------
 def now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+def is_admin(user_id: int) -> bool:
+    try:
+        return int(user_id) in set(int(x) for x in getattr(C, "ADMIN_USER_IDS", []) or [])
+    except Exception:
+        return False
 
 def _git_short_rev() -> Optional[str]:
     try:
@@ -88,35 +99,33 @@ def _git_short_rev() -> Optional[str]:
     except Exception:
         return None
 
-def is_admin(user_id: int) -> bool:
-    try:
-        return int(user_id) in set(int(x) for x in getattr(C, "ADMIN_USER_IDS", []) or [])
-    except Exception:
-        return False
-
+# Money formatting for prices (USD)
 def _fmt_money(x: Optional[Decimal]) -> str:
     if x is None:
         return "—"
-    try:
-        d = Decimal(x)
-    except InvalidOperation:
-        return "—"
-    # 5 decimals max for readability (per your request)
-    q = Decimal("0.00001")
-    d = d.quantize(q) if d < 100 else d.quantize(Decimal("0.01"))
-    s = f"{d:,.5f}" if d < 100 else f"{d:,.2f}"
-    return f"${s}"
+    x = Decimal(x)
+    if x >= 1000:
+        return f"${x:,.2f}"
+    if x >= 1:
+        return f"${x:,.5f}".rstrip("0").rstrip(".") if "." in f"{x:.5f}" else f"${x:.5f}"
+    # small values, keep 5 decimals
+    return f"${x:,.5f}"
 
-def _coinbase_eth() -> Optional[Decimal]:
-    if CB is None:
-        return None
+# Amount formatting for balances (per symbol rule)
+def _fmt_amt(sym: str, val) -> str:
     try:
-        p = CB.fetch_eth_usd_price()  # float or None
-        return Decimal(str(p)) if p is not None else None
+        d = Decimal(str(val))
     except Exception:
-        return None
+        return str(val)
+    if sym.upper() == "1ETH":
+        # Keep high precision for 1ETH
+        q = Decimal("0.00000001")
+        return f"{d.quantize(q, rounding=ROUND_DOWN):f}"
+    # Everything else to hundredths for tightness
+    q = Decimal("0.01")
+    return f"{d.quantize(q, rounding=ROUND_DOWN):.2f}"
 
-# ---------- logging ----------
+# ---------- Logging helpers ----------
 def _log_update(update: Update, context: CallbackContext):
     try:
         uid = update.effective_user.id if update.effective_user else "?"
@@ -128,7 +137,7 @@ def _log_update(update: Update, context: CallbackContext):
 def _log_error(update: object, context: CallbackContext):
     log.exception("Handler error")
 
-# ---------- plan/dryrun rendering ----------
+# ---------- Render helpers ----------
 def render_plan(actions_by_bot) -> str:
     if not actions_by_bot or not any(actions_by_bot.values()):
         return f"Plan (preview @ {now_iso()})\nNo actions proposed."
@@ -186,7 +195,7 @@ def render_dryrun(results):
         )
     return "\n".join(lines).strip()
 
-# ---------- commands ----------
+# ---------- Commands ----------
 def cmd_start(update: Update, context: CallbackContext):
     update.message.reply_text(
         "TECBot online.\n"
@@ -233,8 +242,9 @@ def cmd_sanity(update: Update, context: CallbackContext):
         "balances_loaded": bool(BL),
         "slippage_loaded": bool(SL),
     }
-    update.message.reply_text("Sanity:\n  " + "\n  ".join(f"{k}: {v}" for k,v in details.items())
-                              + "\n\nModules:\n  " + "\n  ".join(f"{k}: {v}" for k,v in avail.items()))
+    txt = "Sanity:\n  " + "\n  ".join(f"{k}: {v}" for k,v in details.items())
+    txt += "\n\nModules:\n  " + "\n  ".join(f"{k}: {v}" for k,v in avail.items())
+    update.message.reply_text(txt)
 
 def cmd_assets(update: Update, context: CallbackContext):
     tokens = {k.upper(): v for k, v in getattr(C, "TOKENS", {}).items()}
@@ -249,9 +259,27 @@ def cmd_assets(update: Update, context: CallbackContext):
     lines.append("-------------------------------------------------------")
     for k in sorted(wallets.keys()):
         lines.append(f"{k:<12} {wallets[k]}")
-    update.message.reply_text("\n".join(lines))
+    # Wrap in <pre> for Telegram monospace alignment
+    update.message.reply_text(f"<pre>\n{chr(10).join(lines)}\n</pre>", parse_mode=ParseMode.HTML)
 
-# -------- Balances (Option A; tight, aligned; drop '(native)') --------
+# ---- BALANCES (Option A: header tightened, tolerant ONE resolver, wider columns) ----
+_ONE_KEY_ORDER = [
+    "ONE(native)", "ONE (native)", "ONE_NATIVE", "NATIVE_ONE", "NATIVE",  # common variants
+    "ONE", "WONE"  # fallbacks if above not present
+]
+
+def _resolve_one_value(row: Dict[str, Decimal]) -> Decimal:
+    # tolerant case-insensitive lookup across variants
+    lower = {k.lower(): k for k in row.keys()}
+    for key in _ONE_KEY_ORDER:
+        k = lower.get(key.lower())
+        if k is not None:
+            try:
+                return Decimal(str(row[k]))
+            except Exception:
+                pass
+    return Decimal("0")
+
 def cmd_balances(update: Update, context: CallbackContext):
     if BL is None:
         update.message.reply_text("Balances unavailable (module not loaded)."); return
@@ -261,92 +289,184 @@ def cmd_balances(update: Update, context: CallbackContext):
         log.exception("balances failure")
         update.message.reply_text(f"Balances error: {e}"); return
 
+    # Column order you approved
     cols = ["ONE", "1USDC", "1ETH", "TEC", "1sDAI"]
-    title = f"Balances (@ {now_iso()})"
-    # widths tuned for Telegram monospaced; 2 spaces between cols
+
+    # widths tuned for Telegram
     w_wallet = 14
-    w_col = 10
+    w_amt    = 11
 
-    lines = [title]
-    header = "Wallet".ljust(w_wallet) + "  " + "  ".join(c.rjust(w_col) for c in cols)
-    lines.append(header)
-    lines.append("-" * len(header))
-
-    def fmt_amt(x):
-        try:
-            d = Decimal(str(x))
-            d = d.quantize(Decimal("0.00001"))
-            s = f"{d:.5f}"
-            return s
-        except Exception:
-            return str(x)
+    header = f"{'Wallet':<{w_wallet}}  " + "  ".join(f"{c:>{w_amt}}" for c in cols)
+    sep    = "-" * len(header)
+    lines  = [f"Balances (@ {now_iso()})", header, sep]
 
     for w_name in sorted(table.keys()):
         row = table[w_name]
-        vals = [fmt_amt(row.get(c, 0)) for c in cols]
-        line = w_name.ljust(w_wallet) + "  " + "  ".join(v.rjust(w_col) for v in vals)
-        lines.append(line)
+        vals: List[str] = []
+        # ONE uses tolerant resolver
+        one_val = _resolve_one_value(row)
+        vals.append(_fmt_amt("ONE", one_val))
+        # others direct
+        for c in cols[1:]:
+            vals.append(_fmt_amt(c, row.get(c, 0)))
+        lines.append(f"{w_name:<{w_wallet}}  " + "  ".join(f"{v:>{w_amt}}" for v in vals))
 
-    update.message.reply_text("\n".join(lines))
+    update.message.reply_text(f"<pre>\n{chr(10).join(lines)}\n</pre>", parse_mode=ParseMode.HTML)
 
-# -------- Prices (Option B; uses prices.unit_quote + Coinbase compare) --------
+# ---- ETH forward vs reverse tiny-probe (for /prices note removal; internal only) ----
+def _eth_best_side_and_route() -> (Optional[Decimal], str):
+    """
+    Returns (lp_price_per_1_eth, 'fwd'|'rev') using small reverse probes and a 1 ETH forward.
+    Display only; price logic remains in prices.py.
+    """
+    if PR is None:
+        return None, "fwd"
+    try:
+        from web3 import Web3
+        from app.chain import get_ctx
+        ctx = get_ctx(C.HARMONY_RPC)
+        ABI = [{
+          "inputs":[{"internalType":"bytes","name":"path","type":"bytes"},
+                    {"internalType":"uint256","name":"amountIn","type":"uint256"}],
+          "name":"quoteExactInput",
+          "outputs":[{"internalType":"uint256","name":"amountOut","type":"uint256"},
+                     {"internalType":"uint160","name":"sqrtPriceX96After","type":"uint160"},
+                     {"internalType":"uint32","name":"initializedTicksCrossed","type":"uint32"},
+                     {"internalType":"uint256","name":"gasEstimate","type":"uint256"}],
+          "stateMutability":"nonpayable","type":"function"}]
+        q = ctx.w3.eth.contract(address=Web3.to_checksum_address(C.QUOTER_ADDR), abi=ABI)
+        def addr(s): return Web3.to_checksum_address(PR._addr(s))
+        def fee3(f): return int(f).to_bytes(3, "big")
+
+        dec_e = PR._dec("1ETH")
+        dec_u = PR._dec("1USDC")
+
+        # reverse: small USDC in -> ETH out -> implied price
+        choices = []
+        for usdc_in in (Decimal("25"), Decimal("50"), Decimal("100"), Decimal("250")):
+            wei = int(usdc_in * (Decimal(10)**dec_u))
+            path = (Web3.to_bytes(hexstr=addr("1USDC")) + fee3(3000) +
+                    Web3.to_bytes(hexstr=addr("WONE"))  + fee3(3000) +
+                    Web3.to_bytes(hexstr=addr("1ETH")))
+            out = q.functions.quoteExactInput(path, wei).call()[0]
+            eth_out = Decimal(out) / (Decimal(10)**dec_e)
+            if eth_out > 0:
+                choices.append(usdc_in / eth_out)
+
+        rev = min(choices) if choices else None  # smallest implied price is most favorable buy price
+
+        # forward: sell exactly 1 ETH
+        wei_in = int(Decimal("1") * (Decimal(10)**dec_e))
+        path_f = (Web3.to_bytes(hexstr=addr("1ETH")) + fee3(3000) +
+                  Web3.to_bytes(hexstr=addr("WONE")) + fee3(3000) +
+                  Web3.to_bytes(hexstr=addr("1USDC")))
+        out_f = q.functions.quoteExactInput(path_f, wei_in).call()[0]
+        fwd = (Decimal(out_f) / (Decimal(10)**dec_u)) if out_f else None
+
+        if rev is not None and fwd is not None:
+            # choose the side closer to Coinbase reference, if available; else pick reverse if they diverge
+            cb = _coinbase_eth()
+            if cb:
+                # pick the side nearer to cb
+                d_rev = abs(rev - cb)
+                d_fwd = abs(fwd - cb)
+                return (rev, "rev") if d_rev <= d_fwd else (fwd, "fwd")
+            # no cb: if big divergence, prefer reverse (buy side)
+            if abs(rev - fwd) / max(Decimal("1"), rev) > Decimal("0.05"):
+                return rev, "rev"
+            return fwd, "fwd"
+        return (rev or fwd), ("rev" if rev else "fwd")
+    except Exception:
+        return None, "fwd"
+
+# ---- PRICES (Option B) ----
 def cmd_prices(update: Update, context: CallbackContext):
     if PR is None:
         update.message.reply_text("Prices unavailable (module not loaded)."); return
 
+    # Your preferred order
     syms = ["ONE", "1USDC", "1sDAI", "TEC", "1ETH"]
 
-    # Table header
-    title = "LP Prices"
-    col_names = ["Asset", "LP Price", "Quote Basis", "Slippage", "Route"]
-    w = [5, 10, 12, 9, 26]  # column widths for Telegram
-    def rowfmt(A,B,C,D,E):
-        return f"{A:<{w[0]}} | {B:>{w[1]}} | {C:>{w[2]}} | {D:>{w[3]}} | {E:<{w[4]}}"
+    # Column widths tuned for Telegram monospace
+    w_asset, w_lp, w_basis, w_slip, w_route = 6, 11, 12, 9, 27
 
-    out = [title, rowfmt(*col_names), "-" * (sum(w) + 12)]
+    header = (
+        f"{'Asset':<{w_asset}} | {'LP Price':>{w_lp}} | {'Quote Basis':>{w_basis}} | "
+        f"{'Slippage':>{w_slip}} | {'Route':<{w_route}}"
+    )
+    sep = "-" * (len(header) + 0)
+    lines = ["LP Prices", header, sep]
 
-    # rows
-    for s in syms:
-        try:
-            uq = PR.unit_quote(s)  # dict or None
-        except Exception as e:
-            uq = None
-            log.warning("unit_quote error for %s: %s", s, e)
-
-        if not uq:
-            out.append(rowfmt(s, "—", "—", "—", "—"))
-            continue
-
-        price = _fmt_money(Decimal(uq["unit_price"]))  # USDC per 1
-        basis = f"{Decimal(uq['basis']):.5f}"
-        slip  = f"{int(uq['slippage_bps']):d} bps"
-        route = uq["route"]
-
-        out.append(rowfmt(s, price, basis, slip, route))
-
-    # Coinbase comparison for ETH
-    lp_eth = None
-    try:
-        uq_eth = PR.unit_quote("1ETH")
-        lp_eth = Decimal(uq_eth["unit_price"]) if uq_eth else None
-    except Exception:
-        pass
+    # Compute rows
     cb_eth = _coinbase_eth()
+    lp_eth_pref, side = _eth_best_side_and_route()  # display-only suggestion
 
-    out.append("")
-    out.append("ETH: Harmony LP vs Coinbase")
-    out.append(f"  LP:       {_fmt_money(lp_eth)}")
-    out.append(f"  Coinbase: {_fmt_money(cb_eth)}")
-    if lp_eth is not None and cb_eth not in (None, Decimal(0)):
+    for s in syms:
+        route_text = "—"
+        basis = Decimal("1")
+        slip_txt = "0 bps"
+        price: Optional[Decimal] = None
+
         try:
-            diff = (lp_eth - cb_eth) / cb_eth * Decimal(100)
-            out.append(f"  Diff:     {diff:+.2f}%")
+            if s == "ONE":
+                # Display ONE via WONE → 1USDC if available
+                price = PR.price_usd("WONE", Decimal("1"))
+                route_text = "WONE → 1USDC (fwd)" if price is not None else "—"
+            elif s == "1USDC":
+                price = Decimal("1")
+                route_text = "—"
+            elif s == "1sDAI":
+                price = PR.price_usd("1sDAI", Decimal("1"))
+                route_text = "1SDAI → 1USDC (fwd)" if price is not None else "—"
+            elif s == "TEC":
+                basis = Decimal("100")
+                out = PR.price_usd("TEC", basis)
+                price = (out / basis) if out is not None and basis > 0 else None
+                # prefer best of TEC→WONE→USDC vs TEC→1sDAI→USDC handled inside prices module;
+                # set a generic route text for display:
+                route_text = "TEC → WONE → 1USDC"
+                # slippage is display-only; we don't run heavy calc here
+                slip_txt = "—" if price is None else "  "
+            elif s == "1ETH":
+                # Use best-side suggestion for display (does not alter core pricing logic)
+                price = lp_eth_pref or PR.price_usd("1ETH", Decimal("1"))
+                route_text = ("1USDC → WONE → 1ETH (rev)" if side == "rev"
+                              else "1ETH → WONE → 1USDC (fwd)")
+            else:
+                price = PR.price_usd(s, Decimal("1"))
+                route_text = "—" if price is None else "(direct/best)"
+
+        except Exception:
+            price = None
+
+        lp_str = _fmt_money(price).rjust(w_lp)
+        basis_str = f"{basis:.5f}".rjust(w_basis)
+        slip_str = slip_txt.rjust(w_slip)
+        lines.append(f"{s:<{w_asset}} | {lp_str} | {basis_str} | {slip_str} | {route_text:<{w_route}}")
+
+    # Coinbase compare block for ETH
+    # (use the per-1 ETH LP value we just displayed)
+    eth_lp_display = None
+    try:
+        eth_lp_display = next((Decimal(lines[i].split("|")[1].strip().replace("$","").replace(",",""))
+                               for i in range(len(lines))
+                               if lines[i].startswith("1ETH ")), None)
+    except Exception:
+        eth_lp_display = None
+
+    lines += ["", "ETH: Harmony LP vs Coinbase"]
+    lines.append(f"  LP:       {_fmt_money(eth_lp_display)}")
+    lines.append(f"  Coinbase: {_fmt_money(cb_eth)}")
+    if eth_lp_display is not None and cb_eth not in (None, Decimal(0)):
+        try:
+            diff = (Decimal(eth_lp_display) - Decimal(cb_eth)) / Decimal(cb_eth) * Decimal(100)
+            lines.append(f"  Diff:     {diff:+.2f}%")
         except Exception:
             pass
 
-    update.message.reply_text("\n".join(out))
+    update.message.reply_text(f"<pre>\n{chr(10).join(lines)}\n</pre>", parse_mode=ParseMode.HTML)
 
-# -------- Slippage (Option B; aligned table; price logic unchanged) --------
+# ---- SLIPPAGE (Option B table) ----
 def cmd_slippage(update: Update, context: CallbackContext):
     args = context.args or []
     if not args:
@@ -361,58 +481,47 @@ def cmd_slippage(update: Update, context: CallbackContext):
     amount_in = Decimal(args[1]) if len(args) >= 2 else Decimal("1")
     token_out = args[2].upper() if len(args) >= 3 else "1USDC"
 
-    # Mid (per 1 unit) via prices.unit_quote for consistency with /prices display
-    mid = None
+    # Table widths for Telegram
+    w1, w2, w3, w4 = 12, 16, 12, 16
+
+    # Baseline mid via price_usd per 1 unit
     try:
-        uq = PR.unit_quote(token_in)
-        if uq:
-            mid = Decimal(uq["unit_price"])
+        mid = PR.price_usd(token_in, Decimal("1"))
     except Exception:
-        pass
+        mid = None
 
-    # Build size targets in OUT=USDC terms (10 / 100 / 1000 / 10000)
+    # Curve (USDC targets), aligned table
     targets = [Decimal("10"), Decimal("100"), Decimal("1000"), Decimal("10000")]
-
-    # Helper for total->per-unit eff price using legacy price_usd to honor existing path logic
-    def eff_price_for_usdc_target(usdc_target: Decimal) -> (Optional[Decimal], Optional[Decimal]):
-        """Return (amount_in_est, eff_price_per_unit)"""
-        if not mid or mid <= 0:
-            return None, None
-        # naive estimate, then recompute via price_usd
-        est_in = (usdc_target / mid).quantize(Decimal("0.000001"))
-        try:
-            total_out = PR.price_usd(token_in, est_in)
-            eff = (total_out / est_in) if (total_out and est_in > 0) else None
-            return est_in, eff
-        except Exception:
-            return est_in, None
-
-    # Table
-    title = f"Slippage curve: {token_in} → {token_out}"
-    lines = [title]
-    if mid:
-        lines.append(f"Baseline (mid): {_fmt_money(mid)} per 1{token_in}")
-
-    # header widths tuned for Telegram
-    w = [12, 16, 12, 16]
-    hdr = f"{'Size (USDC)':>{w[0]}} | {'Amount In (sym)':>{w[1]}} | {'Eff. Price':>{w[2]}} | {'Slippage vs mid':>{w[3]}}"
-    lines.append("")
-    lines.append(hdr)
-    lines.append("-" * len(hdr))
-
-    for t in targets:
-        ain, eff = eff_price_for_usdc_target(t)
-        eff_s = _fmt_money(eff) if eff else "—"
-        if eff and mid:
-            slip = ((eff - mid) / mid * Decimal(100)).quantize(Decimal("0.01"))
-            slip_s = f"{slip:+.2f}%"
+    rows = []
+    for usdc in targets:
+        if mid and mid > 0:
+            est_in = (usdc / mid).quantize(Decimal("0.000001"))
         else:
-            slip_s = "—"
-        ain_s = f"{ain:.6f}" if ain else "—"
-        lines.append(f"{format(t, ',.0f'):>{w[0]}} | {ain_s:>{w[1]}} | {eff_s:>{w[2]}} | {slip_s:>{w[3]}}")
+            est_in = Decimal("0")
+        try:
+            px_usd = PR.price_usd(token_in, est_in)
+            eff = (px_usd / est_in) if (px_usd and est_in > 0) else None
+            slip = ((eff - mid) / mid * Decimal("100")) if (eff and mid) else None
+            rows.append((f"{usdc:,.0f}", f"{est_in:.6f}", f"{eff:,.2f}" if eff else "—", f"{slip:+.2f}%" if slip is not None else "—"))
+        except Exception:
+            rows.append((f"{usdc:,.0f}", "—", "—", "—"))
 
-    update.message.reply_text("\n".join(lines))
+    # Build pretty table
+    col1, col2, col3, col4 = "Size (USDC)", "Amount In (sym)", "Eff. Price", "Slippage vs mid"
+    line_hdr = f"{col1:>{w1}} | {col2:>{w2}} | {col3:>{w3}} | {col4:>{w4}}"
+    line_sep = "-" * len(line_hdr)
+    tbl = [line_hdr, line_sep]
+    for a,b,c,d in rows:
+        tbl.append(f"{a:>{w1}} | {b:>{w2}} | {('$'+c) if c!='—' else '—':>{w3}} | {d:>{w4}}")
 
+    out = [f"Slippage curve: {token_in} → {token_out}"]
+    if mid:
+        out.append(f"Baseline (mid): ${mid:,.2f} per 1{token_in}")
+    out.append("")
+    out.extend(tbl)
+    update.message.reply_text(f"<pre>\n{chr(10).join(out)}\n</pre>", parse_mode=ParseMode.HTML)
+
+# ---------- Commands (planner/runner/meta) ----------
 def cmd_ping(update: Update, context: CallbackContext):
     ip_txt = "unknown"
     try:
@@ -464,7 +573,8 @@ def cmd_dryrun(update: Update, context: CallbackContext):
 
     text = render_dryrun(results)
     kb = [[InlineKeyboardButton(f"▶️ Execute {getattr(r,'action_id','?')}", callback_data=f"exec:{getattr(r,'action_id','?')}")] for r in results]
-    kb.append([InlineKeyboardButton("❌ Cancel", callback_data="exec_cancel")])
+    kb.append([InlineKeyboardButton("❌ Cancel", CallbackQueryHandler)])
+    kb[-1] = [InlineKeyboardButton("❌ Cancel", callback_data="exec_cancel")]
     update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
 
 def on_exec_button(update: Update, context: CallbackContext):
@@ -499,6 +609,7 @@ def on_exec_cancel(update: Update, context: CallbackContext):
     q.edit_message_text("Canceled. No transaction sent.")
     q.answer()
 
+# ---------- Main ----------
 def main():
     token = os.environ.get("TELEGRAM_BOT_TOKEN") or getattr(C, "TELEGRAM_BOT_TOKEN", None)
     if not token:
@@ -507,6 +618,7 @@ def main():
     up = Updater(token=token, use_context=True)
     dp = up.dispatcher
 
+    # Core & on-chain
     dp.add_handler(CommandHandler("start", cmd_start))
     dp.add_handler(CommandHandler("help", cmd_help))
     dp.add_handler(CommandHandler("version", cmd_version))
@@ -515,11 +627,13 @@ def main():
     dp.add_handler(CommandHandler("prices", cmd_prices))
     dp.add_handler(CommandHandler("balances", cmd_balances))
     dp.add_handler(CommandHandler("slippage", cmd_slippage, pass_args=True))
+
     dp.add_handler(CommandHandler("ping", cmd_ping))
     dp.add_handler(CommandHandler("plan", cmd_plan))
     dp.add_handler(CommandHandler("dryrun", cmd_dryrun))
     dp.add_handler(CommandHandler("cooldowns", cmd_cooldowns, pass_args=True))
 
+    # Callbacks & diagnostics
     dp.add_handler(CallbackQueryHandler(on_exec_button, pattern=r"^exec:[A-Za-z0-9_\-]+$"))
     dp.add_handler(CallbackQueryHandler(on_exec_confirm, pattern=r"^exec_go:[A-Za-z0-9_\-]+$"))
     dp.add_handler(CallbackQueryHandler(on_exec_cancel, pattern=r"^exec_cancel$"))
