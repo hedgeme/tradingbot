@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# TECBot Telegram Listener — formatting stable, tolerant ONE resolver, Coinbase compare
+# TECBot Telegram Listener — formatting stable, tolerant ONE resolver, Coinbase compare (mid fix in /slippage)
 
 import os, sys, logging, subprocess, shlex
 from datetime import datetime, timezone
@@ -293,7 +293,7 @@ def cmd_balances(update: Update, context: CallbackContext):
     cols = ["ONE", "1USDC", "1ETH", "TEC", "1sDAI"]
 
     # widths tuned for Telegram
-    w_wallet = 14
+    w_wallet = 22
     w_amt    = 11
 
     header = f"{'Wallet':<{w_wallet}}  " + "  ".join(f"{c:>{w_amt}}" for c in cols)
@@ -313,12 +313,8 @@ def cmd_balances(update: Update, context: CallbackContext):
 
     update.message.reply_text(f"<pre>\n{chr(10).join(lines)}\n</pre>", parse_mode=ParseMode.HTML)
 
-# ---- ETH forward vs reverse tiny-probe (for /prices note removal; internal only) ----
+# ---- ETH reverse tiny-probe (display helper for /prices only; unchanged) ----
 def _eth_best_side_and_route() -> (Optional[Decimal], str):
-    """
-    Returns (lp_price_per_1_eth, 'fwd'|'rev') using small reverse probes and a 1 ETH forward.
-    Display only; price logic remains in prices.py.
-    """
     if PR is None:
         return None, "fwd"
     try:
@@ -364,14 +360,11 @@ def _eth_best_side_and_route() -> (Optional[Decimal], str):
         fwd = (Decimal(out_f) / (Decimal(10)**dec_u)) if out_f else None
 
         if rev is not None and fwd is not None:
-            # choose the side closer to Coinbase reference, if available; else pick reverse if they diverge
             cb = _coinbase_eth()
             if cb:
-                # pick the side nearer to cb
                 d_rev = abs(rev - cb)
                 d_fwd = abs(fwd - cb)
                 return (rev, "rev") if d_rev <= d_fwd else (fwd, "fwd")
-            # no cb: if big divergence, prefer reverse (buy side)
             if abs(rev - fwd) / max(Decimal("1"), rev) > Decimal("0.05"):
                 return rev, "rev"
             return fwd, "fwd"
@@ -409,7 +402,6 @@ def cmd_prices(update: Update, context: CallbackContext):
 
         try:
             if s == "ONE":
-                # Display ONE via WONE → 1USDC if available
                 price = PR.price_usd("WONE", Decimal("1"))
                 route_text = "WONE → 1USDC (fwd)" if price is not None else "—"
             elif s == "1USDC":
@@ -422,13 +414,9 @@ def cmd_prices(update: Update, context: CallbackContext):
                 basis = Decimal("100")
                 out = PR.price_usd("TEC", basis)
                 price = (out / basis) if out is not None and basis > 0 else None
-                # prefer best of TEC→WONE→USDC vs TEC→1sDAI→USDC handled inside prices module;
-                # set a generic route text for display:
                 route_text = "TEC → WONE → 1USDC"
-                # slippage is display-only; we don't run heavy calc here
                 slip_txt = "—" if price is None else "  "
             elif s == "1ETH":
-                # Use best-side suggestion for display (does not alter core pricing logic)
                 price = lp_eth_pref or PR.price_usd("1ETH", Decimal("1"))
                 route_text = ("1USDC → WONE → 1ETH (rev)" if side == "rev"
                               else "1ETH → WONE → 1USDC (fwd)")
@@ -445,7 +433,6 @@ def cmd_prices(update: Update, context: CallbackContext):
         lines.append(f"{s:<{w_asset}} | {lp_str} | {basis_str} | {slip_str} | {route_text:<{w_route}}")
 
     # Coinbase compare block for ETH
-    # (use the per-1 ETH LP value we just displayed)
     eth_lp_display = None
     try:
         eth_lp_display = next((Decimal(lines[i].split("|")[1].strip().replace("$","").replace(",",""))
@@ -466,6 +453,54 @@ def cmd_prices(update: Update, context: CallbackContext):
 
     update.message.reply_text(f"<pre>\n{chr(10).join(lines)}\n</pre>", parse_mode=ParseMode.HTML)
 
+# ---- Mid helpers for /slippage ----
+def _mid_usdc_per_unit(token_in: str) -> Optional[Decimal]:
+    """
+    Stable mid baseline per 1 unit.
+    - 1ETH: use reverse tiny probes (USDC->WONE->1ETH) and take the most favorable implied price.
+    - ONE: use WONE->1USDC per 1 WONE.
+    - otherwise: PR.price_usd(token_in, 1)
+    """
+    if PR is None:
+        return None
+    t = token_in.upper()
+    try:
+        if t == "1ETH":
+            from web3 import Web3
+            from app.chain import get_ctx
+            ctx = get_ctx(C.HARMONY_RPC)
+            ABI = [{
+              "inputs":[{"internalType":"bytes","name":"path","type":"bytes"},
+                        {"internalType":"uint256","name":"amountIn","type":"uint256"}],
+              "name":"quoteExactInput",
+              "outputs":[{"internalType":"uint256","name":"amountOut","type":"uint256"},
+                         {"internalType":"uint160","name":"sqrtPriceX96After","type":"uint160"},
+                         {"internalType":"uint32","name":"initializedTicksCrossed","type":"uint32"},
+                         {"internalType":"uint256","name":"gasEstimate","type":"uint256"}],
+              "stateMutability":"nonpayable","type":"function"}]
+            q = ctx.w3.eth.contract(address=Web3.to_checksum_address(C.QUOTER_ADDR), abi=ABI)
+            def addr(s): return Web3.to_checksum_address(PR._addr(s))
+            def fee3(f): return int(f).to_bytes(3, "big")
+            dec_e = PR._dec("1ETH")
+            dec_u = PR._dec("1USDC")
+            choices = []
+            for usdc_in in (Decimal("25"), Decimal("50"), Decimal("100"), Decimal("250")):
+                wei = int(usdc_in * (Decimal(10)**dec_u))
+                path = (Web3.to_bytes(hexstr=addr("1USDC")) + fee3(3000) +
+                        Web3.to_bytes(hexstr=addr("WONE"))  + fee3(3000) +
+                        Web3.to_bytes(hexstr=addr("1ETH")))
+                out = q.functions.quoteExactInput(path, wei).call()[0]
+                eth_out = Decimal(out) / (Decimal(10)**dec_e)
+                if eth_out > 0:
+                    choices.append(usdc_in / eth_out)
+            return min(choices) if choices else None
+        if t == "ONE":
+            return PR.price_usd("WONE", Decimal("1"))
+        # default
+        return PR.price_usd(t, Decimal("1"))
+    except Exception:
+        return None
+
 # ---- SLIPPAGE (Option B table) ----
 def cmd_slippage(update: Update, context: CallbackContext):
     args = context.args or []
@@ -484,11 +519,8 @@ def cmd_slippage(update: Update, context: CallbackContext):
     # Table widths for Telegram
     w1, w2, w3, w4 = 12, 16, 12, 16
 
-    # Baseline mid via price_usd per 1 unit
-    try:
-        mid = PR.price_usd(token_in, Decimal("1"))
-    except Exception:
-        mid = None
+    # Baseline mid (fixed: robust per token)
+    mid = _mid_usdc_per_unit(token_in)
 
     # Curve (USDC targets), aligned table
     targets = [Decimal("10"), Decimal("100"), Decimal("1000"), Decimal("10000")]
@@ -499,7 +531,11 @@ def cmd_slippage(update: Update, context: CallbackContext):
         else:
             est_in = Decimal("0")
         try:
-            px_usd = PR.price_usd(token_in, est_in)
+            # For ONE, quote using WONE under the hood
+            if token_in == "ONE":
+                px_usd = PR.price_usd("WONE", est_in)
+            else:
+                px_usd = PR.price_usd(token_in, est_in)
             eff = (px_usd / est_in) if (px_usd and est_in > 0) else None
             slip = ((eff - mid) / mid * Decimal("100")) if (eff and mid) else None
             rows.append((f"{usdc:,.0f}", f"{est_in:.6f}", f"{eff:,.2f}" if eff else "—", f"{slip:+.2f}%" if slip is not None else "—"))
@@ -573,8 +609,7 @@ def cmd_dryrun(update: Update, context: CallbackContext):
 
     text = render_dryrun(results)
     kb = [[InlineKeyboardButton(f"▶️ Execute {getattr(r,'action_id','?')}", callback_data=f"exec:{getattr(r,'action_id','?')}")] for r in results]
-    kb.append([InlineKeyboardButton("❌ Cancel", CallbackQueryHandler)])
-    kb[-1] = [InlineKeyboardButton("❌ Cancel", callback_data="exec_cancel")]
+    kb.append([InlineKeyboardButton("❌ Cancel", callback_data="exec_cancel")])
     update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
 
 def on_exec_button(update: Update, context: CallbackContext):
