@@ -1,13 +1,15 @@
+# /bot/app/prices.py
 # On-chain prices via Uniswap V3 QuoterV2 (Harmony)
-# Public (unchanged): price_usd(sym: str, amount: Decimal) -> Optional[Decimal]
-# Helpers (unchanged): _addr, _dec, _find_pool, _quote_path
-# Added for /prices table: unit_quote(sym) -> dict with per-unit price, basis, slippage bps, route
+# Exposes:
+#   - price_usd(sym: str, amount: Decimal) -> Decimal|None    (effective sell price for `amount`)
+#   - mid_price(sym: str) -> Decimal|None                     (tiny-notional mid; robust for 1ETH)
+# Helpers used by slippage.py and telegram_listener.py:
+#   _addr, _dec, _find_pool, _quote_path
 
 from decimal import Decimal
 from functools import lru_cache
 from typing import Dict, List, Optional, Tuple
 
-# ----- tolerant imports (config & chain) -----
 try:
     from app import config as C
 except Exception:
@@ -21,7 +23,7 @@ except Exception:
 from web3 import Web3
 from web3.contract import Contract
 
-# ------------ Quoter ABI (V2) ------------
+# ---------- ABIs ----------
 _QUOTER_V2_ABI = [{
     "inputs":[
         {"internalType":"bytes","name":"path","type":"bytes"},
@@ -36,6 +38,13 @@ _QUOTER_V2_ABI = [{
     "stateMutability":"nonpayable","type":"function"
 }]
 
+_ERC20_DECIMALS_ABI = [{
+    "inputs":[], "name":"decimals",
+    "outputs":[{"internalType":"uint8","name":"","type":"uint8"}],
+    "stateMutability":"view","type":"function"
+}]
+
+# ---------- context ----------
 @lru_cache(maxsize=1)
 def _ctx():
     return get_ctx(getattr(C, "HARMONY_RPC", "https://api.s0.t.hmny.io"))
@@ -47,55 +56,66 @@ def _quoter() -> Contract:
         abi=_QUOTER_V2_ABI
     )
 
+# ---------- symbol helpers ----------
 def _norm(sym: str) -> str:
     return sym.upper().strip()
 
+def _canon(sym: str) -> str:
+    """Map native 'ONE' to 'WONE' for routing/quoting. Others pass-through."""
+    s = _norm(sym)
+    if s == "ONE":
+        return "WONE"
+    return s
+
 def _tokens() -> Dict[str, str]:
-    return {k.upper(): v for k, v in getattr(C, "TOKENS", {}).items()}
+    # keep original map but allow lookups by canon name too
+    t = {k.upper(): v for k, v in getattr(C, "TOKENS", {}).items()}
+    if "ONE" in t and "WONE" in t and t["ONE"] == t["WONE"]:
+        # both present and same address -> good
+        pass
+    return t
 
 def _pools() -> Dict[str, Dict[str, int]]:
-    # keys like "1ETH/WONE@3000"
     return {k: {"address": v["address"], "fee": int(v["fee"])}
             for k, v in getattr(C, "POOLS_V3", {}).items()}
 
 def _addr(sym: str) -> str:
-    symN = _norm(sym)
+    s = _canon(sym)
     t = _tokens()
-    if symN not in t:
-        raise KeyError(f"missing address for {symN}")
-    return t[symN]
-
-# --- ERC20 decimals (cached) ---
-_ERC20_DECIMALS_ABI = [{"inputs":[],"name":"decimals","outputs":[{"internalType":"uint8","name":"","type":"uint8"}],"stateMutability":"view","type":"function"}]
+    if s not in t:
+        raise KeyError(f"missing address for {s}")
+    return t[s]
 
 @lru_cache(maxsize=64)
 def _dec(sym: str) -> int:
-    symN = _norm(sym)
+    s = _canon(sym)
+    # optional local hints
     dec_map = {k.upper(): v for k, v in getattr(C, "DECIMALS", {}).items()}
-    if symN in dec_map:
-        return int(dec_map[symN])
-    token = _ctx().w3.eth.contract(address=Web3.to_checksum_address(_addr(symN)), abi=_ERC20_DECIMALS_ABI)
+    if s in dec_map:
+        return int(dec_map[s])
+    w3 = _ctx().w3
+    token = w3.eth.contract(address=Web3.to_checksum_address(_addr(s)), abi=_ERC20_DECIMALS_ABI)
     return int(token.functions.decimals().call())
 
 def _fee3(fee: int) -> bytes:
     return int(fee).to_bytes(3, "big")
 
 def _find_pool(a: str, b: str) -> Optional[int]:
-    """Return fee tier between tokens if a known pool exists (either direction)."""
-    aN, bN = _norm(a), _norm(b)
-    for key, _info in _pools().items():
+    """Return fee tier if a known v3 pool exists between a and b (either order)."""
+    aN, bN = _canon(a), _canon(b)
+    for key, info in _pools().items():
         try:
             pair, fee_txt = key.split("@", 1)
-            x, y = pair.split("/", 1)
+            x, y = [p.upper() for p in pair.split("/", 1)]
             fee = int(fee_txt)
         except Exception:
             continue
-        if {aN, bN} == {x.upper(), y.upper()}:
+        # treat ONE as WONE by canonicalization
+        if {aN, bN} == {_canon(x), _canon(y)}:
             return fee
     return None
 
 def _build_path(hops: List[Tuple[str, int, str]]) -> bytes:
-    """ABI-encoded path for Quoter/Router: tokenIn (20) + fee (3) + tokenOut (20) [+ ...]"""
     out = b""
     for i, (src, fee, dst) in enumerate(hops):
         if i == 0:
@@ -103,26 +123,23 @@ def _build_path(hops: List[Tuple[str, int, str]]) -> bytes:
         out += _fee3(fee) + Web3.to_bytes(hexstr=Web3.to_checksum_address(_addr(dst)))
     return out
 
-def _quote_path(hops: List[Tuple[str, int, str]], amount_in: int) -> Optional[int]:
+def _quote_path(hops: List[Tuple[str, int, str]], amount_in_wei: int) -> Optional[int]:
     if not hops:
         return None
     try:
         q = _quoter()
-        out = q.functions.quoteExactInput(_build_path(hops), int(amount_in)).call()
+        out = q.functions.quoteExactInput(_build_path(hops), int(amount_in_wei)).call()
         return int(out[0])
     except Exception:
         return None
 
-# ------------ ROUTING HELPERS ------------
-def _best_forward_route_to_usdc(sym: str, wei_in: int) -> Optional[List[Tuple[str,int,str]]]:
-    """
-    Among (direct), via WONE, via 1sDAI — pick the one that yields the highest USDC-out
-    for the GIVEN input size (wei_in).
-    """
-    s = _norm(sym)
+# ---------- routing ----------
+def _best_route_to_usdc(sym: str) -> Optional[List[Tuple[str, int, str]]]:
+    """Pick the best of: direct, via WONE, via 1sDAI — by tiny forward probe into 1USDC."""
+    s = _canon(sym)
     if s == "1USDC":
         return []
-    candidates: List[List[Tuple[str,int,str]]] = []
+    candidates: List[List[Tuple[str, int, str]]] = []
 
     # direct
     f = _find_pool(s, "1USDC")
@@ -144,171 +161,124 @@ def _best_forward_route_to_usdc(sym: str, wei_in: int) -> Optional[List[Tuple[st
     if not candidates:
         return None
 
+    # probe each with 0.01 unit and pick highest USDC out
+    dec_in = _dec(s)
+    probe_wei = int((Decimal("0.01")) * (Decimal(10) ** dec_in)) or 1
     best = None
-    best_out = -1
+    best_out = Decimal("-1")
+
     for route in candidates:
-        out = _quote_path(route, wei_in)
+        out = _quote_path(route, probe_wei)
         if out is None:
             continue
-        if out > best_out:
-            best_out = out
+        usdc_out = Decimal(out) / (Decimal(10) ** _dec("1USDC"))
+        if usdc_out > best_out:
+            best_out = usdc_out
             best = route
     return best
 
-def _reverse_eth_price_from_usdc(usdc_in: Decimal) -> Optional[Tuple[Decimal,str]]:
-    """
-    Buy ETH with a small USDC amount; return (USDC per 1 ETH, route_text).
-    Route is 1USDC -> WONE -> 1ETH using known 0.3% pools.
-    """
-    try:
-        dec_u = _dec("1USDC"); dec_e = _dec("1ETH")
-        wei = int(usdc_in * (Decimal(10)**dec_u))
-        route = [
-            ("1USDC", 3000, "WONE"),
-            ("WONE", 3000, "1ETH"),
-        ]
-        out = _quote_path(route, wei)
-        if not out:
-            return None
-        eth_out = Decimal(out) / (Decimal(10)**dec_e)
-        if eth_out <= 0:
-            return None
-        price = usdc_in / eth_out  # USDC per 1 ETH
-        return price, "1USDC → WONE → 1ETH (rev)"
-    except Exception:
-        return None
-
-# ------------ PUBLIC (legacy behavior kept) ------------
+# ---------- public API ----------
 def price_usd(sym: str, amount: Decimal) -> Optional[Decimal]:
     """
-    Return total USDC for `amount` of `sym` using forward best-known route.
-    (Legacy behavior; kept for compatibility with slippage and other callers.)
+    Effective sell price: USDC you’d receive by selling `amount` of `sym`.
+    This is what the trade would roughly execute at (forward path).
     """
-    s = _norm(sym)
+    s = _canon(sym)
     amt = Decimal(amount)
 
     if s == "1USDC":
         return amt
 
     if s == "1SDAI":
-        # Prefer pool if available; else assume 1:1
-        f = _find_pool("1sDAI", "1USDC")
-        if not f:
+        # quote via sdai->usdc
+        route = _best_route_to_usdc("1sDAI")
+        if not route:
             return amt
         dec_in = _dec("1sDAI")
         wei_in = int(amt * (Decimal(10) ** dec_in))
-        out = _quote_path([("1sDAI", f, "1USDC")], wei_in)
-        return (Decimal(out) / (Decimal(10)**_dec("1USDC"))) if out else amt
+        out = _quote_path(route, wei_in)
+        if out is None:
+            return amt
+        return Decimal(out) / (Decimal(10) ** _dec("1USDC"))
 
-    # General forward best-of (at this size)
-    dec_in = _dec(s)
-    wei_in = int(amt * (Decimal(10) ** dec_in))
-    route = _best_forward_route_to_usdc(s, wei_in)
+    # general forward route
+    route = _best_route_to_usdc(s)
     if route is None:
         return None
+    dec_in = _dec(s)
+    wei_in = int(amt * (Decimal(10) ** dec_in))
     wei_out = _quote_path(route, wei_in)
     if wei_out is None:
         return None
     return Decimal(wei_out) / (Decimal(10) ** _dec("1USDC"))
 
-# ------------ NEW: unit-level pricer for /prices ------------
-_BASIS_BY_ASSET: Dict[str, Decimal] = {
-    "1ETH":  Decimal("0.05"),   # basis for display; ETH price uses small reverse buy under the hood
-    "TEC":   Decimal("100"),
-    "ONE":   Decimal("1000"),
-    "WONE":  Decimal("1000"),
-    "1SDAI": Decimal("1"),
-    "1USDC": Decimal("1"),
-}
-
-def _basis_for(sym: str) -> Decimal:
-    return _BASIS_BY_ASSET.get(_norm(sym), Decimal("1"))
-
-def _safe_micro(amount: Decimal) -> Decimal:
-    # 1/20th of basis but not below a dust floor
-    micro = (amount / Decimal(20)).quantize(Decimal("0.000001"))
-    return micro if micro > Decimal("0") else Decimal("0.000001")
-
-def unit_quote(sym: str) -> Optional[Dict[str, object]]:
+def mid_price(sym: str) -> Optional[Decimal]:
     """
-    Policy used by /prices table:
-      - ETH: reverse at small USDC size ($100 USDC), invert to USDC/ETH
-      - Others: forward best-of at a chosen basis size; normalize to per-1
-      - Slippage shown: per-unit at basis vs per-unit at micro (basis/20), in bps
-    Returns: {
-      'asset': '1ETH',
-      'unit_price': Decimal,            # USDC per 1 token
-      'basis': Decimal,                 # the size used for quoting (in token units; ETH row still reports per 1)
-      'slippage_bps': int,              # bps vs micro
-      'route': str,                     # human text of route and direction
-      'direction': 'fwd'|'rev'|'base'
-    }
+    Tiny-notional, more neutral 'mid':
+      - For 1ETH: robust reverse tiny probes (USDC→ETH) vs forward tiny sell; take median,
+        ignore obviously bad reverse outliers.
+      - For others: forward tiny probe.
+    Returns USDC per 1 unit of `sym`.
     """
-    s = _norm(sym)
-
-    # 1USDC is base
+    s = _canon(sym)
     if s == "1USDC":
-        return {
-            "asset": s,
-            "unit_price": Decimal("1"),
-            "basis": Decimal("1"),
-            "slippage_bps": 0,
-            "route": "—",
-            "direction": "base",
-        }
+        return Decimal("1")
 
-    # ETH uses reverse small USDC buy for robustness
-    if s == "1ETH":
-        # main quote from $100 USDC; micro from $25 USDC
-        main = _reverse_eth_price_from_usdc(Decimal("100"))
-        micro = _reverse_eth_price_from_usdc(Decimal("25"))
-        if not main or not micro:
-            return None
-        px_main, route_txt = main
-        px_micro, _ = micro
-        # bps vs micro
-        slip_bps = int((((px_main - px_micro) / px_micro) * Decimal(10000)).quantize(Decimal("1")))
-        return {
-            "asset": s,
-            "unit_price": px_main,   # USDC per 1 ETH
-            "basis": Decimal("1"),   # display per 1 ETH (derived from $100 buy)
-            "slippage_bps": slip_bps,
-            "route": route_txt,
-            "direction": "rev",
-        }
-
-    # Everyone else: forward best-of at basis
-    basis = _basis_for(s)
+    # forward tiny: sell 0.01 sym into USDC
+    route_f = _best_route_to_usdc(s)
+    if not route_f:
+        return None
     dec_in = _dec(s)
-    wei_in = int(basis * (Decimal(10)**dec_in))
-    route = _best_forward_route_to_usdc(s, wei_in)
-    if not route:
+    tiny_amt = Decimal("0.01")
+    wei_in = int(tiny_amt * (Decimal(10) ** dec_in))
+    f_out = _quote_path(route_f, wei_in)
+    if f_out is None:
         return None
+    f_px = (Decimal(f_out) / (Decimal(10) ** _dec("1USDC"))) / tiny_amt
 
-    out = _quote_path(route, wei_in)
-    if not out:
-        return None
-    usdc_out = Decimal(out) / (Decimal(10)**_dec("1USDC"))
-    per_unit = usdc_out / basis
+    if s != "1ETH":
+        return f_px  # forward tiny is fine for non-ETH
 
-    # micro probe for slippage
-    micro_amt = _safe_micro(basis)
-    wei_micro = int(micro_amt * (Decimal(10)**dec_in))
-    route_micro = _best_forward_route_to_usdc(s, wei_micro) or route
-    out_micro = _quote_path(route_micro, wei_micro)
-    per_unit_micro = (Decimal(out_micro) / (Decimal(10)**_dec("1USDC")) / micro_amt) if out_micro else per_unit
-    slip_bps = int((((per_unit - per_unit_micro) / per_unit_micro) * Decimal(10000)).quantize(Decimal("1")))
+    # reverse tiny probes for 1ETH (USDC -> ETH), then invert
+    # try a few small sizes and collect acceptable implied prices
+    def _rev_px(usdc_in: Decimal) -> Optional[Decimal]:
+        # build path USDC->...->ETH by inverting best route
+        # Our forward best is ETH->(WONE|1sDAI)->USDC; reverse is USDC->(WONE|1sDAI)->ETH
+        best_eth_to_usdc = _best_route_to_usdc("1ETH")
+        if not best_eth_to_usdc:
+            return None
+        rev_hops = []
+        # reverse hops order & tokens
+        cur_dst = "1ETH"
+        for (a, fee, b) in best_eth_to_usdc[::-1]:
+            rev_hops.append((_canon(b), fee, _canon(a)))
+        # ensure first is 1USDC
+        if rev_hops[0][0] != "1USDC":
+            # If we ended with WONE->1ETH, first should be 1USDC->WONE; that’s fine.
+            pass
+        dec_u = _dec("1USDC")
+        wei = int(usdc_in * (Decimal(10) ** dec_u))
+        eth_out_wei = _quote_path(rev_hops, wei)
+        if eth_out_wei is None or eth_out_wei == 0:
+            return None
+        eth_out = Decimal(eth_out_wei) / (Decimal(10) ** _dec("1ETH"))
+        if eth_out <= 0:
+            return None
+        return usdc_in / eth_out  # implied USDC per 1 ETH
 
-    # route text
-    route_txt = " → ".join([route[0][0]] + [h[2] for h in route])
+    samples = []
+    for usdc in (Decimal("50"), Decimal("100"), Decimal("250")):
+        px = _rev_px(usdc)
+        if px is not None:
+            samples.append(px)
 
-    return {
-        "asset": s,
-        "unit_price": per_unit,   # USDC per 1 token
-        "basis": basis,           # token units used for quoting
-        "slippage_bps": slip_bps,
-        "route": f"{route_txt} (fwd)",
-        "direction": "fwd",
-    }
+    # guardrails: drop samples that are > 2.0x or < 0.5x of forward tiny
+    good = [p for p in samples if (p <= f_px * Decimal("2.0") and p >= f_px * Decimal("0.5"))]
+    if not good:
+        return f_px
+    # median-of forward tiny and the good reverse samples
+    cand = sorted(good + [f_px])
+    mid = cand[len(cand)//2]
+    return mid
 
-__all__ = ["price_usd", "_addr", "_dec", "_find_pool", "_quote_path", "unit_quote"]
+__all__ = ["price_usd", "mid_price", "_addr", "_dec", "_find_pool", "_quote_path"]
