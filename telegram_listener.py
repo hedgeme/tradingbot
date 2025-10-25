@@ -4,7 +4,7 @@
 import os, sys, logging, subprocess, shlex
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_DOWN
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Any
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ParseMode, Update
 from telegram.ext import (
@@ -217,7 +217,8 @@ def cmd_help(update: Update, context: CallbackContext):
         "  /slippage <IN> [AMOUNT] [OUT] — live impact/minOut (default OUT=1USDC, AMOUNT=1)\n"
         "  /assets — configured tokens & wallets\n"
         "  /version — code version\n"
-        "  /sanity — config/modules sanity"
+        "  /sanity — config/modules sanity\n"
+        "  /trade — fast wizard to stage a manual action (Advanced path)"
     )
 
 def cmd_version(update: Update, context: CallbackContext):
@@ -259,7 +260,6 @@ def cmd_assets(update: Update, context: CallbackContext):
     lines.append("-------------------------------------------------------")
     for k in sorted(wallets.keys()):
         lines.append(f"{k:<12} {wallets[k]}")
-    # Wrap in <pre> for Telegram monospace alignment
     update.message.reply_text(f"<pre>\n{chr(10).join(lines)}\n</pre>", parse_mode=ParseMode.HTML)
 
 # ---- BALANCES (Option A: header tightened, tolerant ONE resolver, wider columns) ----
@@ -269,7 +269,6 @@ _ONE_KEY_ORDER = [
 ]
 
 def _resolve_one_value(row: Dict[str, Decimal]) -> Decimal:
-    # tolerant case-insensitive lookup across variants
     lower = {k.lower(): k for k in row.keys()}
     for key in _ONE_KEY_ORDER:
         k = lower.get(key.lower())
@@ -289,10 +288,7 @@ def cmd_balances(update: Update, context: CallbackContext):
         log.exception("balances failure")
         update.message.reply_text(f"Balances error: {e}"); return
 
-    # Column order you approved
     cols = ["ONE", "1USDC", "1ETH", "TEC", "1sDAI"]
-
-    # widths tuned for Telegram
     w_wallet = 22
     w_amt    = 11
 
@@ -303,10 +299,8 @@ def cmd_balances(update: Update, context: CallbackContext):
     for w_name in sorted(table.keys()):
         row = table[w_name]
         vals: List[str] = []
-        # ONE uses tolerant resolver
         one_val = _resolve_one_value(row)
         vals.append(_fmt_amt("ONE", one_val))
-        # others direct
         for c in cols[1:]:
             vals.append(_fmt_amt(c, row.get(c, 0)))
         lines.append(f"{w_name:<{w_wallet}}  " + "  ".join(f"{v:>{w_amt}}" for v in vals))
@@ -337,7 +331,6 @@ def _eth_best_side_and_route() -> (Optional[Decimal], str):
         dec_e = PR._dec("1ETH")
         dec_u = PR._dec("1USDC")
 
-        # reverse: small USDC in -> ETH out -> implied price
         choices = []
         for usdc_in in (Decimal("25"), Decimal("50"), Decimal("100"), Decimal("250")):
             wei = int(usdc_in * (Decimal(10)**dec_u))
@@ -349,9 +342,8 @@ def _eth_best_side_and_route() -> (Optional[Decimal], str):
             if eth_out > 0:
                 choices.append(usdc_in / eth_out)
 
-        rev = min(choices) if choices else None  # smallest implied price is most favorable buy price
+        rev = min(choices) if choices else None
 
-        # forward: sell exactly 1 ETH
         wei_in = int(Decimal("1") * (Decimal(10)**dec_e))
         path_f = (Web3.to_bytes(hexstr=addr("1ETH")) + fee3(3000) +
                   Web3.to_bytes(hexstr=addr("WONE")) + fee3(3000) +
@@ -377,10 +369,8 @@ def cmd_prices(update: Update, context: CallbackContext):
     if PR is None:
         update.message.reply_text("Prices unavailable (module not loaded)."); return
 
-    # Your preferred order
     syms = ["ONE", "1USDC", "1sDAI", "TEC", "1ETH"]
 
-    # Column widths tuned for Telegram monospace
     w_asset, w_lp, w_basis, w_slip, w_route = 6, 11, 12, 9, 27
 
     header = (
@@ -390,9 +380,8 @@ def cmd_prices(update: Update, context: CallbackContext):
     sep = "-" * (len(header) + 0)
     lines = ["LP Prices", header, sep]
 
-    # Compute rows
     cb_eth = _coinbase_eth()
-    lp_eth_pref, side = _eth_best_side_and_route()  # display-only suggestion
+    lp_eth_pref, side = _eth_best_side_and_route()
 
     for s in syms:
         route_text = "—"
@@ -432,35 +421,14 @@ def cmd_prices(update: Update, context: CallbackContext):
         slip_str = slip_txt.rjust(w_slip)
         lines.append(f"{s:<{w_asset}} | {lp_str} | {basis_str} | {slip_str} | {route_text:<{w_route}}")
 
-    # Coinbase compare block for ETH
-    eth_lp_display = None
-    try:
-        eth_lp_display = next((Decimal(lines[i].split("|")[1].strip().replace("$","").replace(",",""))
-                               for i in range(len(lines))
-                               if lines[i].startswith("1ETH ")), None)
-    except Exception:
-        eth_lp_display = None
-
     lines += ["", "ETH: Harmony LP vs Coinbase"]
-    lines.append(f"  LP:       {_fmt_money(eth_lp_display)}")
+    lines.append(f"  LP:       {_fmt_money(next((Decimal(lines[i].split('|')[1].strip().replace('$','').replace(',','')) for i in range(len(lines)) if lines[i].startswith('1ETH ')), None))}")
     lines.append(f"  Coinbase: {_fmt_money(cb_eth)}")
-    if eth_lp_display is not None and cb_eth not in (None, Decimal(0)):
-        try:
-            diff = (Decimal(eth_lp_display) - Decimal(cb_eth)) / Decimal(cb_eth) * Decimal(100)
-            lines.append(f"  Diff:     {diff:+.2f}%")
-        except Exception:
-            pass
 
     update.message.reply_text(f"<pre>\n{chr(10).join(lines)}\n</pre>", parse_mode=ParseMode.HTML)
 
 # ---- Mid helpers for /slippage ----
 def _mid_usdc_per_unit(token_in: str) -> Optional[Decimal]:
-    """
-    Stable mid baseline per 1 unit.
-    - 1ETH: use reverse tiny probes (USDC->WONE->1ETH) and take the most favorable implied price.
-    - ONE: use WONE->1USDC per 1 WONE.
-    - otherwise: PR.price_usd(token_in, 1)
-    """
     if PR is None:
         return None
     t = token_in.upper()
@@ -496,7 +464,6 @@ def _mid_usdc_per_unit(token_in: str) -> Optional[Decimal]:
             return min(choices) if choices else None
         if t == "ONE":
             return PR.price_usd("WONE", Decimal("1"))
-        # default
         return PR.price_usd(t, Decimal("1"))
     except Exception:
         return None
@@ -516,13 +483,10 @@ def cmd_slippage(update: Update, context: CallbackContext):
     amount_in = Decimal(args[1]) if len(args) >= 2 else Decimal("1")
     token_out = args[2].upper() if len(args) >= 3 else "1USDC"
 
-    # Table widths for Telegram
     w1, w2, w3, w4 = 12, 16, 12, 16
 
-    # Baseline mid (fixed: robust per token)
     mid = _mid_usdc_per_unit(token_in)
 
-    # Curve (USDC targets), aligned table
     targets = [Decimal("10"), Decimal("100"), Decimal("1000"), Decimal("10000")]
     rows = []
     for usdc in targets:
@@ -531,7 +495,6 @@ def cmd_slippage(update: Update, context: CallbackContext):
         else:
             est_in = Decimal("0")
         try:
-            # For ONE, quote using WONE under the hood
             if token_in == "ONE":
                 px_usd = PR.price_usd("WONE", est_in)
             else:
@@ -542,7 +505,6 @@ def cmd_slippage(update: Update, context: CallbackContext):
         except Exception:
             rows.append((f"{usdc:,.0f}", "—", "—", "—"))
 
-    # Build pretty table
     col1, col2, col3, col4 = "Size (USDC)", "Amount In (sym)", "Eff. Price", "Slippage vs mid"
     line_hdr = f"{col1:>{w1}} | {col2:>{w2}} | {col3:>{w3}} | {col4:>{w4}}"
     line_sep = "-" * len(line_hdr)
@@ -644,6 +606,258 @@ def on_exec_cancel(update: Update, context: CallbackContext):
     q.edit_message_text("Canceled. No transaction sent.")
     q.answer()
 
+# ==== TRADE WIZARD (new) =====================================================
+
+# Small per-chat wizard state (does not affect existing planner/runner until final stage)
+_TW: Dict[int, Dict[str, Any]] = {}
+
+def _tw_state(chat_id: int) -> Dict[str, Any]:
+    st = _TW.get(chat_id)
+    if not st:
+        st = {"wallet": None, "from": None, "to": None, "force_via": None, "route": None, "amount": None, "slip_bps": None}
+        _TW[chat_id] = st
+    return st
+
+def _kb_wallets() -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton("tecbot_usdc", callback_data="tw|w|tecbot_usdc"),
+         InlineKeyboardButton("tecbot_sdai", callback_data="tw|w|tecbot_sdai")],
+        [InlineKeyboardButton("tecbot_eth", callback_data="tw|w|tecbot_eth"),
+         InlineKeyboardButton("tecbot_tec", callback_data="tw|w|tecbot_tec")],
+        [InlineKeyboardButton("Cancel", callback_data="tw|x")]
+    ]
+    return InlineKeyboardMarkup(rows)
+
+def _kb_tokens(kind: str) -> InlineKeyboardMarkup:
+    syms = list(getattr(C, "TOKENS", {}).keys()) or ["ONE","1USDC","1sDAI","TEC","1ETH"]
+    syms = [s.upper() for s in syms]
+    rows, row = [], []
+    for s in sorted(set(syms)):
+        row.append(InlineKeyboardButton(s, callback_data=f"tw|{kind}|{s}"))
+        if len(row) == 3:
+            rows.append(row); row=[]
+    if row: rows.append(row)
+    rows.append([InlineKeyboardButton("Back", callback_data="tw|back"), InlineKeyboardButton("Cancel", callback_data="tw|x")])
+    return InlineKeyboardMarkup(rows)
+
+def _kb_routes(from_sym: str, to_sym: str, force_via: Optional[str]) -> InlineKeyboardMarkup:
+    # Lazy import (works whether file is in app/ or root/)
+    try:
+        from app import route_finder as RF
+    except Exception:
+        import route_finder as RF  # type: ignore
+    cands = RF.candidates(from_sym, to_sym, force_via=force_via, max_hops=2, max_routes=3)
+    buttons = [[InlineKeyboardButton("Best route (auto)", callback_data="tw|route|AUTO")]]
+    if not cands:
+        buttons.append([InlineKeyboardButton("No direct pool — will route via intermediates", callback_data="tw|noop")])
+    else:
+        for p in cands:
+            label = " → ".join(p)
+            buttons.append([InlineKeyboardButton(label, callback_data=f"tw|route|{label}")])
+    buttons.append([InlineKeyboardButton("Advanced path…", callback_data="tw|adv")])
+    buttons.append([InlineKeyboardButton("Back", callback_data="tw|back"), InlineKeyboardButton("Cancel", callback_data="tw|x")])
+    return InlineKeyboardMarkup(buttons)
+
+def _kb_advanced(force_via: Optional[str]) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton("Force via WONE", callback_data="tw|force|WONE"),
+             InlineKeyboardButton("Force via 1sDAI", callback_data="tw|force|1sDAI")]]
+    row2 = []
+    if force_via:
+        row2.append(InlineKeyboardButton("Clear constraint", callback_data="tw|force|CLEAR"))
+    row2 += [InlineKeyboardButton("Back", callback_data="tw|back"), InlineKeyboardButton("Cancel", callback_data="tw|x")]
+    rows.append(row2)
+    return InlineKeyboardMarkup(rows)
+
+def _kb_amount() -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton("100", callback_data="tw|amt|100"),
+         InlineKeyboardButton("250", callback_data="tw|amt|250"),
+         InlineKeyboardButton("500", callback_data="tw|amt|500")],
+        [InlineKeyboardButton("1,500", callback_data="tw|amt|1500"),
+         InlineKeyboardButton("5,000", callback_data="tw|amt|5000"),
+         InlineKeyboardButton("10,000", callback_data="tw|amt|10000")],
+        [InlineKeyboardButton("Custom…", callback_data="tw|amt|CUSTOM"),
+         InlineKeyboardButton("Back", callback_data="tw|back"),
+         InlineKeyboardButton("Cancel", callback_data="tw|x")],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+def _kb_slip() -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton("10 bps", callback_data="tw|slip|10"),
+         InlineKeyboardButton("20 bps", callback_data="tw|slip|20"),
+         InlineKeyboardButton("30 bps", callback_data="tw|slip|30"),
+         InlineKeyboardButton("50 bps", callback_data="tw|slip|50")],
+        [InlineKeyboardButton("Custom…", callback_data="tw|slip|CUSTOM"),
+         InlineKeyboardButton("Back", callback_data="tw|back"),
+         InlineKeyboardButton("Cancel", callback_data="tw|x")],
+    ]
+    return InlineKeyboardMarkup(rows)
+
+def _kb_confirm() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("Stage Action", callback_data="tw|ok"),
+         InlineKeyboardButton("Edit", callback_data="tw|back")],
+        [InlineKeyboardButton("➡️ /dryrun", callback_data="tw|dryrun"),
+         InlineKeyboardButton("Cancel", callback_data="tw|x")]
+    ])
+
+def cmd_trade(update: Update, context: CallbackContext):
+    chat_id = update.effective_chat.id
+    _tw_state(chat_id)  # init
+    update.message.reply_text("Trade wizard: choose a wallet", reply_markup=_kb_wallets())
+
+def cb_trade(update: Update, context: CallbackContext):
+    q = update.callback_query
+    if not q or not q.data: return
+    chat_id = q.message.chat_id
+    st = _tw_state(chat_id)
+
+    try:
+        _, op, *rest = q.data.split("|")
+    except Exception:
+        q.answer("Invalid"); return
+
+    if op == "x":
+        _TW.pop(chat_id, None)
+        q.edit_message_text("Trade wizard canceled."); return
+
+    if op == "w":
+        st["wallet"] = rest[0]
+        q.edit_message_text("From asset:", reply_markup=_kb_tokens("from")); return
+
+    if op == "from":
+        st["from"] = rest[0]; st["to"]=None; st["route"]=None; st["force_via"]=None
+        q.edit_message_text("To asset:", reply_markup=_kb_tokens("to")); return
+
+    if op == "to":
+        st["to"] = rest[0]; st["route"]=None
+        header = f"Route selection for {st['from']} → {st['to']}\n"
+        q.edit_message_text(header + "No direct pool — will route via intermediates",
+                            reply_markup=_kb_routes(st["from"], st["to"], st["force_via"]))
+        return
+
+    if op == "adv":
+        q.edit_message_text("Force an intermediate (optional)", reply_markup=_kb_advanced(st.get("force_via"))); return
+
+    if op == "force":
+        choice = rest[0]
+        if choice == "CLEAR":
+            st["force_via"] = None
+        else:
+            st["force_via"] = choice
+        header = f"Route selection for {st['from']} → {st['to']}\n"
+        lbl = f"Advanced route (forced via {st['force_via']})" if st["force_via"] else "No direct pool — will route via intermediates"
+        q.edit_message_text(header + lbl, reply_markup=_kb_routes(st["from"], st["to"], st["force_via"])); return
+
+    if op == "route":
+        sel = rest[0]
+        st["route"] = None if sel == "AUTO" else sel.split(" → ")
+        q.edit_message_text("Amount:", reply_markup=_kb_amount()); return
+
+    if op == "amt":
+        sel = rest[0]
+        if sel == "CUSTOM":
+            q.answer("Send a number like 1500 or 1500.25")
+            context.user_data["tw_await_amt"] = True
+            return
+        st["amount"] = sel
+        q.edit_message_text("Slippage (bps, max):", reply_markup=_kb_slip()); return
+
+    if op == "slip":
+        sel = rest[0]
+        if sel == "CUSTOM":
+            q.answer("Send integer bps, e.g., 35 for 0.35%")
+            context.user_data["tw_await_slip"] = True
+            return
+        st["slip_bps"] = int(sel)
+        q.edit_message_text(_tw_preview(st), reply_markup=_kb_confirm(), parse_mode=ParseMode.HTML); return
+
+    if op == "ok":
+        # Try to stage into planner if available; otherwise just confirm
+        try:
+            if planner and hasattr(planner, "add_manual_action"):
+                planner.add_manual_action(
+                    wallet_key=st["wallet"],
+                    token_from=st["from"],
+                    token_to=st["to"],
+                    path_tokens=st["route"],   # or None for auto
+                    amount_text=str(st["amount"]),
+                    slippage_bps=int(st["slip_bps"]),
+                    force_via=st.get("force_via")
+                )
+                q.edit_message_text(_tw_preview(st) + "\n\nStaged as a planned action. Use /dryrun to simulate.",
+                                    parse_mode=ParseMode.HTML)
+            else:
+                q.edit_message_text(_tw_preview(st) + "\n\nStaged (local). Use /dryrun to simulate.",
+                                    parse_mode=ParseMode.HTML)
+        except Exception as e:
+            q.edit_message_text(f"Failed to stage: {e}")
+        _TW.pop(chat_id, None)
+        return
+
+    if op == "dryrun":
+        # convenience: invoke /dryrun handler path
+        fake_update = Update(q.update_id, message=None, callback_query=q)  # reuse q to keep chat context
+        # We can’t directly call handlers with Update hack; just tell user:
+        q.answer("Run /dryrun now to simulate.", show_alert=False)
+        return
+
+    if op == "back":
+        # simple back chain
+        if st.get("slip_bps") is not None:
+            st["slip_bps"]=None; q.edit_message_text("Slippage (bps, max):", reply_markup=_kb_slip()); return
+        if st.get("amount") is not None:
+            st["amount"]=None; q.edit_message_text("Amount:", reply_markup=_kb_amount()); return
+        if st.get("route") is not None or st.get("to"):
+            st["route"]=None
+            header = f"Route selection for {st['from']} → {st['to']}\n"
+            q.edit_message_text(header + "No direct pool — will route via intermediates",
+                                reply_markup=_kb_routes(st["from"], st["to"], st["force_via"]))
+            return
+        if st.get("from"):
+            st["to"]=None; st["from"]=None
+            q.edit_message_text("From asset:", reply_markup=_kb_tokens("from")); return
+        if st.get("wallet"):
+            st["wallet"]=None
+            q.edit_message_text("Trade wizard: choose a wallet", reply_markup=_kb_wallets()); return
+        q.edit_message_text("Trade wizard: choose a wallet", reply_markup=_kb_wallets()); return
+
+def _tw_preview(st: Dict[str, Any]) -> str:
+    wallet_lbl = st.get("wallet") or "?"
+    path_lbl = "Best route (auto)" if not st.get("route") else " → ".join(st["route"])
+    amt_lbl = st.get("amount") or "?"
+    slip_lbl = f"{st.get('slip_bps','?')} bps (max)"
+    note = f"\n(Advanced constraint: via {st['force_via']})" if st.get("force_via") else ""
+    # Keep your compact monospace style
+    lines = [
+        f"<pre>Review Action — {wallet_lbl}",
+        f"From     : {st.get('from','?')}    To: {st.get('to','?')}",
+        f"Path     : {path_lbl}",
+        f"AmountIn : {amt_lbl} {st.get('from','')}",
+        f"Slippage : {slip_lbl}</pre>",
+    ]
+    return "\n".join(lines) + note
+
+def msg_text_trade(update: Update, context: CallbackContext):
+    chat_id = update.effective_chat.id
+    st = _tw_state(chat_id)
+    text = (update.message.text or "").strip()
+    if context.user_data.get("tw_await_amt"):
+        context.user_data["tw_await_amt"] = False
+        st["amount"] = text
+        update.message.reply_text("Slippage (bps, max):", reply_markup=_kb_slip())
+        return
+    if context.user_data.get("tw_await_slip"):
+        context.user_data["tw_await_slip"] = False
+        try:
+            st["slip_bps"] = int(text)
+        except Exception:
+            update.message.reply_text("Send integer bps, e.g., 35"); return
+        update.message.reply_html(_tw_preview(st), reply_markup=_kb_confirm())
+
+# ==== END TRADE WIZARD ========================================================
+
 # ---------- Main ----------
 def main():
     token = os.environ.get("TELEGRAM_BOT_TOKEN") or getattr(C, "TELEGRAM_BOT_TOKEN", None)
@@ -668,6 +882,11 @@ def main():
     dp.add_handler(CommandHandler("dryrun", cmd_dryrun))
     dp.add_handler(CommandHandler("cooldowns", cmd_cooldowns, pass_args=True))
 
+    # NEW: trade wizard (does not affect existing commands)
+    dp.add_handler(CommandHandler("trade", cmd_trade))
+    dp.add_handler(CallbackQueryHandler(cb_trade, pattern=r"^tw\|"))
+    dp.add_handler(MessageHandler(Filters.text & ~Filters.command, msg_text_trade), group=1)
+
     # Callbacks & diagnostics
     dp.add_handler(CallbackQueryHandler(on_exec_button, pattern=r"^exec:[A-Za-z0-9_\-]+$"))
     dp.add_handler(CallbackQueryHandler(on_exec_confirm, pattern=r"^exec_go:[A-Za-z0-9_\-]+$"))
@@ -675,8 +894,8 @@ def main():
     dp.add_error_handler(_log_error)
     dp.add_handler(MessageHandler(Filters.all, _log_update), group=-1)
 
-    log.info("Handlers registered: /start /help /version /sanity /assets /prices /balances /slippage /ping /plan /dryrun /cooldowns")
-    up.start_polling(clean=True)  # ok for ptb 13.x
+    log.info("Handlers registered: /start /help /version /sanity /assets /prices /balances /slippage /ping /plan /dryrun /cooldowns /trade")
+    up.start_polling(clean=True)
     log.info("Telegram bot started")
     up.idle()
 
