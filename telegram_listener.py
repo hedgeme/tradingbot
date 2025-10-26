@@ -1,24 +1,15 @@
 #!/usr/bin/env python3
 # TECBot Telegram Listener
+# - Preserves stable table formats for /prices /balances /slippage
+# - Adds /trade (full end-to-end trade wizard with execution)
+# - Adds /withdraw (send funds to treasury wallet)
+# - Leaves /plan and /dryrun handlers in place for internal use
 #
-# - Keeps your original formatting for prices/balances/slippage.
-# - Adds /trade (one-pass trade wizard with execute).
-# - Adds /withdraw (move funds to treasury).
+# NOTE: You MUST wire the placeholder tx helpers at the bottom:
+#   _tw_quote_swap, _tw_send_swap, _tw_send_approval, _wd_send_transfer
 #
-# IMPORTANT:
-#   - /plan and /dryrun handlers are still present so we don't break anything,
-#     but you will remove them from BotFather's /setcommands so they don't show.
-#
-#   - You MUST wire the TODOs for:
-#       _get_wallet_balance_for_token(...)
-#       _quote_swap_for_review(...)
-#       _send_approval_tx(...)
-#       _execute_swap_now(...)
-#       _send_withdraw_tx(...)
-#
-#   Those should use your existing modules (runner, trade_executor, balances, prices, etc.).
-#
-#   - We assume Harmony gas is paid in ONE. Adjust _format_gas_cost if needed.
+# SECURITY:
+# - execute trade and withdraw require admin check (is_admin)
 
 import os, sys, logging, subprocess, shlex
 from datetime import datetime, timezone
@@ -30,15 +21,14 @@ from telegram.ext import (
     Updater, CommandHandler, CallbackQueryHandler, MessageHandler, Filters, CallbackContext
 )
 
-# ---------- Logging ----------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
 log = logging.getLogger("telegram_listener")
 
-# Ensure /bot imports work (root and app.* both supported)
+# ensure /bot on path
 if "/bot" not in sys.path:
     sys.path.insert(0, "/bot")
 
-# ---------- Tolerant imports ----------
+# tolerant imports
 try:
     from app import config as C
     log.info("Loaded config from app.config")
@@ -89,20 +79,17 @@ except Exception:
         log.warning("runner module not available: %s", e)
         runner = None
 
-# For route discovery
-try:
-    from app import route_finder as RF
-except Exception:
-    import route_finder as RF  # type: ignore
+# coinbase spot helper for /prices
+def _coinbase_eth() -> Optional[Decimal]:
+    try:
+        import coinbase_client  # must expose fetch_eth_usd_price()
+        val = coinbase_client.fetch_eth_usd_price()
+        return Decimal(str(val)) if val is not None else None
+    except Exception:
+        return None
 
-# ---------- Constants ----------
-TREASURY_ADDRESS = "0x360c48a44f513b5781854588d2f1A40E90093c60"
+# ---------- core utils ----------
 
-SUPPORTED_TOKENS_UI = ["ONE", "1USDC", "1sDAI", "TEC", "1ETH", "WONE"]  # WONE included for clarity
-FORCE_VIA_OPTIONS = ["WONE", "1sDAI"]  # Advanced path hints
-DEFAULT_SLIP_CHOICES_BPS = [10, 20, 30, 50]  # we will display both bps and %
-
-# ---------- Utilities ----------
 def now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
@@ -114,20 +101,15 @@ def is_admin(user_id: int) -> bool:
 
 def _git_short_rev() -> Optional[str]:
     try:
-        out = subprocess.check_output(shlex.split("git rev-parse --short HEAD"), cwd="/bot", stderr=subprocess.DEVNULL)
+        out = subprocess.check_output(
+            shlex.split("git rev-parse --short HEAD"),
+            cwd="/bot",
+            stderr=subprocess.DEVNULL,
+        )
         return out.decode().strip()
     except Exception:
         return None
 
-def _coinbase_eth() -> Optional[Decimal]:
-    try:
-        import coinbase_client
-        val = coinbase_client.fetch_eth_usd_price()
-        return Decimal(str(val)) if val is not None else None
-    except Exception:
-        return None
-
-# Money formatting for USD
 def _fmt_money(x: Optional[Decimal]) -> str:
     if x is None:
         return "—"
@@ -138,7 +120,6 @@ def _fmt_money(x: Optional[Decimal]) -> str:
         return f"${x:,.5f}".rstrip("0").rstrip(".") if "." in f"{x:.5f}" else f"${x:.5f}"
     return f"${x:,.5f}"
 
-# Amount formatting for balances (per symbol rule)
 def _fmt_amt(sym: str, val) -> str:
     try:
         d = Decimal(str(val))
@@ -149,21 +130,6 @@ def _fmt_amt(sym: str, val) -> str:
         return f"{d.quantize(q, rounding=ROUND_DOWN):f}"
     q = Decimal("0.01")
     return f"{d.quantize(q, rounding=ROUND_DOWN):.2f}"
-
-def _resolve_one_value(row: Dict[str, Decimal]) -> Decimal:
-    _ONE_KEY_ORDER = [
-        "ONE(native)", "ONE (native)", "ONE_NATIVE", "NATIVE_ONE", "NATIVE",
-        "ONE", "WONE"
-    ]
-    lower = {k.lower(): k for k in row.keys()}
-    for key in _ONE_KEY_ORDER:
-        k = lower.get(key.lower())
-        if k is not None:
-            try:
-                return Decimal(str(row[k]))
-            except Exception:
-                pass
-    return Decimal("0")
 
 def _log_update(update: Update, context: CallbackContext):
     try:
@@ -176,36 +142,8 @@ def _log_update(update: Update, context: CallbackContext):
 def _log_error(update: object, context: CallbackContext):
     log.exception("Handler error")
 
-# ---------- Gas formatting helper ----------
-def _format_gas_cost(gas_units: int,
-                     gas_price_wei: int,
-                     native_symbol: str = "ONE") -> Tuple[str, str]:
-    """
-    Returns (gas_line, cost_line)
-    - gas_line like '210,843 gas'
-    - cost_line like '0.00421 ONE (~4,210 gwei)'
-    You MUST adapt gas_price_wei, 1 ONE = 1e18 wei assumption etc.
-    TODO: plug correct chain math (Harmony uses 1 ONE = 1e18 "atto"), etc.
-    """
-    try:
-        gas_units_int = int(gas_units)
-        gas_price_wei_int = int(gas_price_wei)
-        total_wei = gas_units_int * gas_price_wei_int
+# ---------- render helpers for /plan and /dryrun (kept as-is) ----------
 
-        # naive conversions:
-        # gwei = 1e9 wei
-        total_gwei = Decimal(total_wei) / Decimal(10**9)
-
-        # assume 1 ONE = 1e18 wei
-        total_one = Decimal(total_wei) / Decimal(10**18)
-
-        gas_line = f"{gas_units_int:,} gas"
-        cost_line = f"{total_one:.6f} {native_symbol}  (~{total_gwei:,.0f} gwei)"
-        return gas_line, cost_line
-    except Exception:
-        return (f"{gas_units} gas", f"(gas calc unavailable)")
-
-# ---------- Planner/Dryrun Renders (unchanged) ----------
 def render_plan(actions_by_bot) -> str:
     if not actions_by_bot or not any(actions_by_bot.values()):
         return f"Plan (preview @ {now_iso()})\nNo actions proposed."
@@ -263,12 +201,14 @@ def render_dryrun(results):
         )
     return "\n".join(lines).strip()
 
-# ---------- Core command handlers (unchanged) ----------
+# ---------- core commands (unchanged behavior / formatting) ----------
+
 def cmd_start(update: Update, context: CallbackContext):
     update.message.reply_text(
         "TECBot online.\n"
         "Try: /help\n"
-        "Core: /trade /withdraw /cooldowns /ping\n"
+        "Core: /trade /cooldowns /ping\n"
+        "Funds: /withdraw\n"
         "On-chain: /prices [SYMS…] /balances /slippage <IN> [AMOUNT] [OUT]\n"
         "Meta: /version /sanity /assets"
     )
@@ -277,16 +217,16 @@ def cmd_help(update: Update, context: CallbackContext):
     update.message.reply_text(
         "Commands:\n"
         "  /ping — health check\n"
-        "  /trade — manual trade wizard (one flow w/ execute)\n"
-        "  /withdraw — withdraw to treasury wallet\n"
+        "  /trade — manual trade wizard (wallet, route, amount, slippage, execute)\n"
+        "  /withdraw — withdraw funds to treasury wallet\n"
         "  /cooldowns [bot|route] — show cooldowns\n"
         "  /prices [SYMS…] — on-chain quotes in USDC\n"
-        "  /balances — per-wallet balances\n"
-        "  /slippage <IN> [AMOUNT] [OUT] — impact curve\n"
+        "  /balances — per-wallet balances (ERC-20 + ONE)\n"
+        "  /slippage <IN> [AMOUNT] [OUT] — live impact/minOut\n"
         "  /assets — configured tokens & wallets\n"
         "  /version — code version\n"
         "  /sanity — config/modules sanity\n"
-        # /plan and /dryrun intentionally NOT advertised
+        "  (/plan, /dryrun still exist internally but are not exposed)"
     )
 
 def cmd_version(update: Update, context: CallbackContext):
@@ -330,6 +270,22 @@ def cmd_assets(update: Update, context: CallbackContext):
         lines.append(f"{k:<12} {wallets[k]}")
     update.message.reply_text(f"<pre>\n{chr(10).join(lines)}\n</pre>", parse_mode=ParseMode.HTML)
 
+_ONE_KEY_ORDER = [
+    "ONE(native)", "ONE (native)", "ONE_NATIVE", "NATIVE_ONE", "NATIVE",
+    "ONE", "WONE"
+]
+
+def _resolve_one_value(row: Dict[str, Decimal]) -> Decimal:
+    lower = {k.lower(): k for k in row.keys()}
+    for key in _ONE_KEY_ORDER:
+        k = lower.get(key.lower())
+        if k is not None:
+            try:
+                return Decimal(str(row[k]))
+            except Exception:
+                pass
+    return Decimal("0")
+
 def cmd_balances(update: Update, context: CallbackContext):
     if BL is None:
         update.message.reply_text("Balances unavailable (module not loaded)."); return
@@ -352,13 +308,14 @@ def cmd_balances(update: Update, context: CallbackContext):
         vals: List[str] = []
         one_val = _resolve_one_value(row)
         vals.append(_fmt_amt("ONE", one_val))
-        for ccc in cols[1:]:
-            vals.append(_fmt_amt(ccc, row.get(ccc, 0)))
+        for c in cols[1:]:
+            vals.append(_fmt_amt(c, row.get(c, 0)))
         lines.append(f"{w_name:<{w_wallet}}  " + "  ".join(f"{v:>{w_amt}}" for v in vals))
 
     update.message.reply_text(f"<pre>\n{chr(10).join(lines)}\n</pre>", parse_mode=ParseMode.HTML)
 
-# ----- Internal helpers for /prices -----
+# ---------- ETH route helper for /prices (unchanged logic/format intent) ----------
+
 def _eth_best_side_and_route() -> (Optional[Decimal], str):
     if PR is None:
         return None, "fwd"
@@ -376,14 +333,11 @@ def _eth_best_side_and_route() -> (Optional[Decimal], str):
                      {"internalType":"uint256","name":"gasEstimate","type":"uint256"}],
           "stateMutability":"nonpayable","type":"function"}]
         q = ctx.w3.eth.contract(address=Web3.to_checksum_address(C.QUOTER_ADDR), abi=ABI)
-
         def addr(s): return Web3.to_checksum_address(PR._addr(s))
         def fee3(f): return int(f).to_bytes(3, "big")
 
         dec_e = PR._dec("1ETH")
         dec_u = PR._dec("1USDC")
-
-        # reverse tiny-probe: how much ETH we get for tiny USDC, then invert
         choices = []
         for usdc_in in (Decimal("25"), Decimal("50"), Decimal("100"), Decimal("250")):
             wei = int(usdc_in * (Decimal(10)**dec_u))
@@ -394,10 +348,8 @@ def _eth_best_side_and_route() -> (Optional[Decimal], str):
             eth_out = Decimal(out) / (Decimal(10)**dec_e)
             if eth_out > 0:
                 choices.append(usdc_in / eth_out)
-
         rev = min(choices) if choices else None
 
-        # forward: sell 1ETH for USDC
         wei_in = int(Decimal("1") * (Decimal(10)**dec_e))
         path_f = (Web3.to_bytes(hexstr=addr("1ETH")) + fee3(3000) +
                   Web3.to_bytes(hexstr=addr("WONE")) + fee3(3000) +
@@ -423,7 +375,6 @@ def cmd_prices(update: Update, context: CallbackContext):
         update.message.reply_text("Prices unavailable (module not loaded)."); return
 
     syms = ["ONE", "1USDC", "1sDAI", "TEC", "1ETH"]
-
     w_asset, w_lp, w_basis, w_slip, w_route = 6, 11, 12, 9, 27
 
     header = (
@@ -435,6 +386,8 @@ def cmd_prices(update: Update, context: CallbackContext):
 
     cb_eth = _coinbase_eth()
     lp_eth_pref, side = _eth_best_side_and_route()
+
+    eth_lp_val = None
 
     for s in syms:
         route_text = "—"
@@ -468,32 +421,31 @@ def cmd_prices(update: Update, context: CallbackContext):
         except Exception:
             price = None
 
+        if s == "1ETH":
+            try:
+                eth_lp_val = Decimal(str(price)) if price is not None else None
+            except Exception:
+                eth_lp_val = None
+
         lp_str = _fmt_money(price).rjust(w_lp)
         basis_str = f"{basis:.5f}".rjust(w_basis)
         slip_str = slip_txt.rjust(w_slip)
         lines.append(f"{s:<{w_asset}} | {lp_str} | {basis_str} | {slip_str} | {route_text:<{w_route}}")
 
-    # ETH LP vs Coinbase note
     lines += ["", "ETH: Harmony LP vs Coinbase"]
-    try:
-        eth_lp_display = next(
-            (Decimal(lines[i].split("|")[1].strip().replace("$","").replace(",",""))
-             for i in range(len(lines))
-             if lines[i].startswith("1ETH ")), None)
-    except Exception:
-        eth_lp_display = None
-    lines.append(f"  LP:       {_fmt_money(eth_lp_display)}")
+    lines.append(f"  LP:       {_fmt_money(eth_lp_val)}")
     lines.append(f"  Coinbase: {_fmt_money(cb_eth)}")
-    if eth_lp_display is not None and cb_eth not in (None, Decimal(0)):
+    if eth_lp_val is not None and cb_eth not in (None, Decimal(0)):
         try:
-            diff = (Decimal(eth_lp_display) - Decimal(cb_eth)) / Decimal(cb_eth) * Decimal(100)
+            diff = (Decimal(eth_lp_val) - Decimal(cb_eth)) / Decimal(cb_eth) * Decimal(100)
             lines.append(f"  Diff:     {diff:+.2f}%")
         except Exception:
             pass
 
     update.message.reply_text(f"<pre>\n{chr(10).join(lines)}\n</pre>", parse_mode=ParseMode.HTML)
 
-# ----- Slippage helpers -----
+# ---------- /slippage (unchanged table style) ----------
+
 def _mid_usdc_per_unit(token_in: str) -> Optional[Decimal]:
     if PR is None:
         return None
@@ -549,7 +501,6 @@ def cmd_slippage(update: Update, context: CallbackContext):
     token_out = args[2].upper() if len(args) >= 3 else "1USDC"
 
     w1, w2, w3, w4 = 12, 16, 12, 16
-
     mid = _mid_usdc_per_unit(token_in)
 
     targets = [Decimal("10"), Decimal("100"), Decimal("1000"), Decimal("10000")]
@@ -566,7 +517,14 @@ def cmd_slippage(update: Update, context: CallbackContext):
                 px_usd = PR.price_usd(token_in, est_in)
             eff = (px_usd / est_in) if (px_usd and est_in > 0) else None
             slip = ((eff - mid) / mid * Decimal("100")) if (eff and mid) else None
-            rows.append((f"{usdc:,.0f}", f"{est_in:.6f}", f"{eff:,.2f}" if eff else "—", f"{slip:+.2f}%" if slip is not None else "—"))
+            rows.append(
+                (
+                    f"{usdc:,.0f}",
+                    f"{est_in:.6f}",
+                    f"{eff:,.2f}" if eff else "—",
+                    f"{slip:+.2f}%" if slip is not None else "—",
+                )
+            )
         except Exception:
             rows.append((f"{usdc:,.0f}", "—", "—", "—"))
 
@@ -574,7 +532,7 @@ def cmd_slippage(update: Update, context: CallbackContext):
     line_hdr = f"{col1:>{w1}} | {col2:>{w2}} | {col3:>{w3}} | {col4:>{w4}}"
     line_sep = "-" * len(line_hdr)
     tbl = [line_hdr, line_sep]
-    for a,b,c,d in rows:
+    for a, b, c, d in rows:
         tbl.append(f"{a:>{w1}} | {b:>{w2}} | {('$'+c) if c!='—' else '—':>{w3}} | {d:>{w4}}")
 
     out = [f"Slippage curve: {token_in} → {token_out}"]
@@ -582,9 +540,30 @@ def cmd_slippage(update: Update, context: CallbackContext):
         out.append(f"Baseline (mid): ${mid:,.2f} per 1{token_in}")
     out.append("")
     out.extend(tbl)
-    update.message.reply_text(f"<pre>\n{chr(10).join(out)}\n</pre>", parse_mode=ParseMode.HTML)
+    update.message.reply_text(
+        f"<pre>\n{chr(10).join(out)}\n</pre>", parse_mode=ParseMode.HTML
+    )
 
-# ---------- cooldowns / ping ----------
+# ---------- cooldowns ----------
+
+def cmd_cooldowns(update: Update, context: CallbackContext):
+    defaults = getattr(C, "COOLDOWNS_DEFAULTS", {"price_refresh": 15, "trade_retry": 30, "alert_throttle": 60})
+    by_bot = getattr(C, "COOLDOWNS_BY_BOT", {})
+    by_route = getattr(C, "COOLDOWNS_BY_ROUTE", {})
+    args = context.args or []
+    if not args:
+        update.message.reply_text("Default cooldowns (seconds):\n  " + "\n  ".join(f"{k}: {v}" for k,v in defaults.items())); return
+    key = args[0]
+    if key in by_bot:
+        d = by_bot[key]; header = f"Cooldowns for {key} (seconds):"
+    elif key in by_route:
+        d = by_route[key]; header = f"Cooldowns for route {key} (seconds):"
+    else:
+        update.message.reply_text(f"No specific cooldowns for '{key}'. Showing defaults.\n  " + "\n  ".join(f"{k}: {v}" for k,v in defaults.items())); return
+    update.message.reply_text(header + "\n  " + "\n  ".join(f"{k}: {v}" for k,v in d.items()))
+
+# ---------- ping ----------
+
 def cmd_ping(update: Update, context: CallbackContext):
     ip_txt = "unknown"
     try:
@@ -595,33 +574,9 @@ def cmd_ping(update: Update, context: CallbackContext):
     ver = os.getenv("TECBOT_VERSION", getattr(C, "TECBOT_VERSION", "v0.1.0-ops"))
     update.message.reply_text(f"pong · IP: {ip_txt} · {ver}")
 
-def cmd_cooldowns(update: Update, context: CallbackContext):
-    defaults = getattr(C, "COOLDOWNS_DEFAULTS", {"price_refresh": 15, "trade_retry": 30, "alert_throttle": 60})
-    by_bot = getattr(C, "COOLDOWNS_BY_BOT", {})
-    by_route = getattr(C, "COOLDOWNS_BY_ROUTE", {})
-    args = context.args or []
-    if not args:
-        update.message.reply_text(
-            "Default cooldowns (seconds):\n  " +
-            "\n  ".join(f"{k}: {v}" for k,v in defaults.items())
-        )
-        return
-    key = args[0]
-    if key in by_bot:
-        d = by_bot[key]; header = f"Cooldowns for {key} (seconds):"
-    elif key in by_route:
-        d = by_route[key]; header = f"Cooldowns for route {key} (seconds):"
-    else:
-        update.message.reply_text(
-            f"No specific cooldowns for '{key}'. Showing defaults.\n  " +
-            "\n  ".join(f"{k}: {v}" for k,v in defaults.items())
-        )
-        return
-    update.message.reply_text(header + "\n  " + "\n  ".join(f"{k}: {v}" for k,v in d.items()))
+# ---------- plan/dryrun (kept for internal visibility, not in BotFather) ----------
 
-# ---------- (legacy) plan / dryrun ----------
 def cmd_plan(update: Update, context: CallbackContext):
-    # still callable manually but not advertised
     if planner is None or not hasattr(planner, "build_plan_snapshot"):
         update.message.reply_text("Plan error: planner module not available."); return
     try:
@@ -632,11 +587,10 @@ def cmd_plan(update: Update, context: CallbackContext):
     update.message.reply_text(render_plan(snap))
 
 def cmd_dryrun(update: Update, context: CallbackContext):
-    # still callable manually but not advertised
     if not getattr(C, "DRYRUN_ENABLED", True):
-        update.message.reply_text("Dry-run disabled."); return
+        update.message.reply_text("Dry-run is disabled."); return
     if runner is None or not all(hasattr(runner, n) for n in ("build_dryrun","execute_action")):
-        update.message.reply_text("Dry-run unavailable."); return
+        update.message.reply_text("Dry-run unavailable: runner hooks missing."); return
     try:
         results = runner.build_dryrun()
     except Exception as e:
@@ -652,27 +606,23 @@ def cmd_dryrun(update: Update, context: CallbackContext):
     update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb), parse_mode=ParseMode.HTML)
 
 def on_exec_button(update: Update, context: CallbackContext):
-    # legacy execute from /dryrun
     q = update.callback_query; data = q.data or ""
-    if not data.startswith("exec:"):
-        q.answer(); return
-    if not is_admin(q.from_user.id):
-        q.answer("Not authorized.", show_alert=True); return
+    if not data.startswith("exec:"): q.answer(); return
+    if not is_admin(q.from_user.id): q.answer("Not authorized.", show_alert=True); return
     aid = data.split(":",1)[1]
     q.edit_message_text(f"Confirm execution: Action #{aid}\nAre you sure?")
-    q.edit_message_reply_markup(InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Confirm", callback_data=f"exec_go:{aid}"),
-         InlineKeyboardButton("❌ Abort", callback_data="exec_cancel")]
-    ]))
+    q.edit_message_reply_markup(
+        InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Confirm", callback_data=f"exec_go:{aid}"),
+             InlineKeyboardButton("❌ Abort", callback_data="exec_cancel")]
+        ])
+    )
     q.answer()
 
 def on_exec_confirm(update: Update, context: CallbackContext):
-    # legacy execute, same warning applies
     q = update.callback_query; data = q.data or ""
-    if not data.startswith("exec_go:"):
-        q.answer(); return
-    if not is_admin(q.from_user.id):
-        q.answer("Not authorized.", show_alert=True); return
+    if not data.startswith("exec_go:"): q.answer(); return
+    if not is_admin(q.from_user.id): q.answer("Not authorized.", show_alert=True); return
     if runner is None or not hasattr(runner, "execute_action"):
         q.answer("Execution backend missing.", show_alert=True); return
     aid = data.split(":",1)[1]
@@ -696,278 +646,232 @@ def on_exec_cancel(update: Update, context: CallbackContext):
     q.answer()
 
 # ============================================================================
-# /trade wizard (single-pass trade builder, quote, execute)
+# /trade — full flow (wallet → from → to → route → amount → slippage → quote → exec)
 # ============================================================================
 
-# State per chat for /trade
-_TRADE: Dict[int, Dict[str, Any]] = {}
+# Per-chat wizard state for trading
+_TW: Dict[int, Dict[str, Any]] = {}
+
+TREASURY_ADDR = "0x360c48a44f513b5781854588d2f1A40E90093c60"  # also reused in /withdraw
 
 def _tw_state(chat_id: int) -> Dict[str, Any]:
-    st = _TRADE.get(chat_id)
+    st = _TW.get(chat_id)
     if not st:
         st = {
             "wallet": None,
             "from": None,
             "to": None,
             "force_via": None,
-            "route_tokens": None,  # e.g. ["1USDC","WONE","1ETH"]
-            "route_fees": None,    # e.g. [500,3000]
-            "amount": None,
-            "slip_bps": None,
-            "quote": None,         # filled later by _quote_swap_for_review
+            "route_tokens": None,   # ["1USDC","WONE","1ETH"]
+            "route_fees": None,     # [500,3000]
+            "amount": None,         # "1500.00"
+            "slip_bps": None,       # int
+            "pending_custom_amount": False,
+            "pending_custom_slip": False,
         }
-        _TRADE[chat_id] = st
+        _TW[chat_id] = st
     return st
 
-def _get_wallet_balance_for_token(wallet_key: str, sym: str) -> Optional[Decimal]:
-    """
-    Look up this wallet's balance for this token symbol.
-    We already have BL.all_balances() that returns {wallet:{token:amount,...}}.
-    We'll try to read from that. This should mirror /balances logic.
-    """
-    if BL is None:
-        return None
-    try:
-        table = BL.all_balances()
-        row = table.get(wallet_key, {})
-        if sym.upper() == "ONE":
-            return _resolve_one_value(row)
-        return Decimal(str(row.get(sym, "0")))
-    except Exception as e:
-        log.warning("balance lookup failed: %s", e)
-        return None
+def _tw_clear(chat_id: int):
+    if chat_id in _TW:
+        del _TW[chat_id]
 
-def _fee_bps_to_pct(fee_bps: int) -> str:
-    # 500 -> 0.05%, 3000 -> 0.30%, 10000 -> 1.00%
-    pct = Decimal(fee_bps) / Decimal(10000) * Decimal(100)  # convert bps-of-1 to %
-    # Wait: Uniswap fee tier 500 means 0.05% = 5/10000.
-    # 500/1e4 = 0.05, *100 = 5% (WRONG).
-    # Let's do direct mapping per Uniswap spec:
-    # 100 => 0.01%
-    # 500 => 0.05%
-    # 3000 => 0.30%
-    # 10000 => 1.00%
-    # We'll special-case known tiers.
-    if fee_bps == 100:
-        return "0.01%"
-    if fee_bps == 500:
-        return "0.05%"
-    if fee_bps == 3000:
-        return "0.30%"
-    if fee_bps == 10000:
-        return "1.00%"
-    # fallback generic:
-    # fee_bps basis points of 1.00%? We'll just show bps/100 with 2 decimals as %
-    pct_generic = (Decimal(fee_bps) / Decimal(10000)) * Decimal(100)
-    return f"{pct_generic:.2f}%"
-
-def _humanize_route(route_tokens: List[str], route_fees: List[int]) -> Tuple[str, str]:
-    """
-    route_tokens = ["1USDC","WONE","1ETH"]
-    route_fees   = [500,3000]
-
-    Returns:
-      readable_path:
-        '1USDC → WONE@0.05% → 1ETH@0.30%'
-      total_fee_text:
-        '~0.35% total pool fees'
-    """
-    if not route_tokens or not route_fees:
-        return ("Best route (auto)", "—")
-    hops = []
-    total_pct = Decimal("0")
-    for i in range(len(route_fees)):
-        token_next = route_tokens[i+1]
-        fee_raw = route_fees[i]
-        fee_pct_txt = _fee_bps_to_pct(fee_raw)
-        hops.append(f"{route_tokens[i]} → {token_next}@{fee_pct_txt}")
-        # we add fee_pct to total_pct numerically:
-        # convert known tiers numerically:
-        if fee_raw == 100:
-            total_pct += Decimal("0.01")
-        elif fee_raw == 500:
-            total_pct += Decimal("0.05")
-        elif fee_raw == 3000:
-            total_pct += Decimal("0.30")
-        elif fee_raw == 10000:
-            total_pct += Decimal("1.00")
-        else:
-            # fallback approx:
-            total_pct += (Decimal(fee_raw) / Decimal(10000)) * Decimal(100)
-    readable_path = " → ".join([route_tokens[0]] + [f"{route_tokens[i+1]}@{_fee_bps_to_pct(route_fees[i])}" for i in range(len(route_fees))])
-    total_fee_text = f"~{total_pct:.2f}% total pool fees"
-    return readable_path, total_fee_text
-
-def _quote_swap_for_review(st: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Build a full preview for the final confirmation screen:
-    - quote_out_human
-    - impact_bps
-    - min_out_human (after slippage)
-    - gas_units, gas_price_wei
-    - allowance_ok
-    - nonce
-    - tx_preview_text (router call)
-    TODO: wire this into your actual quoting logic.
-    """
-    # This is where you call your current dryrun path to get:
-    #   - expected output
-    #   - impact
-    #   - minOut using st["slip_bps"]
-    #   - gas estimate, gas price
-    #   - allowance status
-    #   - account nonce
-    #
-    # Below is placeholder structure you must replace with real calls.
-    dummy = {
-        "amount_in_human": f"{st.get('amount')} {st.get('from')}",
-        "quote_out_human": f"0.4321 {st.get('to')}",
-        "impact_bps": Decimal("11.00"),
-        "min_out_human": f"0.4308 {st.get('to')}",
-        "slip_bps": st.get("slip_bps", 30),
-        "gas_units": 210843,
-        "gas_price_wei": 20000000000,  # 20 gwei placeholder
-        "allowance_ok": True,
-        "needs_approval_amount_human": f"{st.get('amount')} {st.get('from')}",
-        "nonce": 57,
-        "tx_preview_text": (
-            "swapExactTokensForTokens(\n"
-            "  path=[USDC,WONE@0.05%,1ETH@0.30%],\n"
-            "  amountIn=1,500.00,\n"
-            "  amountOutMin=0.4308,\n"
-            "  deadline=now+120s\n"
-            ")"
-        ),
-    }
-    return dummy
-
-def _send_approval_tx(st: Dict[str, Any], amount_human: str) -> Dict[str, Any]:
-    """
-    Send ERC20 approve() for EXACT trade size, not unlimited.
-    Returns tx result dict {hash, gas_used, gas_price_wei,...}
-    TODO: hook into trade_executor / web3 signer.
-    """
-    # placeholder stub
-    return {
-        "tx_hash": "0xAPPROVEPLACEHOLDER",
-        "gas_used": 50000,
-        "gas_price_wei": 20000000000,
-    }
-
-def _execute_swap_now(st: Dict[str, Any], quote: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Actually submit the swap using st + quote info.
-    Returns tx result dict {hash, gas_used, gas_price_wei, filled_out_human}
-    TODO: hook into your real on-chain send.
-    """
-    return {
-        "tx_hash": "0xSWAPPLACEHOLDER",
-        "gas_used": 212004,
-        "gas_price_wei": 20000000000,
-        "filled_out_human": quote.get("quote_out_human", "?"),
-    }
-
-# --- Keyboards for /trade steps ---
-
-def _kb_trade_wallets() -> InlineKeyboardMarkup:
+def _kb_wallets() -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton("tecbot_usdc", callback_data="tw|w|tecbot_usdc"),
          InlineKeyboardButton("tecbot_sdai", callback_data="tw|w|tecbot_sdai")],
-        [InlineKeyboardButton("tecbot_eth",  callback_data="tw|w|tecbot_eth"),
-         InlineKeyboardButton("tecbot_tec",  callback_data="tw|w|tecbot_tec")],
+        [InlineKeyboardButton("tecbot_eth", callback_data="tw|w|tecbot_eth"),
+         InlineKeyboardButton("tecbot_tec", callback_data="tw|w|tecbot_tec")],
         [InlineKeyboardButton("Cancel", callback_data="tw|x")]
     ]
     return InlineKeyboardMarkup(rows)
 
-def _kb_trade_tokens(kind: str) -> InlineKeyboardMarkup:
-    syms = SUPPORTED_TOKENS_UI
-    rows, row = [], []
+def _wallet_balance_for(sym: str, wallet_name: str) -> Optional[Decimal]:
+    """
+    Pull a single wallet's balance for a symbol from BL (balances).
+    """
+    if BL is None:
+        return None
+    try:
+        table = BL.all_balances()  # { wallet_name: {sym: amt,...}, ... }
+    except Exception:
+        return None
+    row = table.get(wallet_name, {})
+    # handle ONE specially like balances does
+    if sym.upper() in ["ONE", "WONE"]:
+        return _resolve_one_value(row)
+    val = row.get(sym, None)
+    if val is None:
+        # try strict/upper
+        for k, v in row.items():
+            if k.upper() == sym.upper():
+                val = v
+                break
+    try:
+        return Decimal(str(val)) if val is not None else None
+    except Exception:
+        return None
+
+def _kb_tokens(kind: str) -> InlineKeyboardMarkup:
+    # Show supported tokens
+    syms = list(getattr(C, "TOKENS", {}).keys()) or ["ONE","1USDC","1sDAI","TEC","1ETH","WONE"]
+    syms = [s.upper() for s in syms]
+    # De-dupe + deterministic
+    seen = []
     for s in syms:
+        if s not in seen:
+            seen.append(s)
+    buttons: List[List[InlineKeyboardButton]] = []
+    row: List[InlineKeyboardButton] = []
+    for s in seen:
         row.append(InlineKeyboardButton(s, callback_data=f"tw|{kind}|{s}"))
         if len(row) == 3:
-            rows.append(row); row=[]
-    if row: rows.append(row)
-    rows.append([InlineKeyboardButton("Back", callback_data="tw|back"),
-                 InlineKeyboardButton("Cancel", callback_data="tw|x")])
-    return InlineKeyboardMarkup(rows)
+            buttons.append(row); row=[]
+    if row:
+        buttons.append(row)
+    buttons.append([InlineKeyboardButton("Back", callback_data="tw|back"),
+                    InlineKeyboardButton("Cancel", callback_data="tw|x")])
+    return InlineKeyboardMarkup(buttons)
 
-def _build_route_candidates(st: Dict[str, Any]) -> List[Dict[str, Any]]:
+def _humanize_route_list(from_sym: str, to_sym: str, force_via: Optional[str], ref_size: Decimal) -> List[Tuple[str, Dict[str,str], List[str], List[int]]]:
     """
-    Use route_finder to produce a few candidate paths. Optionally apply force_via.
-    We return a list like:
-      [{"tokens":["1USDC","WONE","1ETH"],
-        "fees":[500,3000],
-        "label_multiline":"1USDC → WONE@0.05% → 1ETH@0.30%\nImpact ~11 bps\nFees ~0.35% total\nEstOut ~0.4321 1ETH"}
-      , ...]
-    NOTE: Impact/EstOut in this menu can be rough/placeholder. We'll show real data in final quote.
+    Build candidate route list (for UI).
+    Returns list of tuples:
+      (label_id, human_info, route_tokens, route_fees)
+
+    human_info contains:
+      "display" (tokens with fee %)
+      "fee_total_pct"
+      "impact_bps" (string or '—')
+      "est_out" (string or '—')
     """
-    token_in = st.get("from")
-    token_out = st.get("to")
-    force_via = st.get("force_via")
+    # lazy import the finder so we don't explode if it's not present
+    try:
+        from app import route_finder as RF
+    except Exception:
+        import route_finder as RF  # type: ignore
 
-    cands_raw = RF.candidates(token_in, token_out, force_via=force_via, max_hops=2, max_routes=3)
-    out: List[Dict[str, Any]] = []
+    raw_paths = RF.candidates(from_sym, to_sym, force_via=force_via, max_hops=2, max_routes=3)
+    out: List[Tuple[str, Dict[str,str], List[str], List[int]]] = []
 
-    # transform each raw path with fees -> tokens[], fees[]
-    # raw like ["1USDC","WONE@500","1ETH@3000"]
-    for raw in cands_raw:
-        tokens_clean: List[str] = []
-        fees_clean: List[int] = []
-        # parse "WONE@500"
-        first_tok = raw[0]
-        tokens_clean.append(first_tok)
-        for hop in raw[1:]:
-            nxt, fee_txt = hop.split("@")
-            tokens_clean.append(nxt)
-            fees_clean.append(int(fee_txt))
-        readable_path, fee_text = _humanize_route(tokens_clean, fees_clean)
-        label = (
-            f"{readable_path}\n"
-            f"{fee_text}\n"
-            f"(Preview size not final)"
-        )
-        out.append({
-            "tokens": tokens_clean,
-            "fees": fees_clean,
-            "label": label,
-        })
+    idx = 1
+    for lp in raw_paths:
+        # lp like ["1USDC","WONE@500","1ETH@3000"]
+        # extract clean tokens + fee ints
+        tokens_only: List[str] = []
+        fees_only: List[int] = []
+
+        prev = None
+        for hop in lp:
+            if "@" in hop:
+                sym, raw = hop.split("@",1)
+                tokens_only.append(sym)
+                try: fees_only.append(int(raw))
+                except: fees_only.append(3000)  # fallback
+            else:
+                tokens_only.append(hop)
+            prev = hop
+
+        # fix first token duplication: tokens_only currently repeats first token at index0 and again later logic, so ensure:
+        # e.g. lp: ["1USDC","WONE@500","1ETH@3000"]
+        # tokens_only result was ["1USDC","WONE","1ETH"]
+        # fees_only        was [500,3000] good.
+
+        # Build human readable
+        human_core = RF.humanize_path(lp)
+        display_path = human_core["display"]              # "1USDC → WONE@0.05% → 1ETH@0.30%"
+        fee_total_pct = human_core["fee_total_pct"]       # "~0.35%"
+
+        # we *could* pre-quote each route for a small reference amount:
+        est_out_str = "—"
+        impact_bps_str = "—"
+        try:
+            qd = _tw_quote_swap(
+                wallet_key=None,  # just need quoting, no wallet checks
+                token_in=from_sym,
+                token_out=to_sym,
+                route_tokens=tokens_only,
+                route_fees=fees_only,
+                amount_in=ref_size,
+                slip_bps=None,
+                check_allowance=False,
+            )
+            # qd should have "quote_out_human", "impact_bps"
+            est_out_str = qd.get("quote_out_human","—")
+            ibps = qd.get("impact_bps", None)
+            if ibps is not None:
+                impact_bps_str = f"{ibps:.2f} bps"
+        except Exception:
+            pass
+
+        human_info = {
+            "display": display_path,
+            "fee_total_pct": fee_total_pct,
+            "est_out": est_out_str,
+            "impact_bps": impact_bps_str,
+        }
+        out.append((str(idx), human_info, tokens_only, fees_only))
+        idx += 1
+
     return out
 
-def _kb_trade_routes(st: Dict[str, Any]) -> InlineKeyboardMarkup:
-    buttons: List[List[InlineKeyboardButton]] = []
-    cands = _build_route_candidates(st)
-
-    if cands:
-        # show each route as its own button
-        for i, ccc in enumerate(cands, start=1):
-            buttons.append([
-                InlineKeyboardButton(
-                    f"Use route {i}",
-                    callback_data=f"tw|route|{i}"
-                )
-            ])
+def _kb_routes_ui(from_sym: str, to_sym: str, force_via: Optional[str]) -> Tuple[str, InlineKeyboardMarkup, List[Tuple[str,Dict[str,str],List[str],List[int]]]]:
+    """
+    Build the route selection text and keyboard.
+    Returns (header_text, keyboard, candidates_info_list)
+    The callback_data will be "tw|route|<idx>"
+    """
+    header = f"Route for {from_sym} → {to_sym}\n"
+    if force_via:
+        header += f"Forced via {force_via}\n"
     else:
-        buttons.append([
-            InlineKeyboardButton("No direct pool — routing via intermediates", callback_data="tw|noop")
-        ])
+        header += "No direct pool — using intermediates if needed\n\n"
 
-    # advanced path picks
-    buttons.append([
+    # Build candidates and stash them so we can map idx -> path on click
+    ref_amt = Decimal("100")  # small reference amount for preview impact
+    cand_list = _humanize_route_list(from_sym, to_sym, force_via, ref_amt)
+
+    lines = []
+    kbs: List[List[InlineKeyboardButton]] = []
+
+    if not cand_list:
+        lines.append("No viable routes found.")
+    else:
+        for (idx, info, _rtoks, _rfees) in cand_list:
+            # show each route like:
+            # 1) 1USDC → WONE@0.05% → 1ETH@0.30%
+            #    Impact ~11 bps | Fees ~0.35% | EstOut ~0.4321 1ETH
+            l1 = f"{idx}) {info['display']}"
+            l2 = (
+                f"   Impact {info['impact_bps']} | "
+                f"Fees {info['fee_total_pct']} | "
+                f"EstOut {info['est_out']}"
+            )
+            lines.append(l1)
+            lines.append(l2)
+            kbs.append([InlineKeyboardButton(f"Use route {idx}", callback_data=f"tw|route|{idx}")])
+
+    # force via WONE / 1sDAI
+    kbs.append([
         InlineKeyboardButton("Force via WONE", callback_data="tw|force|WONE"),
         InlineKeyboardButton("Force via 1sDAI", callback_data="tw|force|1sDAI"),
     ])
-    # auto/best
-    buttons.append([
-        InlineKeyboardButton("Auto (best)", callback_data="tw|route|AUTO")
+    kbs.append([
+        InlineKeyboardButton("Auto (best)", callback_data="tw|route|AUTO"),
     ])
-
-    buttons.append([
+    kbs.append([
         InlineKeyboardButton("Back", callback_data="tw|back"),
-        InlineKeyboardButton("Cancel", callback_data="tw|x")
+        InlineKeyboardButton("Cancel", callback_data="tw|x"),
     ])
-    return InlineKeyboardMarkup(buttons)
 
-def _kb_trade_amount(st: Dict[str, Any]) -> InlineKeyboardMarkup:
+    text_block = header + "\n".join(lines)
+    return text_block, InlineKeyboardMarkup(kbs), cand_list
+
+def _kb_amount_ui(avail: Optional[Decimal], sym: str) -> Tuple[str, InlineKeyboardMarkup]:
+    amt_line = ""
+    if avail is not None:
+        amt_line = f"Available: { _fmt_amt(sym, avail) } {sym}\n"
+    intro = f"Amount to spend (in {sym})\n{amt_line}"
     rows = [
         [InlineKeyboardButton("100", callback_data="tw|amt|100"),
          InlineKeyboardButton("250", callback_data="tw|amt|250"),
@@ -979,119 +883,887 @@ def _kb_trade_amount(st: Dict[str, Any]) -> InlineKeyboardMarkup:
          InlineKeyboardButton("Back", callback_data="tw|back"),
          InlineKeyboardButton("Cancel", callback_data="tw|x")],
     ]
-    return InlineKeyboardMarkup(rows)
+    return intro, InlineKeyboardMarkup(rows)
 
-def _kb_trade_slip() -> InlineKeyboardMarkup:
-    rows: List[List[InlineKeyboardButton]] = []
-    for bps in DEFAULT_SLIP_CHOICES_BPS:
-        pct = Decimal(bps) / Decimal(100)  # 30 bps -> 0.30%
-        rows.append([
-            InlineKeyboardButton(f"{bps} bps ({pct:.2f}%)", callback_data=f"tw|slip|{bps}")
-        ])
-    rows.append([
-        InlineKeyboardButton("Custom…", callback_data="tw|slip|CUSTOM"),
-        InlineKeyboardButton("Back", callback_data="tw|back"),
-        InlineKeyboardButton("Cancel", callback_data="tw|x")
-    ])
-    return InlineKeyboardMarkup(rows)
+def _kb_slip_ui() -> Tuple[str, InlineKeyboardMarkup]:
+    intro = (
+        "Price protection (max slippage)\n\n"
+        "This is the MOST you're willing to lose to price movement\n"
+        "between quote and execution.\n\n"
+        "Example:\n"
+        "30 bps = 0.30%\n"
+    )
+    rows = [
+        [InlineKeyboardButton("10 bps (0.10%)", callback_data="tw|slip|10")],
+        [InlineKeyboardButton("20 bps (0.20%)", callback_data="tw|slip|20")],
+        [InlineKeyboardButton("30 bps (0.30%)", callback_data="tw|slip|30")],
+        [InlineKeyboardButton("50 bps (0.50%)", callback_data="tw|slip|50")],
+        [InlineKeyboardButton("Custom…", callback_data="tw|slip|CUSTOM"),
+         InlineKeyboardButton("Back", callback_data="tw|back"),
+         InlineKeyboardButton("Cancel", callback_data="tw|x")],
+    ]
+    return intro, InlineKeyboardMarkup(rows)
 
-def _kb_trade_confirm(allowance_ok: bool, price_ok: bool) -> InlineKeyboardMarkup:
-    if not price_ok:
-        # price already breached slippage cap
-        return InlineKeyboardMarkup([
-            [InlineKeyboardButton("Change Slippage", callback_data="tw|edit_slip")],
-            [InlineKeyboardButton("Cancel", callback_data="tw|x")]
+def _quote_confirmation_block(st: Dict[str,Any], qd: Dict[str,Any]) -> Tuple[str, InlineKeyboardMarkup]:
+    """
+    Build the review card and appropriate buttons based on allowance/slippage.
+    qd is dict from _tw_quote_swap().
+    """
+    # qd must carry:
+    # 'path_human'            (string: "1USDC → WONE@0.05% → 1ETH@0.30%")
+    # 'amount_in_human'       ("1,500.00 1USDC")
+    # 'quote_out_human'       ("0.4321 1ETH")
+    # 'impact_bps'            (Decimal or float)
+    # 'fee_total_pct'         ("~0.35%")
+    # 'slip_text'             ("0.30% max → minOut 0.4308 1ETH")
+    # 'gas_units'             (int)
+    # 'gas_cost_one'          ("0.00421 ONE")
+    # 'gas_cost_gwei_total'   ("~4,210 gwei")
+    # 'allowance_ok'          (bool)
+    # 'need_approval_amount'  ("1,500.00 1USDC") if not ok
+    # 'nonce'                 (int)
+    # 'slippage_ok'           (bool)
+    # 'price_limit_text'      ("⚠ price already moved ..." or "")
+    path_human = qd.get("path_human","?")
+    amount_in_human = qd.get("amount_in_human","?")
+    quote_out_human = qd.get("quote_out_human","?")
+    imp_bps = qd.get("impact_bps", None)
+    fee_total_pct = qd.get("fee_total_pct","?")
+    slip_text = qd.get("slip_text","?")
+    gas_units = qd.get("gas_units","?")
+    gas_cost_one = qd.get("gas_cost_one","?")
+    gas_cost_gwei_total = qd.get("gas_cost_gwei_total","?")
+    nonce = qd.get("nonce","?")
+    allowance_ok = qd.get("allowance_ok", False)
+    need_approval_amount = qd.get("need_approval_amount","?")
+    slippage_ok = qd.get("slippage_ok", True)
+    price_limit_text = qd.get("price_limit_text","")
+
+    lines = [
+        f"Review Trade — {st.get('wallet','?')}",
+        f"Path     : {path_human}",
+        f"AmountIn : {amount_in_human}",
+        f"QuoteOut : {quote_out_human}",
+        f"Impact   : {imp_bps:.2f} bps" if imp_bps is not None else "Impact   : —",
+        f"Fees     : {fee_total_pct} total pool fees",
+        f"Slippage : {slip_text}",
+        f"Gas Est  : {gas_units} gas",
+        f"Cost     : {gas_cost_one}  ({gas_cost_gwei_total})",
+        f"Nonce    : {nonce}",
+    ]
+
+    if not allowance_ok:
+        lines.append("Allowance: NOT APPROVED")
+        lines.append(f"Required : approve {need_approval_amount}")
+    else:
+        lines.append("Allowance: OK")
+
+    if price_limit_text:
+        lines.append(price_limit_text)
+
+    text_block = "<pre>\n" + "\n".join(lines) + "\n</pre>"
+
+    # Buttons:
+    kb_rows: List[List[InlineKeyboardButton]] = []
+    if not allowance_ok:
+        # first do approval only
+        kb_rows.append([
+            InlineKeyboardButton("Approve spend first", callback_data="tw|approve|go"),
+            InlineKeyboardButton("❌ Cancel", callback_data="tw|x"),
         ])
-    if allowance_ok:
-        return InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ Execute Trade", callback_data="tw|exec_go")],
-            [InlineKeyboardButton("◀ Back", callback_data="tw|back"),
-             InlineKeyboardButton("❌ Cancel", callback_data="tw|x")]
+    elif not slippage_ok:
+        kb_rows.append([
+            InlineKeyboardButton("Change Slippage", callback_data="tw|back"),
+            InlineKeyboardButton("❌ Cancel", callback_data="tw|x"),
         ])
     else:
-        return InlineKeyboardMarkup([
-            [InlineKeyboardButton("Approve spend first", callback_data="tw|approve")],
-            [InlineKeyboardButton("❌ Cancel", callback_data="tw|x")]
+        kb_rows.append([
+            InlineKeyboardButton("✅ Execute Trade", callback_data="tw|exec|go"),
+        ])
+        kb_rows.append([
+            InlineKeyboardButton("◀ Back", callback_data="tw|back"),
+            InlineKeyboardButton("❌ Cancel", callback_data="tw|x"),
         ])
 
-def _kb_trade_after_exec() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("Close", callback_data="tw|x")]
-    ])
+    return text_block, InlineKeyboardMarkup(kb_rows)
 
 def cmd_trade(update: Update, context: CallbackContext):
     chat_id = update.effective_chat.id
     _tw_state(chat_id)  # init/reset state
-    update.message.reply_text("Trade: choose a wallet", reply_markup=_kb_trade_wallets())
+    update.message.reply_text("Trade: choose a wallet", reply_markup=_kb_wallets())
 
-def _render_trade_amount_prompt(st: Dict[str, Any]) -> str:
-    bal = _get_wallet_balance_for_token(st["wallet"], st["from"])
-    bal_line = ""
-    if bal is not None:
-        bal_line = f"Available in {st['wallet']}: {bal} {st['from']}"
-    return (
-        f"Amount to spend (in {st['from']})\n"
-        f"{bal_line}"
-    )
+def cb_trade(update: Update, context: CallbackContext):
+    q = update.callback_query
+    if not q or not q.data:
+        return
+    chat_id = q.message.chat_id
+    st = _tw_state(chat_id)
 
-def _slippage_explainer() -> str:
-    return (
-        "Price protection (max slippage)\n\n"
-        "This is the MOST you're willing\n"
-        "to lose to price movement between\n"
-        "quote and execution.\n\n"
-        "Example:\n"
-        "30 bps = 0.30%"
-    )
-
-def _render_trade_quote(st: Dict[str, Any]) -> Tuple[str, InlineKeyboardMarkup]:
-    """
-    Build final confirmation message after we have
-    wallet/from/to/route/amount/slip_bps.
-    """
-    quote = _quote_swap_for_review(st)
-    st["quote"] = quote
-
-    # path formatting
-    if st["route_tokens"] and st["route_fees"]:
-        readable_path, total_fee_text = _humanize_route(st["route_tokens"], st["route_fees"])
-    else:
-        readable_path = "Best route (auto)"
-        total_fee_text = "—"
-
-    # gas
-    gas_line, cost_line = _format_gas_cost(
-        quote.get("gas_units", 0),
-        quote.get("gas_price_wei", 0),
-        native_symbol="ONE"
-    )
-
-    # slippage
-    bps = quote.get("slip_bps", st.get("slip_bps"))
-    pct_str = f"{Decimal(bps)/Decimal(100):.2f}%" if bps is not None else "?"
-    slip_line = f"{pct_str} max → minOut {quote.get('min_out_human','?')}"
-
-    impact_line = f"{quote.get('impact_bps','?')} bps (price move at this size)"
-
-    # allowance / price_ok
-    allowance_ok = bool(quote.get("allowance_ok", False))
-    # price_ok is check if impact <= slip_bps (max). If we don't have both, assume True.
     try:
-        impact_val = Decimal(str(quote.get("impact_bps","0")))
-        slip_val = Decimal(str(bps))
-        price_ok = (impact_val <= slip_val)
+        _, op, *rest = q.data.split("|")
     except Exception:
-        price_ok = True
+        q.answer("Invalid"); return
 
-    body_lines = [
-        f"<pre>Review Trade — {st.get('wallet','?')}",
-        f"Path     : {readable_path}",
-        f"AmountIn : {quote.get('amount_in_human','?')}",
-        f"QuoteOut : {quote.get('quote_out_human','?')}",
-        f"Impact   : {impact_line}",
-        f"Fees     : {total_fee_text}",
-        f"Slippage : {slip_line}",
-        f"Gas Est  : {gas_line}",
-        f"Cost     : {cost_line}",
-        "Allowance: " + ("OK" if allowance_ok else "NOT APPROVED"),
-        f"Nonce    : {quote.get('nonce','?')}",
+    # cancel
+    if op == "x":
+        _tw_clear(chat_id)
+        q.edit_message_text("Canceled. No transaction sent.")
+        return
+
+    # wallet select
+    if op == "w":
+        st["wallet"] = rest[0]
+        # next: pick FROM asset
+        bal_line = f"From asset (what you are spending)\nWallet: {st['wallet']}"
+        q.edit_message_text(bal_line, reply_markup=_kb_tokens("from"))
+        return
+
+    # FROM asset
+    if op == "from":
+        st["from"] = rest[0]
+        st["to"] = None
+        st["route_tokens"] = None
+        st["route_fees"] = None
+        st["force_via"] = None
+        q.edit_message_text(
+            "To asset (what you want to receive)\n"
+            "Note: we'll route through other tokens if no direct pool.",
+            reply_markup=_kb_tokens("to"),
+        )
+        return
+
+    # TO asset
+    if op == "to":
+        st["to"] = rest[0]
+        # route selection screen
+        header, kb, cand_list = _kb_routes_ui(st["from"], st["to"], st["force_via"])
+        # stash candidate list so we can resolve 'Use route N'
+        st["cand_list"] = cand_list
+        q.edit_message_text(header, reply_markup=kb)
+        return
+
+    # force route via WONE / 1sDAI
+    if op == "force":
+        choice = rest[0]
+        st["force_via"] = choice
+        header, kb, cand_list = _kb_routes_ui(st["from"], st["to"], st["force_via"])
+        st["cand_list"] = cand_list
+        q.edit_message_text(header, reply_markup=kb)
+        return
+
+    # route pick
+    if op == "route":
+        sel = rest[0]
+        if sel == "AUTO":
+            # If AUTO, pick first candidate if available
+            cand_list = st.get("cand_list", [])
+            if cand_list:
+                _id, _info, rtoks, rfees = cand_list[0]
+                st["route_tokens"] = rtoks
+                st["route_fees"] = rfees
+            else:
+                st["route_tokens"] = None
+                st["route_fees"] = None
+        else:
+            # find by idx
+            cand_list = st.get("cand_list", [])
+            match = [c for c in cand_list if c[0] == sel]
+            if match:
+                _id, _info, rtoks, rfees = match[0]
+                st["route_tokens"] = rtoks
+                st["route_fees"] = rfees
+
+        # move to AMOUNT
+        avail = _wallet_balance_for(st["from"], st["wallet"])
+        intro, kb_amt = _kb_amount_ui(avail, st["from"])
+        q.edit_message_text(intro, reply_markup=kb_amt)
+        return
+
+    # amount pick
+    if op == "amt":
+        sel = rest[0]
+        if sel == "CUSTOM":
+            st["pending_custom_amount"] = True
+            q.answer("Send a number like 1500 or 1500.25")
+            return
+        if sel == "ALL":
+            avail = _wallet_balance_for(st["from"], st["wallet"])
+            st["amount"] = str(avail) if avail is not None else "0"
+        else:
+            st["amount"] = sel
+        # go slippage
+        intro, kb_slip = _kb_slip_ui()
+        q.edit_message_text(intro, reply_markup=kb_slip)
+        return
+
+    # slippage pick
+    if op == "slip":
+        sel = rest[0]
+        if sel == "CUSTOM":
+            st["pending_custom_slip"] = True
+            q.answer("Send integer bps (e.g. 35 for 0.35%)")
+            return
+        st["slip_bps"] = int(sel)
+        # now build live quote + confirmation card
+        qd = _tw_quote_swap(
+            wallet_key=st["wallet"],
+            token_in=st["from"],
+            token_out=st["to"],
+            route_tokens=st["route_tokens"],
+            route_fees=st["route_fees"],
+            amount_in=Decimal(str(st["amount"])),
+            slip_bps=st["slip_bps"],
+            check_allowance=True,
+        )
+        st["last_quote"] = qd
+        text_block, kb_conf = _quote_confirmation_block(st, qd)
+        q.edit_message_text(text_block, reply_markup=kb_conf, parse_mode=ParseMode.HTML)
+        return
+
+    # approve (not unlimited, only trade amount)
+    if op == "approve":
+        if not is_admin(q.from_user.id):
+            q.answer("Not authorized.", show_alert=True); return
+        # send approval tx
+        try:
+            _tw_send_approval(
+                wallet_key=st["wallet"],
+                token_in=st["from"],
+                amount_in=Decimal(str(st["amount"])),
+                route_tokens=st["route_tokens"],
+                route_fees=st["route_fees"],
+            )
+            # after approval: requote
+            qd = _tw_quote_swap(
+                wallet_key=st["wallet"],
+                token_in=st["from"],
+                token_out=st["to"],
+                route_tokens=st["route_tokens"],
+                route_fees=st["route_fees"],
+                amount_in=Decimal(str(st["amount"])),
+                slip_bps=st["slip_bps"],
+                check_allowance=True,
+            )
+            st["last_quote"] = qd
+            text_block, kb_conf = _quote_confirmation_block(st, qd)
+            q.edit_message_text(text_block, reply_markup=kb_conf, parse_mode=ParseMode.HTML)
+            q.answer("Approval submitted.")
+        except Exception as e:
+            q.edit_message_text(f"Approval failed: {e}")
+            q.answer("Approval failed.", show_alert=True)
+        return
+
+    # execute final trade
+    if op == "exec":
+        if not is_admin(q.from_user.id):
+            q.answer("Not authorized.", show_alert=True); return
+
+        # final re-quote & send
+        qd = _tw_quote_swap(
+            wallet_key=st["wallet"],
+            token_in=st["from"],
+            token_out=st["to"],
+            route_tokens=st["route_tokens"],
+            route_fees=st["route_fees"],
+            amount_in=Decimal(str(st["amount"])),
+            slip_bps=st["slip_bps"],
+            check_allowance=True,
+        )
+        st["last_quote"] = qd
+
+        if (not qd.get("allowance_ok", False)) or (not qd.get("slippage_ok", True)):
+            # show card again with warnings
+            text_block, kb_conf = _quote_confirmation_block(st, qd)
+            q.edit_message_text(text_block, reply_markup=kb_conf, parse_mode=ParseMode.HTML)
+            q.answer("Cannot execute (allowance/slippage).", show_alert=True)
+            return
+
+        try:
+            txr = _tw_send_swap(
+                wallet_key=st["wallet"],
+                token_in=st["from"],
+                token_out=st["to"],
+                route_tokens=st["route_tokens"],
+                route_fees=st["route_fees"],
+                amount_in=Decimal(str(st["amount"])),
+                slip_bps=st["slip_bps"],
+            )
+            # txr should contain:
+            # 'tx_hash', 'gas_used', 'gas_cost_one', 'gas_cost_gwei_total',
+            # 'filled_in_human', 'filled_out_human'
+            msg_lines = [
+                "✅ Trade sent",
+                "",
+                f"Wallet : {st['wallet']}",
+                f"Spent  : {txr.get('filled_in_human','?')}",
+                f"Got    : {txr.get('filled_out_human','?')} (minOut enforced)",
+                "",
+                f"Gas used: {txr.get('gas_used','?')}",
+                f"Cost    : {txr.get('gas_cost_one','?')} ({txr.get('gas_cost_gwei_total','?')})",
+                "",
+                "Tx hash:",
+                f"{txr.get('tx_hash','0x')}",
+            ]
+            explorer = txr.get("explorer_url","")
+            if explorer:
+                msg_lines.append("")
+                msg_lines.append(explorer)
+            q.edit_message_text("\n".join(msg_lines))
+            q.answer("Executed.")
+        except Exception as e:
+            q.edit_message_text(f"❌ Trade failed\n{e}")
+            q.answer("Trade failed.", show_alert=True)
+
+        _tw_clear(chat_id)
+        return
+
+    # back: step back in wizard
+    if op == "back":
+        # priority unwind: slippage -> amount -> route -> to -> from -> wallet
+        if st.get("slip_bps") is not None:
+            st["slip_bps"] = None
+            intro, kb_slip = _kb_slip_ui()
+            q.edit_message_text(intro, reply_markup=kb_slip)
+            return
+        if st.get("amount") is not None:
+            st["amount"] = None
+            avail = _wallet_balance_for(st["from"], st["wallet"])
+            intro, kb_amt = _kb_amount_ui(avail, st["from"])
+            q.edit_message_text(intro, reply_markup=kb_amt)
+            return
+        if st.get("route_tokens") is not None or st.get("to"):
+            st["route_tokens"] = None
+            st["route_fees"] = None
+            header, kb, cand_list = _kb_routes_ui(st["from"], st["to"], st["force_via"])
+            st["cand_list"] = cand_list
+            q.edit_message_text(header, reply_markup=kb)
+            return
+        if st.get("to"):
+            st["to"] = None
+            q.edit_message_text(
+                "To asset (what you want to receive)\n"
+                "Note: we'll route through other tokens if no direct pool.",
+                reply_markup=_kb_tokens("to"),
+            )
+            return
+        if st.get("from"):
+            st["from"] = None
+            q.edit_message_text(
+                f"From asset (what you are spending)\nWallet: {st['wallet']}",
+                reply_markup=_kb_tokens("from"),
+            )
+            return
+        if st.get("wallet"):
+            st["wallet"] = None
+            q.edit_message_text("Trade: choose a wallet", reply_markup=_kb_wallets())
+            return
+
+        q.edit_message_text("Trade: choose a wallet", reply_markup=_kb_wallets())
+        return
+
+    q.answer("Unhandled")
+
+def msg_text_trade(update: Update, context: CallbackContext):
+    """
+    Capture custom amount and custom slippage bps when requested.
+    """
+    chat_id = update.effective_chat.id
+    st = _tw_state(chat_id)
+    txt = (update.message.text or "").strip()
+
+    # custom amount
+    if st.get("pending_custom_amount"):
+        st["pending_custom_amount"] = False
+        st["amount"] = txt
+        intro, kb_slip = _kb_slip_ui()
+        update.message.reply_text(intro, reply_markup=kb_slip)
+        return
+
+    # custom slippage
+    if st.get("pending_custom_slip"):
+        st["pending_custom_slip"] = False
+        try:
+            st["slip_bps"] = int(txt)
+        except Exception:
+            update.message.reply_text("Send integer bps (e.g. 35 for 0.35%)")
+            return
+        # now build quote + confirmation
+        qd = _tw_quote_swap(
+            wallet_key=st["wallet"],
+            token_in=st["from"],
+            token_out=st["to"],
+            route_tokens=st["route_tokens"],
+            route_fees=st["route_fees"],
+            amount_in=Decimal(str(st["amount"])),
+            slip_bps=st["slip_bps"],
+            check_allowance=True,
+        )
+        st["last_quote"] = qd
+        text_block, kb_conf = _quote_confirmation_block(st, qd)
+        update.message.reply_html(text_block, reply_markup=kb_conf)
+        return
+
+    # if message isn't part of wizard inputs, just log it
+    _log_update(update, context)
+
+# ============================================================================
+# /withdraw — wallet -> asset -> amount -> confirm -> send
+# ============================================================================
+
+_WD: Dict[int, Dict[str,Any]] = {}
+
+def _wd_state(chat_id: int) -> Dict[str,Any]:
+    st = _WD.get(chat_id)
+    if not st:
+        st = {
+            "wallet": None,
+            "asset": None,
+            "amount": None,
+            "pending_custom_amount": False,
+        }
+        _WD[chat_id] = st
+    return st
+
+def _wd_clear(chat_id: int):
+    if chat_id in _WD:
+        del _WD[chat_id]
+
+def _kb_wd_wallets() -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton("tecbot_usdc", callback_data="wd|w|tecbot_usdc"),
+         InlineKeyboardButton("tecbot_sdai", callback_data="wd|w|tecbot_sdai")],
+        [InlineKeyboardButton("tecbot_eth", callback_data="wd|w|tecbot_eth"),
+         InlineKeyboardButton("tecbot_tec", callback_data="wd|w|tecbot_tec")],
+        [InlineKeyboardButton("Cancel", callback_data="wd|x")]
+    ]
+    return InlineKeyboardMarkup(rows)
+
+def _kb_wd_assets(wallet_name: str) -> Tuple[str, InlineKeyboardMarkup]:
+    # show balances for that wallet so you know what's available
+    table = {}
+    try:
+        if BL is not None:
+            table = BL.all_balances().get(wallet_name, {})
+    except Exception:
+        table = {}
+    # gather nice summary:
+    lines = [f"Which asset to withdraw from {wallet_name}?",
+             f"Destination:\n{TREASURY_ADDR}",
+             "Balance:"]
+    for k,v in table.items():
+        amt = _fmt_amt(k, v)
+        lines.append(f"{k:<7} {amt}")
+    # build buttons for common assets
+    syms = ["1USDC","1sDAI","TEC","1ETH","ONE","WONE"]
+    row = []
+    btn_rows: List[List[InlineKeyboardButton]] = []
+    for s in syms:
+        row.append(InlineKeyboardButton(s, callback_data=f"wd|asset|{s}"))
+        if len(row)==3:
+            btn_rows.append(row); row=[]
+    if row: btn_rows.append(row)
+    btn_rows.append([
+        InlineKeyboardButton("Back", callback_data="wd|back"),
+        InlineKeyboardButton("Cancel", callback_data="wd|x"),
+    ])
+    return "\n".join(lines), InlineKeyboardMarkup(btn_rows)
+
+def _kb_wd_amount_ui(avail: Optional[Decimal], sym: str) -> Tuple[str, InlineKeyboardMarkup]:
+    amt_line = ""
+    if avail is not None:
+        amt_line = f"Available: { _fmt_amt(sym, avail) } {sym}\n"
+    intro = (
+        f"Amount to withdraw ({sym})\n"
+        f"Destination:\n{TREASURY_ADDR}\n"
+        f"{amt_line}"
+    )
+    rows = [
+        [InlineKeyboardButton("100", callback_data="wd|amt|100"),
+         InlineKeyboardButton("250", callback_data="wd|amt|250"),
+         InlineKeyboardButton("500", callback_data="wd|amt|500")],
+        [InlineKeyboardButton("1,000", callback_data="wd|amt|1000"),
+         InlineKeyboardButton("All", callback_data="wd|amt|ALL")],
+        [InlineKeyboardButton("Custom…", callback_data="wd|amt|CUSTOM"),
+         InlineKeyboardButton("Back", callback_data="wd|back"),
+         InlineKeyboardButton("Cancel", callback_data="wd|x")],
+    ]
+    return intro, InlineKeyboardMarkup(rows)
+
+def _wd_confirm_block(st: Dict[str,Any], qd: Dict[str,Any]) -> Tuple[str, InlineKeyboardMarkup]:
+    """
+    qd from _wd_quote_transfer, containing:
+      'gas_units','gas_cost_one','gas_cost_gwei_total','nonce'
+    """
+    wallet_key = st.get("wallet","?")
+    sym = st.get("asset","?")
+    amt = st.get("amount","?")
+    gas_units = qd.get("gas_units","?")
+    cost_one = qd.get("gas_cost_one","?")
+    cost_gwei = qd.get("gas_cost_gwei_total","?")
+    nonce = qd.get("nonce","?")
+
+    lines = [
+        "Confirm Withdraw",
+        "",
+        f"Wallet      : {wallet_key}",
+        f"Asset       : {sym}",
+        f"Amount      : {amt}",
+        f"To          : {TREASURY_ADDR}",
+        "",
+        f"Gas Est     : {gas_units} gas",
+        f"Cost        : {cost_one} ({cost_gwei})",
+        f"Nonce       : {nonce}",
+    ]
+    text_block = "<pre>\n" + "\n".join(lines) + "\n</pre>"
+
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Send Withdrawal", callback_data="wd|exec|go")],
+        [InlineKeyboardButton("◀ Back", callback_data="wd|back"),
+         InlineKeyboardButton("❌ Cancel", callback_data="wd|x")],
+    ])
+    return text_block, kb
+
+def cmd_withdraw(update: Update, context: CallbackContext):
+    chat_id = update.effective_chat.id
+    _wd_state(chat_id)
+    txt = (
+        "Withdraw funds to treasury:\n\n"
+        f"Destination:\n{TREASURY_ADDR}\n\n"
+        "Select source wallet:"
+    )
+    update.message.reply_text(txt, reply_markup=_kb_wd_wallets())
+
+def cb_withdraw(update: Update, context: CallbackContext):
+    q = update.callback_query
+    if not q or not q.data:
+        return
+    chat_id = q.message.chat_id
+    st = _wd_state(chat_id)
+
+    try:
+        _, op, *rest = q.data.split("|")
+    except Exception:
+        q.answer("Invalid"); return
+
+    # cancel
+    if op == "x":
+        _wd_clear(chat_id)
+        q.edit_message_text("Withdrawal canceled.")
+        return
+
+    # wallet
+    if op == "w":
+        st["wallet"] = rest[0]
+        txt, kb = _kb_wd_assets(st["wallet"])
+        q.edit_message_text(txt, reply_markup=kb)
+        return
+
+    # asset
+    if op == "asset":
+        st["asset"] = rest[0]
+        # ask amount
+        avail = _wallet_balance_for(st["asset"], st["wallet"])
+        intro, kb_amt = _kb_wd_amount_ui(avail, st["asset"])
+        q.edit_message_text(intro, reply_markup=kb_amt)
+        return
+
+    # amount
+    if op == "amt":
+        sel = rest[0]
+        if sel == "CUSTOM":
+            st["pending_custom_amount"] = True
+            q.answer("Send a number like 1000 or 1000.25")
+            return
+        if sel == "ALL":
+            avail = _wallet_balance_for(st["asset"], st["wallet"])
+            st["amount"] = str(avail) if avail is not None else "0"
+        else:
+            st["amount"] = sel
+
+        # build confirm (quote gas/nonce)
+        qd = _wd_quote_transfer(
+            wallet_key=st["wallet"],
+            token_sym=st["asset"],
+            amount=Decimal(str(st["amount"])),
+            to_addr=TREASURY_ADDR,
+        )
+        st["last_quote"] = qd
+        text_block, kb_conf = _wd_confirm_block(st, qd)
+        q.edit_message_text(text_block, reply_markup=kb_conf, parse_mode=ParseMode.HTML)
+        return
+
+    # exec withdrawal
+    if op == "exec":
+        # require admin
+        if not is_admin(q.from_user.id):
+            q.answer("Not authorized.", show_alert=True); return
+
+        qd = _wd_quote_transfer(
+            wallet_key=st["wallet"],
+            token_sym=st["asset"],
+            amount=Decimal(str(st["amount"])),
+            to_addr=TREASURY_ADDR,
+        )
+
+        try:
+            txr = _wd_send_transfer(
+                wallet_key=st["wallet"],
+                token_sym=st["asset"],
+                amount=Decimal(str(st["amount"])),
+                to_addr=TREASURY_ADDR,
+            )
+            msg_lines = [
+                "✅ Withdrawal sent",
+                "",
+                f"From  : {st['wallet']}",
+                f"Asset : {st['asset']}",
+                f"Amount: {st['amount']}",
+                f"To    : {TREASURY_ADDR}",
+                "",
+                f"Gas used: {txr.get('gas_used','?')}",
+                f"Cost    : {txr.get('gas_cost_one','?')} ({txr.get('gas_cost_gwei_total','?')})",
+                "",
+                "Tx hash:",
+                f"{txr.get('tx_hash','0x')}",
+            ]
+            explorer = txr.get("explorer_url","")
+            if explorer:
+                msg_lines.append("")
+                msg_lines.append(explorer)
+            q.edit_message_text("\n".join(msg_lines))
+            q.answer("Withdraw sent.")
+        except Exception as e:
+            q.edit_message_text(f"❌ Withdrawal failed\n{e}")
+            q.answer("Withdrawal failed.", show_alert=True)
+
+        _wd_clear(chat_id)
+        return
+
+    # back in withdraw flow
+    if op == "back":
+        if st.get("amount") is not None:
+            st["amount"] = None
+            avail = _wallet_balance_for(st["asset"], st["wallet"])
+            intro, kb_amt = _kb_wd_amount_ui(avail, st["asset"])
+            q.edit_message_text(intro, reply_markup=kb_amt)
+            return
+        if st.get("asset") is not None:
+            st["asset"] = None
+            txt, kb = _kb_wd_assets(st["wallet"])
+            q.edit_message_text(txt, reply_markup=kb)
+            return
+        if st.get("wallet") is not None:
+            st["wallet"] = None
+            txt = (
+                "Withdraw funds to treasury:\n\n"
+                f"Destination:\n{TREASURY_ADDR}\n\n"
+                "Select source wallet:"
+            )
+            q.edit_message_text(txt, reply_markup=_kb_wd_wallets())
+            return
+        q.edit_message_text("Withdraw canceled.")
+        return
+
+    q.answer("Unhandled")
+
+def msg_text_withdraw(update: Update, context: CallbackContext):
+    """
+    Capture custom amount for withdraw.
+    """
+    chat_id = update.effective_chat.id
+    st = _wd_state(chat_id)
+    txt = (update.message.text or "").strip()
+
+    if st.get("pending_custom_amount"):
+        st["pending_custom_amount"] = False
+        st["amount"] = txt
+        qd = _wd_quote_transfer(
+            wallet_key=st["wallet"],
+            token_sym=st["asset"],
+            amount=Decimal(str(st["amount"])),
+            to_addr=TREASURY_ADDR,
+        )
+        st["last_quote"] = qd
+        text_block, kb_conf = _wd_confirm_block(st, qd)
+        update.message.reply_html(text_block, reply_markup=kb_conf)
+        return
+
+    _log_update(update, context)
+
+# ============================================================================
+# PLACEHOLDER LOW-LEVEL HOOKS
+#
+# You must connect these to your chain-specific logic.
+# They are used by /trade and /withdraw.
+# ============================================================================
+
+def _tw_quote_swap(
+    wallet_key: Optional[str],
+    token_in: str,
+    token_out: str,
+    route_tokens: Optional[List[str]],
+    route_fees: Optional[List[int]],
+    amount_in: Decimal,
+    slip_bps: Optional[int],
+    check_allowance: bool,
+) -> Dict[str,Any]:
+    """
+    Build quote details for confirmation step.
+    You already have similar logic in runner.build_dryrun() to compute:
+      - amount_in_human
+      - quote_out_human
+      - impact_bps
+      - minOut based on slip_bps
+      - gas estimate, gas cost in ONE
+      - allowance_ok, nonce
+      - friendly path string with fee % and fee_total_pct
+    Return a dict with keys consumed by _quote_confirmation_block().
+    """
+    # TODO: wire to your quoting / preview logic
+    # The stub below is to keep the bot from crashing if run before wiring.
+    return {
+        "path_human": f"{token_in} → ... → {token_out}",
+        "amount_in_human": f"{amount_in} {token_in}",
+        "quote_out_human": f"~? {token_out}",
+        "impact_bps": Decimal("0"),
+        "fee_total_pct": "~0.00%",
+        "slip_text": f"{(slip_bps or 0)/100:.2f}% max → minOut ? {token_out}",
+        "gas_units": 210000,
+        "gas_cost_one": "0.00 ONE",
+        "gas_cost_gwei_total": "~0 gwei",
+        "allowance_ok": True if not check_allowance else False,
+        "need_approval_amount": f"{amount_in} {token_in}",
+        "nonce": 0,
+        "slippage_ok": True,
+        "price_limit_text": "",
+    }
+
+def _tw_send_approval(
+    wallet_key: str,
+    token_in: str,
+    amount_in: Decimal,
+    route_tokens: Optional[List[str]],
+    route_fees: Optional[List[int]],
+):
+    """
+    Send ERC20 approve() for exactly 'amount_in' of token_in to router,
+    NOT unlimited.
+    """
+    # TODO: call your approval tx builder/sender
+    return
+
+def _tw_send_swap(
+    wallet_key: str,
+    token_in: str,
+    token_out: str,
+    route_tokens: Optional[List[str]],
+    route_fees: Optional[List[int]],
+    amount_in: Decimal,
+    slip_bps: int,
+) -> Dict[str,Any]:
+    """
+    Execute the actual swap now.
+    Must:
+      - re-quote,
+      - apply slip_bps => amountOutMin,
+      - sign and send tx,
+      - return receipt fields.
+    """
+    # TODO: call your trade executor / runner.execute_action equivalent
+    return {
+        "tx_hash": "0x...",
+        "filled_in_human": f"{amount_in} {token_in}",
+        "filled_out_human": f"~? {token_out}",
+        "gas_used": 210000,
+        "gas_cost_one": "0.00 ONE",
+        "gas_cost_gwei_total": "~0 gwei",
+        "explorer_url": "",
+    }
+
+def _wd_quote_transfer(
+    wallet_key: str,
+    token_sym: str,
+    amount: Decimal,
+    to_addr: str,
+) -> Dict[str,Any]:
+    """
+    Quote gas / nonce for a withdrawal transfer.
+    """
+    # TODO: call wallet/runner logic to estimate transfer tx
+    return {
+        "gas_units": 85000,
+        "gas_cost_one": "0.00167 ONE",
+        "gas_cost_gwei_total": "~1,670 gwei",
+        "nonce": 0,
+    }
+
+def _wd_send_transfer(
+    wallet_key: str,
+    token_sym: str,
+    amount: Decimal,
+    to_addr: str,
+) -> Dict[str,Any]:
+    """
+    Send the actual withdrawal transfer (ERC20 transfer or native ONE).
+    """
+    # TODO: sign+send transfer
+    return {
+        "tx_hash": "0x...",
+        "gas_used": 86000,
+        "gas_cost_one": "0.00169 ONE",
+        "gas_cost_gwei_total": "~1,690 gwei",
+        "explorer_url": "",
+    }
+
+# ---------- main ----------
+
+def main():
+    token = os.environ.get("TELEGRAM_BOT_TOKEN") or getattr(C, "TELEGRAM_BOT_TOKEN", None)
+    if not token:
+        raise SystemExit("TELEGRAM_BOT_TOKEN not set")
+
+    up = Updater(token=token, use_context=True)
+    dp = up.dispatcher
+
+    # core commands
+    dp.add_handler(CommandHandler("start", cmd_start))
+    dp.add_handler(CommandHandler("help", cmd_help))
+    dp.add_handler(CommandHandler("version", cmd_version))
+    dp.add_handler(CommandHandler("sanity", cmd_sanity))
+    dp.add_handler(CommandHandler("assets", cmd_assets))
+    dp.add_handler(CommandHandler("prices", cmd_prices))
+    dp.add_handler(CommandHandler("balances", cmd_balances))
+    dp.add_handler(CommandHandler("slippage", cmd_slippage, pass_args=True))
+    dp.add_handler(CommandHandler("ping", cmd_ping))
+    dp.add_handler(CommandHandler("cooldowns", cmd_cooldowns, pass_args=True))
+
+    # old planner/runner (still callable manually)
+    dp.add_handler(CommandHandler("plan", cmd_plan))
+    dp.add_handler(CommandHandler("dryrun", cmd_dryrun))
+
+    # trade wizard
+    dp.add_handler(CommandHandler("trade", cmd_trade))
+    dp.add_handler(CallbackQueryHandler(cb_trade, pattern=r"^tw\|"))
+    dp.add_handler(MessageHandler(Filters.text & ~Filters.command, msg_text_trade), group=1)
+
+    # withdraw wizard
+    dp.add_handler(CommandHandler("withdraw", cmd_withdraw))
+    dp.add_handler(CallbackQueryHandler(cb_withdraw, pattern=r"^wd\|"))
+    dp.add_handler(MessageHandler(Filters.text & ~Filters.command, msg_text_withdraw), group=2)
+
+    # existing exec callbacks for dryrun-based actions
+    dp.add_handler(CallbackQueryHandler(on_exec_button, pattern=r"^exec:[A-Za-z0-9_\-]+$"))
+    dp.add_handler(CallbackQueryHandler(on_exec_confirm, pattern=r"^exec_go:[A-Za-z0-9_\-]+$"))
+    dp.add_handler(CallbackQueryHandler(on_exec_cancel, pattern=r"^exec_cancel$"))
+
+    dp.add_error_handler(_log_error)
+    # group=-1 for catchall logging of other updates
+    dp.add_handler(MessageHandler(Filters.all, _log_update), group=-1)
+
+    log.info("Handlers registered: /start /help /version /sanity /assets /prices /balances /slippage /ping /cooldowns /trade /withdraw (/plan /dryrun internal)")
+    up.start_polling(clean=True)
+    log.info("Telegram bot started")
+    up.idle()
+
+if __name__ == "__main__":
+    main()
