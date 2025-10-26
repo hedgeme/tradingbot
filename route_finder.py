@@ -1,9 +1,17 @@
 # app/route_finder.py
 """
-Lightweight route discovery over POOLS_V3 with optional 'force_via' constraint.
-- Builds a token graph from config.POOLS_V3 keys like '1USDC/WONE@500'
-- Finds direct and 2-hop paths (configurable)
-- Labels hops with lowest available fee tier between each token pair
+Lightweight route discovery over config.POOLS_V3 with optional 'force_via' constraint.
+
+We:
+- Build a token graph from POOLS_V3 keys like '1USDC/WONE@500'
+- Find direct + 2-hop paths
+- Label hops with the *lowest* fee tier available
+- Return paths like ['1USDC','WONE@500','1ETH@3000']
+
+telegram_listener will:
+- Turn 500 -> "0.05%" etc for human-readable display
+- Sum total fee % for the path
+- Attach impact/estOut/etc using quotes
 """
 
 from collections import defaultdict, deque
@@ -23,20 +31,26 @@ def _parse_pool_key(k: str) -> Tuple[str, str, int]:
 
 
 def _build_graph() -> Dict[str, List[Tuple[str, int]]]:
+    """
+    Graph of token -> [(neighbor_token, feeTier), ...]
+    We treat pools as undirected for discovery (quotes will encode direction).
+    """
     g: Dict[str, List[Tuple[str, int]]] = defaultdict(list)
-    for k in getattr(C, "POOLS_V3", {}).keys():
+    for key in getattr(C, "POOLS_V3", {}).keys():
         try:
-            a, b, fee = _parse_pool_key(k)
+            a, b, fee = _parse_pool_key(key)
         except Exception:
             continue
-        # undirected for discovery (quotes will encode direction later)
         g[a].append((b, fee))
         g[b].append((a, fee))
     return g
 
 
 def _label_with_lowest_fees(path_tokens: List[str], g: Dict[str, List[Tuple[str, int]]]) -> Optional[List[str]]:
-    # ['1USDC','WONE','1ETH'] -> ['1USDC','WONE@500','1ETH@3000'] choosing lowest fee for each hop
+    """
+    ['1USDC','WONE','1ETH'] -> ['1USDC','WONE@500','1ETH@3000']
+    We pick the minimum fee tier edge between each hop.
+    """
     if len(path_tokens) < 2:
         return None
     out: List[str] = [path_tokens[0]]
@@ -57,9 +71,16 @@ def candidates(
     max_routes: int = 3,
 ) -> List[List[str]]:
     """
-    Return up to `max_routes` candidate paths as token/fee-labeled hops.
-    Example: ['1USDC','WONE@500','1ETH@3000']
-    - force_via: only return paths that include this token as an intermediate (not endpoints)
+    Return up to max_routes candidate paths.
+
+    token_in='1USDC'
+    token_out='1ETH'
+    -> e.g. [
+        ['1USDC','WONE@500','1ETH@3000'],
+        ['1USDC','1sDAI@500','1ETH@3000'],
+    ]
+
+    If force_via='WONE', we ONLY keep paths where WONE is an intermediate node.
     """
     token_in = token_in.strip()
     token_out = token_out.strip()
@@ -71,12 +92,13 @@ def candidates(
         return []
 
     res: List[List[str]] = []
+    # BFS with memory of minimal depth visited
     q = deque([(token_in, [token_in])])
     visited_depth: Dict[str, int] = {token_in: 0}
 
     while q:
         cur, path = q.popleft()
-        depth = len(path) - 1  # edges taken
+        depth = len(path) - 1
         if depth > max_hops:
             continue
 
@@ -86,6 +108,7 @@ def candidates(
                 if force_via:
                     mids = set(path[1:-1])
                     if force_via not in mids:
+                        # doesn't satisfy constraint
                         pass
                     else:
                         res.append(labeled)
