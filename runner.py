@@ -1,8 +1,9 @@
 # /bot/runner.py
 # Runner: keeps legacy /dryrun mock; adds real /trade hooks using app.slippage + trade_executor
 from dataclasses import dataclass
-from typing import List, Optional, Dict, Any, NamedTuple, Tuple
+from typing import List, Optional, Dict, Any, NamedTuple
 from decimal import Decimal
+import time
 
 # --------------------------
 # Legacy /dryrun (unchanged)
@@ -64,7 +65,7 @@ def execute_action(action_id: str) -> ExecResult:
 # -------------------------------------------------
 try:
     from app import slippage as SLMOD
-except Exception:  # fallback
+except Exception:
     import app.slippage as SLMOD  # type: ignore
 
 try:
@@ -76,10 +77,7 @@ import config as C  # WALLETS, etc.
 
 # trade executor helpers (already in your repo)
 import trade_executor as TE  # approve_if_needed, swap_v3_exact_input_once, quote_v3_exact_input, _v3_path_bytes
-
-# web3 only for gas/nonce estimation (preview path)
 from web3 import Web3
-from eth_abi import encode as _abi_encode  # not strictly needed; kept for completeness
 
 # ------------------------------------
 # Symbol normalization ONE <-> WONE
@@ -111,27 +109,29 @@ def _fee_from_path_text_first_hop(path_text: str, token_in_norm: str) -> Optiona
       "TEC → WONE@10000 → 1USDC@3000" -> 10000
       "1USDC → 1sDAI@500" -> 500
     """
-    # Normalize "WONE" in the string vs token_in_norm we pass in
-    pt = path_text.replace("ONE@", "WONE@").replace(" ONE", " WONE")
+    # Normalize ONE→WONE in the string for comparison only
+    pt = path_text.replace(" ONE", " WONE").replace("ONE@", "WONE@")
     parts = [p.strip() for p in pt.split("→")]
     if not parts:
         return None
-    for i, hop in enumerate(parts):
-        # hop can be like "TEC" (no fee) or "WONE@500"
-        if i == 0:
-            # first element is the starting token name (no fee on it)
-            continue
-        prev = parts[i-1].split("@")[0].strip()
+    for i in range(1, len(parts)):
+        prev = parts[i-1].split("@")[0].strip().upper()
         cur  = parts[i]
-        if prev.upper() == token_in_norm.upper():
-            # current should include "@fee"
-            if "@” in cur:
+        if prev == token_in_norm.upper():
+            if "@" in cur:
+                # cur like "WONE@500" or "1sDAI@500"
+                seg = cur.split("@", 1)[1].strip()
+                # seg may have trailing symbols; keep digits only at start
+                num = []
+                for ch in seg:
+                    if ch.isdigit():
+                        num.append(ch)
+                    else:
+                        break
                 try:
-                    fee = int(cur.split("@", 1)[1].split()[0])
-                    return fee
+                    return int("".join(num)) if num else None
                 except Exception:
                     return None
-            # if no fee printed, try standard defaults by known pairs
             return None
     return None
 
@@ -148,10 +148,8 @@ def _dec(sym: str) -> int:
     return int(PR._dec(sym))
 
 def _router_addr() -> str:
-    # trade_executor exposes this constant in your code
     ra = getattr(TE, "ROUTER_ADDR_ETH", None)
     if not ra:
-        # hard fail — executor must define router; don't guess
         raise RuntimeError("trade_executor.ROUTER_ADDR_ETH is missing")
     return Web3.to_checksum_address(ra)
 
@@ -275,7 +273,7 @@ def _prepare_manual_trade_for_wallet(
     Mirrors your /dryrun internals but for a single manual request.
     - Checks allowance for EXACT amount
     - Builds exactInput calldata (single-hop)
-    - Gas estimate (headroom added in UI step; here we show node estimate)
+    - Gas estimate
     - Next nonce
     - Pretty tx_preview_text
     """
@@ -290,35 +288,32 @@ def _prepare_manual_trade_for_wallet(
 
     # Determine single-hop fee for first hop
     fee_first = _fee_from_path_text_first_hop(path_text or f"{token_in} → {token_out}", token_in) or 500
-    # Build path bytes (single hop)
+
+    # Build path bytes (single hop) using resolved addresses
     t_in_addr  = _addr(token_in)
     t_out_addr = _addr(token_out)
     path_bytes = TE._v3_path_bytes(t_in_addr, int(fee_first), t_out_addr)
 
-    # Allowance check (for ERC-20 input; for ONE we already normalize to WONE)
+    # Allowance check
     approve_text = None
     try:
-        current_allow = TE.get_allowance(owner, _addr(token_in), router)
+        current_allow = TE.get_allowance(owner, t_in_addr, router)
     except Exception:
         current_allow = 0
     allowance_ok = current_allow >= int(amount_in_wei)
     if not allowance_ok:
         approve_text = f"{_fmt_amt(_norm_out(token_in), amount_in)} {_norm_out(token_in)}"
 
-    # Gas estimate preview
-    # Rebuild router.fn to estimate
-    from web3 import Web3 as _W3
-    router_ct = _W3(TE.w3.provider).eth.contract(address=Web3.to_checksum_address(router), abi=TE.ROUTER_EXACT_INPUT_ABI)
-    fn = router_ct.functions.exactInput(path_bytes, int(amount_in_wei), max(1, int(min_out_wei)), owner, int(Web3.to_int(time=None) or 0) or 0)
-    # The deadline isn’t used on estimate, but some nodes need non-zero; we set in tx preview text only.
+    # Gas estimate preview (node estimate, no headroom here)
+    router_ct = TE.w3.eth.contract(address=Web3.to_checksum_address(router), abi=TE.ROUTER_EXACT_INPUT_ABI)
+    deadline  = int(time.time()) + 600
+    fn = router_ct.functions.exactInput(path_bytes, int(amount_in_wei), max(1, int(min_out_wei)), owner, int(deadline))
     try:
-        # a clean estimate with 'from'
-        est = TE.w3.eth.estimate_gas({
-            "to": router,
-            "from": owner,
-            "data": fn._encode_transaction_data() if hasattr(fn, "_encode_transaction_data") else fn.encode_abi(),
-            "value": 0,
-        })
+        data = fn._encode_transaction_data() if hasattr(fn, "_encode_transaction_data") else fn.encode_abi()
+    except Exception:
+        data = fn.encode_abi()
+    try:
+        est = TE.w3.eth.estimate_gas({"to": router, "from": owner, "data": data, "value": 0})
         gas_est = int(est)
     except Exception:
         gas_est = 300_000  # conservative fallback
@@ -367,7 +362,6 @@ def execute_manual_quote(
     # Count hops: tokens in the printed path (WONE vs ONE is cosmetic)
     hop_tokens = [p.strip().split("@")[0] for p in path_text.replace("ONE", "WONE").split("→")]
     if len(hop_tokens) != 2:
-        # Current executor API is single-hop; fail fast with message
         raise RuntimeError("Multi-hop execution is not enabled yet for /trade. Choose a direct pool pair.")
 
     # Fee for the first hop
@@ -375,7 +369,6 @@ def execute_manual_quote(
 
     # Convert to wei
     dec_in  = _dec(t_in_norm)
-    dec_out = _dec(t_out_norm)
     amount_in_wei = int(amount_in * (Decimal(10) ** dec_in))
 
     # Ensure allowance for EXACT amount
@@ -397,11 +390,10 @@ def execute_manual_quote(
         slippage_bps=int(slippage_bps),
         deadline_s=600
     )
-    # trade_executor returns {"tx_hash": ..., "amount_out_min": ..., "path": [...]}
     txh = res.get("tx_hash", "")
     return {
         "tx_hash": txh,
         "filled_text": f"Executed manual swap {amount_in} {token_in} → {token_out}",
-        "gas_used": 0,               # gas_used not returned by send; can be filled by receipt listener later
-        "explorer_url": "",          # alert includes explorer link; you can extend executor to return one here
+        "gas_used": 0,
+        "explorer_url": "",
     }
