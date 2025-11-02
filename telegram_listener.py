@@ -1,20 +1,15 @@
 #!/usr/bin/env python3
-# TECBot Telegram Listener — now with /trade and /withdraw integration
+# TECBot Telegram Listener — with /trade and /withdraw
 #
-# IMPORTANT:
-#   - Existing commands (/prices, /balances, /slippage, /dryrun, etc.) are preserved.
-#   - /plan is still registered but you said you'll hide it from BotFather later.
-#   - /trade now calls runner.build_manual_quote() for honest quotes.
-#   - /trade execute calls runner.execute_manual_quote() (admin-gated).
-#   - /withdraw scaffold included (admin-gated send).
-#
-# You MUST finish the TODOs inside runner._prepare_manual_trade_for_wallet()
-# and runner.execute_manual_quote() for gas/allowance/nonce/tx broadcast.
+# - /trade uses runner.build_manual_quote() for live quotes
+# - /trade Approve uses trade_executor.approve_if_needed(...) for exact amount
+# - /trade Execute uses runner.execute_manual_quote() (admin-gated)
+# - Users can type the amount (captured before catch-all logger)
 #
 import os, sys, logging, subprocess, shlex
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_DOWN
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Tuple
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, ParseMode, Update
 from telegram.ext import (
@@ -58,7 +53,7 @@ try:
 except Exception as e:
     log.warning("slippage module not available: %s", e)
 
-# optional planner/runner
+# planner (optional)
 planner = None
 try:
     from app.strategies import planner
@@ -71,6 +66,7 @@ except Exception:
         log.warning("planner module not available: %s", e)
         planner = None
 
+# runner (required for /trade)
 runner = None
 try:
     from app import runner
@@ -83,14 +79,36 @@ except Exception:
         log.warning("runner module not available: %s", e)
         runner = None
 
-# optional Coinbase spot
-def _coinbase_eth() -> Optional[Decimal]:
+# wallet + trade_executor (for approve + gas helpers)
+try:
+    from app import wallet as W
+    log.info("Loaded wallet from app.wallet")
+except Exception:
     try:
-        import coinbase_client
-        val = coinbase_client.fetch_eth_usd_price()
-        return Decimal(str(val)) if val is not None else None
+        import wallet as W  # type: ignore
+        log.info("Loaded wallet from root wallet")
+    except Exception as e:
+        log.warning("wallet module not available: %s", e)
+        W = None  # type: ignore
+
+try:
+    from app import alert as ALERT
+except Exception:
+    try:
+        import alert as ALERT  # type: ignore
     except Exception:
-        return None
+        ALERT = None  # type: ignore
+
+try:
+    from app import trade_executor as TE
+    log.info("Loaded trade_executor from app.trade_executor")
+except Exception:
+    try:
+        import trade_executor as TE  # type: ignore
+        log.info("Loaded trade_executor from root trade_executor")
+    except Exception as e:
+        log.warning("trade_executor not available: %s", e)
+        TE = None  # type: ignore
 
 # ---------- Utilities ----------
 def now_iso() -> str:
@@ -98,7 +116,7 @@ def now_iso() -> str:
 
 def is_admin(user_id: int) -> bool:
     try:
-        return int(user_id) in set(int(x) for x in getattr(C, "ADMIN_USER_IDS", []) or [])
+        return int(user_id) in set(int(x) for x in (getattr(C, "ADMIN_USER_IDS", []) or []))
     except Exception:
         return False
 
@@ -117,7 +135,8 @@ def _fmt_money(x: Optional[Decimal]) -> str:
     if x >= 1000:
         return f"${x:,.2f}"
     if x >= 1:
-        return f"${x:,.5f}".rstrip("0").rstrip(".") if "." in f"{x:.5f}" else f"${x:.5f}"
+        s = f"{x:.5f}"
+        return f"${s.rstrip('0').rstrip('.') if '.' in s else s}"
     return f"${x:,.5f}"
 
 # Amount formatting for balances (per symbol rule)
@@ -262,6 +281,8 @@ def cmd_sanity(update: Update, context: CallbackContext):
         "prices_loaded": bool(PR),
         "balances_loaded": bool(BL),
         "slippage_loaded": bool(SL),
+        "wallet_loaded": bool(W),
+        "trade_executor_loaded": bool(TE),
     }
     txt = "Sanity:\n  " + "\n  ".join(f"{k}: {v}" for k,v in details.items())
     txt += "\n\nModules:\n  " + "\n  ".join(f"{k}: {v}" for k,v in avail.items())
@@ -327,7 +348,7 @@ def cmd_balances(update: Update, context: CallbackContext):
     update.message.reply_text(f"<pre>\n{chr(10).join(lines)}\n</pre>", parse_mode=ParseMode.HTML)
 
 # ---- price helpers ----
-def _eth_best_side_and_route() -> (Optional[Decimal], str):
+def _eth_best_side_and_route() -> Tuple[Optional[Decimal], str]:
     if PR is None:
         return None, "fwd"
     try:
@@ -382,6 +403,14 @@ def _eth_best_side_and_route() -> (Optional[Decimal], str):
         return (rev or fwd), ("rev" if rev else "fwd")
     except Exception:
         return None, "fwd"
+
+def _coinbase_eth() -> Optional[Decimal]:
+    try:
+        import coinbase_client
+        val = coinbase_client.fetch_eth_usd_price()
+        return Decimal(str(val)) if val is not None else None
+    except Exception:
+        return None
 
 def cmd_prices(update: Update, context: CallbackContext):
     if PR is None:
@@ -652,6 +681,7 @@ def cmd_trade(update: Update, context: CallbackContext):
         "to": "",
         "amount": "",
         "slip_bps": str(getattr(C, "SLIPPAGE_DEFAULT_BPS", 30)),  # default
+        "waiting_amount": "0",
     }
 
     # wallet choices = configured bot wallets
@@ -686,46 +716,36 @@ def _tw_require_state(uid):
             "to": "",
             "amount": "",
             "slip_bps": str(getattr(C, "SLIPPAGE_DEFAULT_BPS", 30)),
+            "waiting_amount": "0",
         }
         _TRADE_STATE[uid] = st
     return st
 
 def _tw_assets_keyboard(uid, which):
-    # which in ("from","to")
-    # show core symbols you support
-    # NOTE: show ONE (user-facing), not WONE
     syms = ["ONE", "1USDC", "1sDAI", "TEC", "1ETH"]
-    kb = []
-    for s in syms:
-        kb.append([InlineKeyboardButton(s, callback_data=f"tw_{which}:{s}")])
+    kb = [[InlineKeyboardButton(s, callback_data=f"tw_{which}:{s}")] for s in syms]
     kb.append([InlineKeyboardButton("⬅ Back", callback_data="tw_back_wallet" if which=="from" else "tw_back_from")])
     kb.append([InlineKeyboardButton("❌ Cancel", callback_data="tw_cancel")])
     return kb
 
 def _tw_slip_keyboard(uid):
-    # Offer preset slippage options in human terms.
-    # We store them as bps.
     choices = [
         ("0.10% max", 10),
         ("0.50% max", 50),
         ("1.00% max", 100),
         ("Use default", getattr(C, "SLIPPAGE_DEFAULT_BPS", 30)),
     ]
-    kb = []
-    for label, bps in choices:
-        kb.append([InlineKeyboardButton(f"{label}", callback_data=f"tw_slip:{bps}")])
+    kb = [[InlineKeyboardButton(f"{label}", callback_data=f"tw_slip:{bps}")] for label,bps in choices]
     kb.append([InlineKeyboardButton("⬅ Back", callback_data="tw_back_amount")])
     kb.append([InlineKeyboardButton("❌ Cancel", callback_data="tw_cancel")])
     return kb
 
 def _tw_amount_keyboard(uid, wallet, token_in):
-    # Show balance for convenience + "All"
     bal_display = "?"
     if BL:
         try:
             table = BL.all_balances()
             row = table.get(wallet, {})
-            # try both native ONE and token_in specifically
             if token_in.upper() == "ONE":
                 bal_display = str(_resolve_one_value(row))
             else:
@@ -741,11 +761,6 @@ def _tw_amount_keyboard(uid, wallet, token_in):
     return kb, bal_display
 
 def _tw_render_manual_quote(uid, st):
-    """
-    Call runner.build_manual_quote() with the user's selections
-    and render a preview block. This is where we remove the fake
-    '~? 1USDC' behavior.
-    """
     if runner is None or not hasattr(runner, "build_manual_quote"):
         return ("Runner manual quote not available.", None, None)
 
@@ -771,7 +786,6 @@ def _tw_render_manual_quote(uid, st):
         slippage_bps=slip_bps,
     )
 
-    # Build the Telegram review text
     path     = getattr(mq, "path_text", f"{token_in_ui} → {token_out_ui}")
     ain_txt  = getattr(mq, "amount_in_text", f"{amt_str} {token_in_ui}")
     qout_txt = getattr(mq, "quote_out_text", f"? {token_out_ui}")
@@ -795,7 +809,6 @@ def _tw_render_manual_quote(uid, st):
         lines.append(f"Impact   : {imp_bps:.2f} bps")
     else:
         lines.append("Impact   : —")
-    # Slippage / minOut line, in human %
     pct = Decimal(slip_bps_val) / Decimal(100)
     lines.append(f"Slippage : {pct:.2f}% max → minOut {min_out}")
     lines.append(f"Gas Est  : {gas_est}")
@@ -812,7 +825,6 @@ def _tw_render_manual_quote(uid, st):
 
     txt = "\n".join(lines)
 
-    # Keyboard:
     kb_rows = []
     if not allow_ok and need_appr_txt:
         kb_rows.append([InlineKeyboardButton("✅ Approve spend first", callback_data="tw_do_approve")])
@@ -847,15 +859,15 @@ def _tw_handle_to(q, uid, sym):
     st = _tw_require_state(uid)
     st["to"] = sym
     st["step"] = "amount"
+    st["waiting_amount"] = "1"
     kb, bal_disp = _tw_amount_keyboard(uid, st["wallet"], st["from"])
     _tw_reply_edit(q,
-        f"FROM {st['from']} TO {sym}\n\nEnter amount of {st['from']} to trade.\nBalance: {bal_disp} {st['from']}",
+        f"FROM {st['from']} TO {sym}\n\nEnter amount of {st['from']} to trade (type a number in chat).\nBalance: {bal_disp} {st['from']}",
         kb
     )
 
 def _tw_handle_amt_all(q, uid):
     st = _tw_require_state(uid)
-    # pull balance for that wallet/from
     amt = "0"
     if BL:
         try:
@@ -904,9 +916,10 @@ def _tw_handle_back(q, uid, dest):
         )
     elif dest == "amount":
         st["step"] = "amount"
+        st["waiting_amount"] = "1"
         kb, bal_disp = _tw_amount_keyboard(uid, st["wallet"], st["from"])
         _tw_reply_edit(q,
-            f"FROM {st['from']} TO {st['to']}\n\nEnter amount of {st['from']} to trade.\nBalance: {bal_disp} {st['from']}",
+            f"FROM {st['from']} TO {st['to']}\n\nEnter amount of {st['from']} to trade (type a number in chat).\nBalance: {bal_disp} {st['from']}",
             kb
         )
     elif dest == "slip":
@@ -918,14 +931,27 @@ def _tw_handle_back(q, uid, dest):
         )
 
 def _tw_handle_approve(q, uid):
-    # must be admin
     if not is_admin(q.from_user.id):
         q.answer("Not authorized.", show_alert=True); return
-    # TODO:
-    #   call runner.* helper to send ERC20 approval for EXACT amount.
-    #   That helper should exist alongside execute_manual_quote.
-    q.edit_message_text("Approval sent (TODO hook). Now re-run /trade to execute.")
-    q.answer("Approval tx (placeholder).")
+    st = _tw_require_state(uid)
+    # exact approve for entered amount
+    if TE is None or runner is None:
+        q.answer("Approve backend missing.", show_alert=True); return
+    try:
+        amt = Decimal(st["amount"])
+        sym = st["from"]
+        wallet_key = st["wallet"]
+        token_addr = runner._addr(sym)  # resolve symbol -> address using runner map
+        dec = TE.get_decimals(token_addr)
+        wei = int(amt * (Decimal(10)**dec))
+        TE.approve_if_needed(wallet_key, token_addr, TE.ROUTER_ADDR_ETH, wei)
+        # Re-render quote after approval
+        txt, kb_rows, _ = _tw_render_manual_quote(uid, st)
+        _tw_reply_edit(q, txt, kb_rows)
+        q.answer("Approve sent.")
+    except Exception as e:
+        _tw_reply_edit(q, f"Approval failed:\n<code>{e}</code>", html=True)
+        q.answer("Failed.", show_alert=True)
 
 def _tw_handle_execute(q, uid):
     if not is_admin(q.from_user.id):
@@ -950,10 +976,10 @@ def _tw_handle_execute(q, uid):
         filled = txr.get("filled_text","")
         gas_used = txr.get("gas_used","—")
         explorer = txr.get("explorer_url","")
-        q.edit_message_text(f"✅ Executed manual trade\n{filled}\nGas used: {gas_used}\nTx: {txh}\n{explorer}".strip())
+        _tw_reply_edit(q, f"✅ Executed manual trade\n{filled}\nGas used: {gas_used}\nTx: {txh}\n{explorer}".strip())
         q.answer("Executed.")
     except Exception as e:
-        q.edit_message_text(f"❌ Execution failed\n{e}")
+        _tw_reply_edit(q, f"❌ Execution failed\n{e}")
         q.answer("Failed.", show_alert=True)
 
 def on_trade_callback(update: Update, context: CallbackContext):
@@ -998,8 +1024,31 @@ def on_trade_callback(update: Update, context: CallbackContext):
     if data == "tw_do_execute":
         _tw_handle_execute(q, uid); return
 
-    # unknown
     q.answer()
+
+# ---- Amount capture (typed number) ----
+def on_text_amount_capture(update: Update, context: CallbackContext):
+    uid = update.effective_user.id if update.effective_user else None
+    if uid is None: return
+    st = _TRADE_STATE.get(uid)
+    if not st: return
+    if st.get("step") != "amount": return
+    if st.get("waiting_amount") != "1": return
+
+    txt = (update.message.text or "").strip()
+    try:
+        amt = Decimal(txt)
+        if amt <= 0:
+            raise ValueError("non-positive")
+        st["waiting_amount"] = "0"
+        _tw_set_amount(uid, st, str(amt))
+        kb = _tw_slip_keyboard(uid)
+        update.message.reply_text(
+            f"Amount set to {amt} {st['from']}. Select slippage:",
+            reply_markup=InlineKeyboardMarkup(kb)
+        )
+    except Exception:
+        update.message.reply_text("Please send a positive numeric amount (e.g., 10 or 0.5).")
 
 # -----------------------------------------------------------------------------
 # /withdraw (basic scaffold)
@@ -1158,12 +1207,8 @@ def _wd_handle_send(q, uid):
     if not is_admin(q.from_user.id):
         q.answer("Not authorized.", show_alert=True); return
     st = _wd_require_state(uid)
-    # TODO:
-    #   this needs a runner/transfer helper that:
-    #   - creates a transfer tx from st["wallet"] to TREASURY_ADDR
-    #   - for ONE use native transfer; for ERC20 use transfer()
-    #   - signs+sends
-    #   - returns tx hash + gas used + explorer URL
+    # TODO (future):
+    #   call a runner helper to perform native/ERC20 transfer to TREASURY_ADDR
     q.edit_message_text(
         "✅ Withdrawal sent (TODO hook)\n"
         f"{st['amount']} {st['asset']} -> {TREASURY_ADDR}\n"
@@ -1200,7 +1245,6 @@ def on_withdraw_callback(update: Update, context: CallbackContext):
     if data == "wd_do_send":
         _wd_handle_send(q, uid); return
 
-    # unknown
     q.answer()
 
 # ---------- Main ----------
@@ -1212,7 +1256,7 @@ def main():
     up = Updater(token=token, use_context=True)
     dp = up.dispatcher
 
-    # Core & on-chain (unchanged from working bot, plus /trade /withdraw)
+    # Core & on-chain
     dp.add_handler(CommandHandler("start", cmd_start))
     dp.add_handler(CommandHandler("help", cmd_help))
     dp.add_handler(CommandHandler("version", cmd_version))
@@ -1236,9 +1280,12 @@ def main():
     dp.add_handler(CallbackQueryHandler(on_exec_confirm, pattern=r"^exec_go:[A-Za-z0-9_\-]+$"))
     dp.add_handler(CallbackQueryHandler(on_exec_cancel, pattern=r"^exec_cancel$"))
 
-    # NEW callback groups
+    # NEW callback groups for trade/withdraw
     dp.add_handler(CallbackQueryHandler(on_trade_callback, pattern=r"^tw_"))
     dp.add_handler(CallbackQueryHandler(on_withdraw_callback, pattern=r"^wd_"))
+
+    # Amount capture MUST be before catch-all logger
+    dp.add_handler(MessageHandler(Filters.text & ~Filters.command, on_text_amount_capture), group=0)
 
     dp.add_error_handler(_log_error)
     dp.add_handler(MessageHandler(Filters.all, _log_update), group=-1)
