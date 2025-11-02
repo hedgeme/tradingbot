@@ -1,12 +1,11 @@
-# Minimal runner stub for /dryrun + execution callback
+# /bot/runner.py
+# Minimal dryrun stubs (kept) + real manual quote/execute wired to trade_executor
+
 from dataclasses import dataclass
 from typing import List, Optional, Dict, Any, NamedTuple
-from decimal import Decimal
-import re
+from decimal import Decimal, ROUND_DOWN
 
-# ------------------------
-# Existing dataclasses
-# ------------------------
+# ---------- Dry-run types (unchanged so /dryrun UI stays stable) ----------
 @dataclass
 class DryRunResult:
     action_id: str
@@ -30,10 +29,10 @@ class ExecResult:
     explorer_url: str
 
 # Simple in-memory cache keyed by action_id so execute can find what dryrun showed
-_CACHE = {}
+_CACHE: Dict[str, DryRunResult] = {}
 
 def build_dryrun() -> List[DryRunResult]:
-    # No real actions yet; return one mock so UI can be tested end-to-end.
+    # Keep your existing display mock so /dryrun remains usable while strategies mature
     r = DryRunResult(
         action_id="A12",
         bot="tecbot_usdc",
@@ -52,7 +51,7 @@ def build_dryrun() -> List[DryRunResult]:
     return [r]
 
 def execute_action(action_id: str) -> ExecResult:
-    # Simulate success; replace with real send logic later
+    # Stub remains the same to avoid changing /dryrun behavior
     if action_id not in _CACHE:
         raise RuntimeError("Action not prepared (dry-run cache miss).")
     return ExecResult(
@@ -63,80 +62,106 @@ def execute_action(action_id: str) -> ExecResult:
     )
 
 # ---------------------------------------------------------------------------------
-# MANUAL TRADE SUPPORT FOR /trade (TELEGRAM)
+# MANUAL TRADE SUPPORT FOR /trade
 # ---------------------------------------------------------------------------------
 
-# Load on-chain helpers from your executor to avoid duplicating config/node/ABIs
-from web3 import Web3
-import trade_executor as TE
-
+# Light, safe imports that exist in your repo
 try:
-    from app import slippage as SLMOD
+    import config as C
 except Exception:
-    import app.slippage as SLMOD  # fallback
+    from app import config as C  # if you ever move it under app/
 
-# --- symbol mapping ---
+from app import slippage as SLMOD
+from app import wallet as W
+import trade_executor as TE
+from web3 import Web3
+
+# ---------- Helpers: token canon / fee / decimals / formatting ----------
+
 def _canon(sym: str) -> str:
-    return (sym or "").strip().upper()
-
-def _norm_in(sym: str) -> str:
-    s = _canon(sym)
-    if s == "ONE":
+    """Canonical token symbol for routing/addresses (case-insensitive)."""
+    s = (sym or "").strip()
+    u = s.upper()
+    # User 'ONE' routes as 'WONE' on pools; display stays 'ONE'
+    if u == "ONE":
         return "WONE"
-    return s
+    # Harmony sDAI symbol is mixed-case in your maps; normalize both inputs
+    if u == "1SDAI":
+        return "1sDAI"
+    return u  # 1USDC, 1ETH, TEC, WONE
 
-def _norm_out(sym: str) -> str:
-    s = _canon(sym)
-    if s == "WONE":
+def _display_sym(sym: str) -> str:
+    """What we show back to the user."""
+    u = (sym or "").upper()
+    if u == "WONE":
         return "ONE"
-    return s
+    # Preserve 1sDAI exact casing for user display
+    if u == "1SDAI":
+        return "1sDAI"
+    return u
 
-# --- address/decimals helpers (source of truth = trade_executor)
 def _addr(sym: str) -> str:
+    """Resolve symbol to checksum address via config first, then TE.FALLBACK_TOKENS."""
     s = _canon(sym)
-    if s == "ONE":
-        s = "WONE"
-    if s in TE.FALLBACK_TOKENS:
-        return Web3.to_checksum_address(TE.FALLBACK_TOKENS[s])
+    # Try config.TOKENS if present
+    tok = {k.upper(): v for k, v in getattr(C, "TOKENS", {}).items()}
+    if s in tok:
+        return Web3.to_checksum_address(tok[s])
+    # Fallback to trade_executor map
+    fe = {k.upper(): v for k, v in getattr(TE, "FALLBACK_TOKENS", {}).items()}
+    # Special: 1sDAI canonical in TE is '1sDAI' (lower s). We normalized to upper above,
+    # so map back here if needed.
+    if s == "1SDAI" and "1SDAI" not in fe and "1sDAI" in getattr(TE, "FALLBACK_TOKENS", {}):
+        return Web3.to_checksum_address(TE.FALLBACK_TOKENS["1sDAI"])
+    if s in fe:
+        return Web3.to_checksum_address(fe[s])
     raise KeyError(f"Unknown token symbol: {sym}")
 
 def _dec(sym: str) -> int:
+    """On-chain decimals for a token symbol."""
     return int(TE.get_decimals(_addr(sym)))
 
+def _fee_for_pair(token_in: str, token_out: str) -> int:
+    """
+    Read preferred fee tier from C.POOLS_V3 keys like '1USDC/1sDAI@500'.
+    Falls back to 500 if none found.
+    """
+    ins = _canon(token_in)
+    outs = _canon(token_out)
+    pools = getattr(C, "POOLS_V3", {}) or {}
+    # Keys may be like "1USDC/1sDAI@500" or "WONE/1USDC@3000"
+    for k in pools.keys():
+        try:
+            pair, fee = k.split("@", 1)
+            a, b = pair.split("/", 1)
+            if _canon(a) == ins and _canon(b) == outs:
+                return int(fee)
+            # also allow reverse check if code accidentally flips (we keep fwd here)
+        except Exception:
+            continue
+    # Default harmony tiers commonly 500 for stable/WONE
+    return 500
+
+def _fmt_amt(sym: str, val: Decimal) -> str:
+    """Human formatting aligned to your telegram_listener behavior."""
+    s = sym.upper()
+    if s == "1ETH":
+        q = Decimal("0.00000001")
+        return f"{val.quantize(q, rounding=ROUND_DOWN):f}"
+    q = Decimal("0.01")
+    return f"{val.quantize(q, rounding=ROUND_DOWN):.2f}"
+
+def _path_human_with_fee(token_in: str, token_out: str, fee: int) -> str:
+    """Display single-hop with fee like '1USDC@500→1sDAI' and ensure ONE/WONE display ok."""
+    a = _display_sym(token_in)
+    b = _display_sym(token_out)
+    return f"{a}@{fee}→{b}"
+
 def _router_addr() -> str:
-    return Web3.to_checksum_address(TE.ROUTER_ADDR_ETH)
+    return Web3.to_checksum_address(getattr(TE, "ROUTER_ADDR_ETH"))
 
-# --- parse fee from a path like "1USDC → 1SDAI@500" or "TEC → WONE@10000"
-_FEE_RE = re.compile(r"@(\d{3,5})")
-
-def _fee_from_path_text(path_text: str, default_fee: int = 500) -> int:
-    if not path_text:
-        return default_fee
-    m = _FEE_RE.search(path_text)
-    if not m:
-        return default_fee
-    try:
-        return int(m.group(1))
-    except Exception:
-        return default_fee
-
-# --- path inspection utilities ---
-def _is_single_hop_display(path_text: str) -> bool:
-    if not path_text:
-        return False
-    # Count arrows ignoring fee annotation
-    hops = [p.strip() for p in path_text.split("→")]
-    return len(hops) == 2  # tokenA → tokenB
-
-# --- preview text builder (human-friendly, mirrors /dryrun tone) ---
-def _preview_exact_input(path_text_display: str, amount_in_wei: int, min_out_wei: int, deadline_s: int = 600) -> str:
-    return (
-        f"exactInput(path=[{path_text_display.replace(' ', '')}], "
-        f"amountIn={amount_in_wei}, amountOutMin={min_out_wei}, deadline=now+{deadline_s}s)"
-    )
-
+# ---------- Result container for /trade preview ----------
 class ManualQuoteResult(NamedTuple):
-    # This mirrors what telegram_listener.render_dryrun() expects
     action_id: str
     bot: str
     path_text: str
@@ -153,6 +178,7 @@ class ManualQuoteResult(NamedTuple):
     slippage_ok: bool
     approval_required_amount_text: Optional[str]
 
+# ---------- Core: build_manual_quote ----------
 def build_manual_quote(
     wallet_key: str,
     token_in: str,
@@ -160,30 +186,28 @@ def build_manual_quote(
     amount_in: Decimal,
     slippage_bps: int
 ) -> ManualQuoteResult:
-    """
-    Dryrun-style preview for a specific manual trade request.
-    No broadcast here.
-    """
-    t_in_norm  = _norm_in(token_in)
-    t_out_norm = _norm_in(token_out)
 
-    # 1) Live quote (path + amount_out + impact) via your slippage module
-    slip_info = SLMOD.compute_slippage(
+    t_in_norm  = _canon(token_in)
+    t_out_norm = _canon(token_out)
+
+    # Ask the slippage module for a live quote (and path if multi-hop in the future)
+    slip = SLMOD.compute_slippage(
         t_in_norm,
         t_out_norm,
         amount_in,
         slippage_bps=slippage_bps
     )
-    if not slip_info:
+    if not slip:
+        # Sentinel failure
         return ManualQuoteResult(
             action_id="manual",
             bot=wallet_key,
-            path_text=f"{token_in} → {token_out}",
-            amount_in_text=f"{amount_in:,.2f} {token_in}",
-            quote_out_text=f"~? {token_out}",
+            path_text=f"{_display_sym(token_in)} → {_display_sym(token_out)}",
+            amount_in_text=f"{_fmt_amt(token_in, amount_in)} {_display_sym(token_in)}",
+            quote_out_text=f"~? {_display_sym(token_out)}",
             impact_bps=None,
             slippage_bps=slippage_bps,
-            min_out_text=f"? {token_out}",
+            min_out_text=f"? {_display_sym(token_out)}",
             gas_estimate=0,
             allowance_ok=False,
             nonce=0,
@@ -192,32 +216,23 @@ def build_manual_quote(
             approval_required_amount_text=None,
         )
 
-    quoted_out      = slip_info.get("amount_out")
-    min_out_amt     = slip_info.get("min_out")
-    impact_bps_val  = slip_info.get("impact_bps")
-    path_text_route = slip_info.get("path_text", f"{t_in_norm} → {t_out_norm}")
-    path_text_disp  = path_text_route.replace("WONE", "ONE")  # user-facing ONE
+    quoted_out  = slip.get("amount_out")            # Decimal
+    min_out     = slip.get("min_out")               # Decimal
+    impact_bps  = slip.get("impact_bps")            # float
+    # Your slippage.compute_slippage already formats path with @fee; keep single-hop here
+    fee = _fee_for_pair(t_in_norm, t_out_norm)
+    path_text = _path_human_with_fee(t_in_norm, t_out_norm, fee)
 
-    # Human formatting (consistent with telegram_listener)
-    def _fmt_amt(sym: str, val: Decimal) -> str:
-        if sym.upper() == "1ETH":
-            return f"{val:.8f}".rstrip("0").rstrip(".")
-        return f"{val:,.2f}"
-
-    amount_in_text  = f"{_fmt_amt(token_in, amount_in)} {token_in}"
-    quote_out_text  = f"{_fmt_amt(token_out, quoted_out)} {token_out}" if quoted_out is not None else f"~? {token_out}"
-    min_out_text    = f"{_fmt_amt(token_out, min_out_amt)} {token_out}" if min_out_amt is not None else f"? {token_out}"
-
-    # Simple sanity: if price impact already exceeds selected slippage, flag
-    slippage_ok_flag = True
+    # Guard: if price impact exceeds user slippage choice, we’ll mark not-ok
+    slippage_ok = True
     try:
-        if impact_bps_val is not None and slippage_bps is not None:
-            if float(impact_bps_val) > float(slippage_bps):
-                slippage_ok_flag = False
+        if impact_bps is not None and slippage_bps is not None:
+            if float(impact_bps) > float(slippage_bps):
+                slippage_ok = False
     except Exception:
         pass
 
-    # 2) Allowance / Gas / Nonce / tx_preview using TE's node+ABI
+    # Pull allowance/gas/nonce/preview via internal prepare (real, no broadcast)
     details = _prepare_manual_trade_for_wallet(
         wallet_key=wallet_key,
         token_in=t_in_norm,
@@ -225,32 +240,31 @@ def build_manual_quote(
         amount_in=amount_in,
         slippage_bps=slippage_bps,
         quoted_out=quoted_out,
-        min_out=min_out_amt,
+        min_out=min_out,
     )
 
-    gas_estimate_val   = int(details.get("gas_estimate", 0))
-    allowance_ok_flag  = bool(details.get("allowance_ok", False))
-    approval_text      = details.get("approve_amount_text")
-    next_nonce         = int(details.get("nonce", 0))
-    tx_preview_display = details.get("tx_preview_text", "(tx preview unavailable)")
+    amount_in_text = f"{_fmt_amt(token_in, amount_in)} {_display_sym(token_in)}"
+    quote_out_text = f"{_fmt_amt(token_out, quoted_out)} {_display_sym(token_out)}" if quoted_out is not None else f"~? {_display_sym(token_out)}"
+    min_out_text   = f"{_fmt_amt(token_out, min_out)} {_display_sym(token_out)}" if min_out is not None else f"? {_display_sym(token_out)}"
 
     return ManualQuoteResult(
         action_id="manual",
         bot=wallet_key,
-        path_text=path_text_disp,
+        path_text=path_text,
         amount_in_text=amount_in_text,
         quote_out_text=quote_out_text,
-        impact_bps=impact_bps_val,
+        impact_bps=impact_bps,
         slippage_bps=slippage_bps,
         min_out_text=min_out_text,
-        gas_estimate=gas_estimate_val,
-        allowance_ok=allowance_ok_flag,
-        nonce=next_nonce,
-        tx_preview_text=tx_preview_display,
-        slippage_ok=slippage_ok_flag,
-        approval_required_amount_text=approval_text,
+        gas_estimate=int(details.get("gas_estimate", 0)),
+        allowance_ok=bool(details.get("allowance_ok", False)),
+        nonce=int(details.get("nonce", 0)),
+        tx_preview_text=str(details.get("tx_preview_text", "(tx preview unavailable)")),
+        slippage_ok=slippage_ok,
+        approval_required_amount_text=details.get("approve_amount_text"),
     )
 
+# ---------- Internal: allowance/gas/nonce/preview (no broadcast) ----------
 def _prepare_manual_trade_for_wallet(
     wallet_key: str,
     token_in: str,
@@ -260,102 +274,80 @@ def _prepare_manual_trade_for_wallet(
     quoted_out: Optional[Decimal],
     min_out: Optional[Decimal],
 ) -> Dict[str, Any]:
-    """
-    INTERNAL SUPPORT (no broadcast):
-      - check allowance for EXACT amount
-      - build router exactInput call and estimate gas
-      - get next nonce
-      - produce a readable tx preview
-    """
-    w3 = TE.w3  # reuse same provider
-    router = _router_addr()
 
-    # Resolve addresses/decimals
+    owner = W.WALLETS.get(wallet_key) or ""
+    if not owner:
+        raise RuntimeError(f"Unknown wallet key: {wallet_key}")
+
     addr_in  = _addr(token_in)
     addr_out = _addr(token_out)
-    dec_in   = _dec(token_in)
-    dec_out  = _dec(token_out)
 
-    amount_in_wei = int(Decimal(amount_in) * (Decimal(10) ** dec_in))
+    dec_in  = _dec(token_in)
+    dec_out = _dec(token_out)
 
-    # If caller didn't pass min_out, compute with selected slippage against a fresh quote
-    if min_out is None:
-        # Build path bytes and quote via QuoterV1
-        fee = 500  # default; UI normally yields a fee in the path_text, but we may not have it here
-        path_bytes = TE._v3_path_bytes(addr_in, fee, addr_out)
-        quoted = TE.quote_v3_exact_input(path_bytes, int(amount_in_wei))
-        min_out_wei = max(1, (int(quoted) * (10_000 - int(slippage_bps))) // 10_000)
-    else:
-        min_out_wei = int(Decimal(min_out) * (Decimal(10) ** dec_out))
+    amount_in_wei = int((amount_in * (Decimal(10) ** dec_in)).to_integral_value(rounding=ROUND_DOWN))
 
-    # Allowance check against router for EXACT amount
-    owner_eth = None
+    # If min_out not provided by slippage, compute from quoted_out + chosen slippage
+    if min_out is None and quoted_out is not None:
+        min_out = quoted_out * (Decimal(10000 - int(slippage_bps)) / Decimal(10000))
+
+    min_out_wei = 1
+    if min_out is not None:
+        min_out_wei = int((min_out * (Decimal(10) ** dec_out)).to_integral_value(rounding=ROUND_DOWN))
+
+    router = _router_addr()
+
+    # Allowance check for EXACT amount (no unlimited approvals here)
+    allowance = TE.get_allowance(owner, addr_in, router)
+    allowance_ok = int(allowance) >= int(amount_in_wei)
+    approve_text = None if allowance_ok else f"{_fmt_amt(token_in, amount_in)} {_display_sym(token_in)}"
+
+    # Build tx data for preview + gas estimate (same function signature as send path)
+    fee = _fee_for_pair(token_in, token_out)
+    path_bytes = TE._v3_path_bytes(addr_in, fee, addr_out)
     try:
-        # In your env, wallet private keys are loaded inside TE._get_account(wallet_key)
-        # We can't call _get_account here (it's private), but allowance doesn't require it.
-        # Use WALLETS from root wallet module through TE.FALLBACK_TOKENS? Not needed:
-        # We only need the owner address for nonce; TE.swap* will sign later.
-        from wallet import WALLETS  # root wallet.py
-        owner_eth = Web3.to_checksum_address(WALLETS[wallet_key])
-    except Exception:
-        owner_eth = None
-
-    allowance_ok = False
-    approve_text = None
-    try:
-        current = TE.get_allowance(owner_eth, addr_in, router) if owner_eth else 0
-        allowance_ok = (int(current) >= int(amount_in_wei))
-        if not allowance_ok:
-            # show the EXACT amount needing approval (human units)
-            approve_text = f"{amount_in:,.2f} {token_in}"
-    except Exception:
-        allowance_ok = False
-
-    # Build router exactInput and estimate gas (with headroom like trade_executor does)
-    from web3.contract import Contract
-    router_c: Contract = w3.eth.contract(address=router, abi=TE.ROUTER_EXACT_INPUT_ABI)
-    path_bytes = TE._v3_path_bytes(addr_in, 500, addr_out)  # preview uses fee=500 here; execution will parse actual fee
-    fn = router_c.functions.exactInput(path_bytes, int(amount_in_wei), int(min_out_wei), owner_eth or router, int(w3.eth.get_block("latest")["timestamp"] + 600))
-    try:
-        data = fn._encode_transaction_data()
-    except AttributeError:
-        data = fn.encode_abi()
-
-    gas_est = 300_000
-    try:
+        # We use Quoter for the preview quote (already done in slippage), now encode swap
+        router_c = TE.w3.eth.contract(address=router, abi=TE.ROUTER_EXACT_INPUT_ABI)
+        fn = router_c.functions.exactInput(path_bytes, int(amount_in_wei), int(min_out_wei), Web3.to_checksum_address(owner), int(TE.time.time()) + 600)
+        try:
+            data = fn._encode_transaction_data()
+        except AttributeError:
+            data = fn.encode_abi()
+        # Estimate gas with headroom inline (like TE.swap_v3_exact_input_once)
         tx = {
             "to": router,
             "value": 0,
             "data": data,
             "chainId": TE.HMY_CHAIN_ID,
-            "nonce": w3.eth.get_transaction_count(owner_eth) if owner_eth else 0,
-            "gasPrice": w3.eth.gas_price,
+            "nonce": TE.w3.eth.get_transaction_count(Web3.to_checksum_address(owner)),
+            "gasPrice": TE._current_gas_price_wei_capped() if hasattr(TE, "_current_gas_price_wei_capped") else W.suggest_gas_price_wei(),
         }
-        est = w3.eth.estimate_gas({**tx, "from": owner_eth}) if owner_eth else 300_000
-        gas_est = max(min(int(est * 1.5), 1_500_000), 300_000)
+        try:
+            est = TE.w3.eth.estimate_gas({**tx, "from": Web3.to_checksum_address(owner)})
+            gas = max(min(int(est * 1.5), 1_500_000), 300_000)
+        except Exception:
+            gas = 300_000
     except Exception:
-        pass
+        gas = 300_000
+        data = b""
 
-    # Nonce
-    next_nonce = 0
-    try:
-        if owner_eth:
-            next_nonce = int(w3.eth.get_transaction_count(owner_eth))
-    except Exception:
-        next_nonce = 0
+    # Pretty tx preview (matches your dryrun style)
+    tx_preview_text = (
+        f"exactInput(path=[{_display_sym(token_in)}@{fee}→{_display_sym(token_out)}], "
+        f"amountIn={amount_in_wei}, amountOutMin={min_out_wei}, deadline=now+600s)"
+    )
 
-    # Human preview string
-    path_text_display = f"{_norm_out(token_in)}@500→{_norm_out(token_out)}"
-    tx_preview = _preview_exact_input(path_text_display, int(amount_in_wei), int(min_out_wei))
+    nonce = TE.w3.eth.get_transaction_count(Web3.to_checksum_address(owner))
 
     return {
-        "gas_estimate": int(gas_est),
-        "allowance_ok": bool(allowance_ok),
+        "gas_estimate": gas,
+        "allowance_ok": allowance_ok,
         "approve_amount_text": approve_text,
-        "nonce": int(next_nonce),
-        "tx_preview_text": tx_preview,
+        "nonce": int(nonce),
+        "tx_preview_text": tx_preview_text,
     }
 
+# ---------- Execute: approve (if needed) + send (single-hop) ----------
 def execute_manual_quote(
     wallet_key: str,
     token_in: str,
@@ -363,35 +355,26 @@ def execute_manual_quote(
     amount_in: Decimal,
     slippage_bps: int
 ) -> Dict[str, Any]:
-    """
-    Broadcast the trade prepared in build_manual_quote().
-    Steps:
-      1) parse single-hop fee from the path
-      2) approve_if_needed(EXACT amount)
-      3) swap_v3_exact_input_once(...)
-    """
-    # Build a fresh quote to (a) get path fee and (b) block if multi-hop
-    q = build_manual_quote(wallet_key, token_in, token_out, amount_in, slippage_bps)
 
-    if not _is_single_hop_display(q.path_text):
-        # Safety: we only enable single-hop sends through TE.swap_v3_exact_input_once
-        raise RuntimeError("Multi-hop send not enabled (path: %s)" % q.path_text)
+    owner = W.WALLETS.get(wallet_key) or ""
+    if not owner:
+        raise RuntimeError(f"Unknown wallet key: {wallet_key}")
 
-    fee = _fee_from_path_text(q.path_text, default_fee=500)
+    addr_in  = _addr(token_in)
+    addr_out = _addr(token_out)
+    router   = _router_addr()
 
-    # Resolve addresses/decimals + compute amount_in_wei
-    sym_in_norm  = _norm_in(token_in)
-    sym_out_norm = _norm_in(token_out)
-    addr_in  = _addr(sym_in_norm)
-    addr_out = _addr(sym_out_norm)
-    dec_in   = _dec(sym_in_norm)
-    amount_in_wei = int(Decimal(amount_in) * (Decimal(10) ** dec_in))
+    dec_in  = _dec(token_in)
+    dec_out = _dec(token_out)
 
-    # 1) Approval (EXACT amount, no unlimited)
-    TE.approve_if_needed(wallet_key, addr_in, _router_addr(), int(amount_in_wei))
+    amount_in_wei = int((amount_in * (Decimal(10) ** dec_in)).to_integral_value(rounding=ROUND_DOWN))
 
-    # 2) Execute (sign+send) via executor’s exactInput wrapper
-    send_res = TE.swap_v3_exact_input_once(
+    # Approve exact if needed (no unlimited)
+    TE.approve_if_needed(wallet_key, addr_in, router, int(amount_in_wei))
+
+    # Single-hop send (current executor supports one hop cleanly)
+    fee = _fee_for_pair(token_in, token_out)
+    res = TE.swap_v3_exact_input_once(
         wallet_key=wallet_key,
         token_in=addr_in,
         token_out=addr_out,
@@ -400,11 +383,13 @@ def execute_manual_quote(
         slippage_bps=int(slippage_bps),
         deadline_s=600
     )
-    txh = send_res.get("tx_hash", "")
-    filled = f"Executed manual swap {amount_in:,.2f} {token_in} → {token_out}"
+    txh = res.get("tx_hash", "")
+    min_out_wei = int(res.get("amount_out_min", "0") or 0)
+    min_out = (Decimal(min_out_wei) / (Decimal(10) ** dec_out)) if min_out_wei > 0 else Decimal("0")
+
     return {
         "tx_hash": txh,
-        "filled_text": filled,
-        "gas_used": 0,            # not returned by the executor; explorer shows final gas
-        "explorer_url": "",       # alert already includes clickable explorer link
+        "filled_text": f"Sent {_fmt_amt(token_in, amount_in)} {_display_sym(token_in)} → min {_fmt_amt(token_out, min_out)} {_display_sym(token_out)}",
+        "gas_used": 0,   # you can enrich later with a receipt read if desired
+        "explorer_url": f"https://explorer.harmony.one/tx/{txh}" if txh else "",
     }
