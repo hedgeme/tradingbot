@@ -1,30 +1,27 @@
-# /bot/app/trade_executor.py
+# /bot/trade_executor.py
 import os
 import re
 import json
 import time
 import struct
+import subprocess
 from pathlib import Path
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List
 
 from dotenv import load_dotenv
 from web3 import Web3
-from eth_abi import encode as abi_encode  # installed with web3 v7
 
 from app.alert import (
     alert_trade_success,
     alert_trade_failure,
-    alert_preflight_fail,  # used for readyness issues
+    alert_preflight_fail,
 )
 from app.wallet import (
     WALLETS,
-    get_w3,
-    get_native_balance_wei,
-    get_erc20_balance_wei,
 )
 
 # -----------------------------------------------------------------------------
-# Config
+# Config / RPC
 # -----------------------------------------------------------------------------
 load_dotenv("/home/tecviva/.env")
 
@@ -33,19 +30,24 @@ HMY_CHAIN_ID  = int(os.getenv("HMY_CHAIN_ID", "1666600000"))
 GAS_CAP_GWEI  = int(os.getenv("GAS_CAP_GWEI", "150"))
 APP_DIR       = Path("/bot/app")
 
-# Known verified router (Uniswap V3 SwapRouter02 on Harmony)
+# Web3 provider
+w3 = Web3(Web3.HTTPProvider(HMY_NODE, request_kwargs={"timeout": 25}))
+
+def _current_gas_price_wei_capped() -> int:
+    """Harmony mostly uses legacy gasPrice. Cap by GAS_CAP_GWEI."""
+    cap = int(GAS_CAP_GWEI) * 10**9 if int(GAS_CAP_GWEI) > 0 else None
+    try:
+        gp = int(w3.eth.gas_price)
+        return min(gp, cap) if cap else gp
+    except Exception:
+        # Fallback 50 gwei if RPC hiccups
+        return (50 * 10**9) if cap is None else cap
+
+# -----------------------------------------------------------------------------
+# SwapRouter / Quoter (Uniswap V3 on Harmony, verified)
+# -----------------------------------------------------------------------------
 ROUTER_ADDR_ETH = Web3.to_checksum_address("0x85495f44768ccbb584d9380Cc29149fDAA445F69")
-
-# Harmony Quoter (V1 style: quoteExactInput(bytes,uint256))
-QUOTER_V1_ADDR = Web3.to_checksum_address("0x314456E8F5efaa3dD1F036eD5900508da8A3B382")
-
-# Minimal ABIs
-ERC20_ABI = [
-    {"constant": True, "inputs": [], "name": "decimals", "outputs": [{"name": "","type": "uint8"}], "stateMutability": "view","type": "function"},
-    {"constant": True, "inputs": [{"name":"owner","type":"address"},{"name":"spender","type":"address"}], "name":"allowance", "outputs":[{"name":"","type":"uint256"}], "stateMutability":"view", "type":"function"},
-    {"constant": False, "inputs": [{"name":"spender","type":"address"},{"name":"amount","type":"uint256"}], "name":"approve", "outputs":[{"name":"","type":"bool"}], "stateMutability":"nonpayable", "type":"function"},
-    {"constant": True, "inputs": [{"name":"account","type":"address"}], "name":"balanceOf", "outputs":[{"name":"","type":"uint256"}], "stateMutability":"view", "type":"function"},
-]
+QUOTER_V1_ADDR  = Web3.to_checksum_address("0x314456E8F5efaa3dD1F036eD5900508da8A3B382")
 
 ROUTER_EXACT_INPUT_ABI = [{
     "inputs":[
@@ -68,22 +70,18 @@ QUOTER_V1_ABI = [{
     "stateMutability":"nonpayable","type":"function"
 }]
 
-# Web3 provider
-w3 = Web3(Web3.HTTPProvider(HMY_NODE, request_kwargs={"timeout": 25}))
-
 # -----------------------------------------------------------------------------
-# Token address discovery (from verified_info.md with fallbacks)
+# Tokens (from verified_info.md with fallbacks)
 # -----------------------------------------------------------------------------
 VERIFIED_INFO = APP_DIR / "verified_info.md"
 
 FALLBACK_TOKENS: Dict[str, str] = {
-    # Verified ETH-format addresses (case-insensitive; we checksum on return)
     "WONE":  "0xcF664087a5bB0237a0BAd6742852ec6c8d69A27a",
     "1ETH":  "0x4cc435d7b9557d54d6ef02d69bbf72634905bf11",
     "1USDC": "0xbc594cabd205bd993e7ffa6f3e9cea75c1110da5",
     "TEC":   "0x0deb9a1998aae32daacf6de21161c3e942ace074",
     "1sDAI": "0xedeb95d51dbc4116039435379bd58472a2c09b1f",
-    # Extras we saw in verified_info.md:
+    # useful infra addrs captured in your doc:
     "FactoryV3": "0x12d21f5d0Ab768c312E19653Bf3f89917866B8e8",
     "TickLens":  "0x2D7B3ae07fE5E1d9da7c2C79F953339D0450a017",
     "NFPM":      "0xE4E259BE9c84260FDC7C9a3629A0410b1Fb3C114",
@@ -95,7 +93,7 @@ def _parse_verified_addresses() -> Dict[str, str]:
         return mapping
     text = VERIFIED_INFO.read_text()
 
-    # Parse markdown table rows like: | Asset | SYMBOL | 0x... |
+    # markdown rows like: | ... | SYMBOL | 0x... |
     for line in text.splitlines():
         s = line.strip()
         if not s.startswith("|") or "0x" not in s:
@@ -110,7 +108,7 @@ def _parse_verified_addresses() -> Dict[str, str]:
         except StopIteration:
             pass
 
-    # Also capture loose lines "SYMBOL ... 0x.."
+    # loose lines "SYMBOL ... 0x.."
     for line in text.splitlines():
         if "0x" not in line:
             continue
@@ -124,19 +122,29 @@ def _parse_verified_addresses() -> Dict[str, str]:
 
 def get_token_address(symbol: str) -> str:
     parsed = _parse_verified_addresses()
-    merged = {**FALLBACK_TOKENS, **parsed}  # file wins
+    merged = {**FALLBACK_TOKENS, **parsed}
     key = symbol.strip()
     if key in merged:
         return Web3.to_checksum_address(merged[key])
     raise ValueError(f"Token symbol not found: {symbol} (have {sorted(merged.keys())})")
 
 def _find_router_address() -> str:
-    # If you add routing by reading from verified_info.md later, put it here.
     return ROUTER_ADDR_ETH
 
 # -----------------------------------------------------------------------------
-# Read-only ERC-20 helpers
+# ERC-20 minimal
 # -----------------------------------------------------------------------------
+ERC20_ABI = [
+    {"constant": True,  "inputs": [], "name": "decimals",
+     "outputs": [{"name":"","type":"uint8"}], "stateMutability":"view", "type":"function"},
+    {"constant": True,  "inputs": [{"name":"owner","type":"address"},{"name":"spender","type":"address"}],
+     "name":"allowance", "outputs":[{"name":"","type":"uint256"}], "stateMutability":"view", "type":"function"},
+    {"constant": False, "inputs": [{"name":"spender","type":"address"},{"name":"amount","type":"uint256"}],
+     "name":"approve",   "outputs":[{"name":"","type":"bool"}],     "stateMutability":"nonpayable", "type":"function"},
+    {"constant": True,  "inputs": [{"name":"account","type":"address"}],
+     "name":"balanceOf", "outputs":[{"name":"","type":"uint256"}], "stateMutability":"view", "type":"function"},
+]
+
 def _erc20(token_addr: str):
     return w3.eth.contract(address=Web3.to_checksum_address(token_addr), abi=ERC20_ABI)
 
@@ -156,7 +164,102 @@ def get_balance(owner_eth: str, token_addr: str) -> int:
     return int(c.functions.balanceOf(Web3.to_checksum_address(owner_eth)).call())
 
 # -----------------------------------------------------------------------------
-# Approve-if-needed (ERC-20)
+# GPG-based key management
+# -----------------------------------------------------------------------------
+# Default secret files — you can override with env:
+#   SECRET_PATH_TECBOT_USDC, SECRET_PATH_TECBOT_SDAI, SECRET_PATH_TECBOT_ETH, SECRET_PATH_TECBOT_TEC
+# Each file contains the hex private key (with or without 0x), GPG-encrypted.
+_DEFAULT_SECRET_DIR = Path(os.getenv("SECRETS_DIR", "/home/tecviva/.secrets"))
+
+_SECRET_FILE_BY_WALLET: Dict[str, Path] = {
+    "tecbot_usdc": _DEFAULT_SECRET_DIR / "tecbot_usdc.pass.gpg",
+    "tecbot_sdai": _DEFAULT_SECRET_DIR / "tecbot_sdai.pass.gpg",
+    "tecbot_eth":  _DEFAULT_SECRET_DIR / "tecbot_eth.pass.gpg",
+    "tecbot_tec":  _DEFAULT_SECRET_DIR / "tecbot_tec.pass.gpg",
+}
+
+def _secret_path_for(wallet_key: str) -> Path:
+    env_name = f"SECRET_PATH_{wallet_key.upper()}"
+    override = os.getenv(env_name)
+    if override:
+        return Path(override)
+    return _SECRET_FILE_BY_WALLET.get(wallet_key, _DEFAULT_SECRET_DIR / f"{wallet_key}.pass.gpg")
+
+def _gpg_decrypt_file(path: Path) -> str:
+    """
+    Decrypts a GPG file and returns the plaintext string.
+    Requires gpg-agent to be unlocked (your gpgcheck helper handles this).
+    """
+    if not path.exists():
+        raise FileNotFoundError(f"Secret file not found: {path}")
+    try:
+        out = subprocess.check_output(
+            ["gpg", "--quiet", "--batch", "--decrypt", str(path)],
+            stderr=subprocess.STDOUT,
+            timeout=10,
+        )
+        return out.decode().strip()
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"GPG decrypt failed for {path}: {e.output.decode().strip()}") from e
+
+def _get_account(wallet_key: str):
+    """
+    Returns a signer account for wallet_key using GPG-decrypted secret.
+    Falls back to env PKs if present (optional).
+    """
+    # 1) Try GPG file
+    pk = None
+    try:
+        pk = _gpg_decrypt_file(_secret_path_for(wallet_key))
+    except Exception as e:
+        # 2) Optional env PK fallback
+        for k in (
+            f"PRIVKEY_{wallet_key.upper()}",
+            f"PK_{wallet_key.upper()}",
+            f"{wallet_key.upper()}_PRIVKEY",
+        ):
+            v = os.getenv(k)
+            if v and v.strip():
+                pk = v.strip()
+                break
+        if pk is None:
+            raise RuntimeError(f"Private key unavailable for {wallet_key}: {e}")
+
+    if not pk:
+        raise RuntimeError(f"Private key empty for {wallet_key}")
+
+    if not pk.startswith("0x"):
+        pk = "0x" + pk
+
+    acct = w3.eth.account.from_key(pk)
+
+    # Optional sanity vs configured address
+    try:
+        configured = (WALLETS.get(wallet_key) or "").strip()
+        if configured:
+            conf = Web3.to_checksum_address(configured)
+            if conf != Web3.to_checksum_address(acct.address):
+                print(f"[trade_executor] WARNING: signer {acct.address} != configured {conf} for {wallet_key}")
+    except Exception:
+        pass
+
+    return acct
+
+# -----------------------------------------------------------------------------
+# V3 quoting helpers
+# -----------------------------------------------------------------------------
+def _v3_path_bytes(token_in: str, fee: int, token_out: str) -> bytes:
+    """tokenIn(20) + fee(uint24 BE) + tokenOut(20)"""
+    def _addr(a: str) -> bytes: return bytes.fromhex(Web3.to_checksum_address(a)[2:])
+    def _fee(f: int) -> bytes:  return struct.pack(">I", int(f))[1:]
+    return _addr(token_in) + _fee(fee) + _addr(token_out)
+
+def quote_v3_exact_input(path_bytes: bytes, amount_in_wei: int) -> int:
+    quoter = w3.eth.contract(address=QUOTER_V1_ADDR, abi=QUOTER_V1_ABI)
+    return int(quoter.functions.quoteExactInput(path_bytes, int(amount_in_wei)).call())
+
+# -----------------------------------------------------------------------------
+# Approve-if-needed
 # -----------------------------------------------------------------------------
 def approve_if_needed(wallet_key: str,
                       token_addr: str,
@@ -203,22 +306,11 @@ def approve_if_needed(wallet_key: str,
         alert_trade_failure("approve", "erc20.approve", str(e))
         raise
 
-    # No wait needed here; router read will see allowance after inclusion
     return {"tx_hash": txh, "allowance_before": str(current)}
 
 # -----------------------------------------------------------------------------
-# V3 quoting & swapping (exactInput path-bytes)
+# V3 swap — exactInput (single hop)
 # -----------------------------------------------------------------------------
-def _v3_path_bytes(token_in: str, fee: int, token_out: str) -> bytes:
-    """tokenIn(20) + fee(uint24 BE) + tokenOut(20)"""
-    def _addr(a: str) -> bytes: return bytes.fromhex(Web3.to_checksum_address(a)[2:])
-    def _fee(f: int) -> bytes:  return struct.pack(">I", int(f))[1:]
-    return _addr(token_in) + _fee(fee) + _addr(token_out)
-
-def quote_v3_exact_input(path_bytes: bytes, amount_in_wei: int) -> int:
-    quoter = w3.eth.contract(address=QUOTER_V1_ADDR, abi=QUOTER_V1_ABI)
-    return int(quoter.functions.quoteExactInput(path_bytes, int(amount_in_wei)).call())
-
 def swap_exact_tokens_for_tokens(wallet_key: str,
                                  amount_in_wei: int,
                                  amount_out_min_wei: int,
@@ -227,9 +319,7 @@ def swap_exact_tokens_for_tokens(wallet_key: str,
                                  gas_limit: int = 900_000,
                                  v3_fee: int = 500) -> Dict[str, Any]:
     """
-    Backward-compatible signature, but internally we do V3 exactInput(path bytes).
-    - path_eth should be [token_in, token_out] for single-hop.
-    - If deadline_ts is None, uses now + 600s.
+    MVP: single hop path [token_in, token_out] via V3 exactInput
     """
     if len(path_eth) != 2:
         raise ValueError("This MVP only supports single-hop path [token_in, token_out]")
@@ -240,9 +330,9 @@ def swap_exact_tokens_for_tokens(wallet_key: str,
     token_out = Web3.to_checksum_address(path_eth[1])
     router    = w3.eth.contract(address=_find_router_address(), abi=ROUTER_EXACT_INPUT_ABI)
 
-    # Build path bytes and (re)quote to set minOut if caller passed a tiny sentinel
     path_bytes = _v3_path_bytes(token_in, v3_fee, token_out)
 
+    # if caller passed tiny sentinel, re-quote and set minOut with default 0.5%
     if amount_out_min_wei <= 1:
         try:
             quoted = quote_v3_exact_input(path_bytes, int(amount_in_wei))
@@ -252,11 +342,9 @@ def swap_exact_tokens_for_tokens(wallet_key: str,
         if quoted <= 0:
             alert_trade_failure(f"{token_in}->{token_out}", "quote", "Quote returned 0")
             raise RuntimeError("Quote returned 0")
-        # default 0.5% slippage
         amount_out_min_wei = max(1, (quoted * 995) // 1000)
 
     deadline = int(deadline_ts) if deadline_ts else int(time.time()) + 600
-
     fn = router.functions.exactInput(
         path_bytes,
         int(amount_in_wei),
@@ -286,7 +374,6 @@ def swap_exact_tokens_for_tokens(wallet_key: str,
         gas = gas_limit
     tx["gas"] = gas
 
-    # Sign & send
     try:
         signed = acct.sign_transaction(tx)
         txh = w3.eth.send_raw_transaction(signed.raw_transaction).hex()
@@ -294,7 +381,6 @@ def swap_exact_tokens_for_tokens(wallet_key: str,
         alert_trade_failure(f"{path_eth[0]}->{path_eth[1]}", "swap", f"sign/send error: {e}")
         raise
 
-    # Success alert (with explorer link inside alert)
     alert_trade_success(
         f"{path_eth[0]}->{path_eth[1]} (v3 exactInput {v3_fee})",
         "swap",
@@ -305,7 +391,7 @@ def swap_exact_tokens_for_tokens(wallet_key: str,
     return {"tx_hash": txh, "path": path_eth, "amount_out_min": str(amount_out_min_wei)}
 
 # -----------------------------------------------------------------------------
-# Convenience single-hop V3 with internal quoting
+# Convenience single-hop wrapper
 # -----------------------------------------------------------------------------
 def swap_v3_exact_input_once(wallet_key: str,
                              token_in: str,
@@ -314,12 +400,6 @@ def swap_v3_exact_input_once(wallet_key: str,
                              fee: int = 500,
                              slippage_bps: int = 50,
                              deadline_s: int = 600) -> Dict[str, Any]:
-    """
-    Simpler API:
-      - Quotes via QuoterV1
-      - Sets minOut = quote * (1 - slippage_bps/10_000)
-      - Calls exactInput and alerts
-    """
     acct = _get_account(wallet_key)
     owner_eth = Web3.to_checksum_address(acct.address)
 
@@ -375,11 +455,10 @@ def swap_v3_exact_input_once(wallet_key: str,
     return {"tx_hash": txh, "amount_out_min": str(min_out), "path": [token_in, token_out]}
 
 # -----------------------------------------------------------------------------
-# Simple self-test (no on-chain send)
+# Self-test (no tx send)
 # -----------------------------------------------------------------------------
 if __name__ == "__main__":
     try:
-        # Smoke: ensure router reachable and token parsing works
         print("NODE:", HMY_NODE)
         print("Router:", _find_router_address())
         print("Parsed tokens:", json.dumps(_parse_verified_addresses(), indent=2))
