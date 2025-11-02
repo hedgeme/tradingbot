@@ -101,20 +101,23 @@ def _display_sym(sym: str) -> str:
     return u
 
 def _addr(sym: str) -> str:
-    """Resolve symbol to checksum address via config first, then TE.FALLBACK_TOKENS."""
-    s = _canon(sym)
-    # Try config.TOKENS if present
-    tok = {k.upper(): v for k, v in getattr(C, "TOKENS", {}).items()}
-    if s in tok:
-        return Web3.to_checksum_address(tok[s])
-    # Fallback to trade_executor map
-    fe = {k.upper(): v for k, v in getattr(TE, "FALLBACK_TOKENS", {}).items()}
-    # Special: 1sDAI canonical in TE is '1sDAI' (lower s). We normalized to upper above,
-    # so map back here if needed.
-    if s == "1SDAI" and "1SDAI" not in fe and "1sDAI" in getattr(TE, "FALLBACK_TOKENS", {}):
-        return Web3.to_checksum_address(TE.FALLBACK_TOKENS["1sDAI"])
-    if s in fe:
-        return Web3.to_checksum_address(fe[s])
+    """
+    Resolve symbol to checksum address via config first, then TE.FALLBACK_TOKENS.
+    Case-insensitive matching; supports 1sDAI/1SDAI, ONE/WONE, etc.
+    """
+    s = _canon(sym)            # e.g. "1sDAI"
+    su = s.upper()             # e.g. "1SDAI"
+
+    # Try config.TOKENS first (case-insensitive)
+    tok_map = {k.upper(): v for k, v in getattr(C, "TOKENS", {}).items()}
+    if su in tok_map:
+        return Web3.to_checksum_address(tok_map[su])
+
+    # Fallback to trade_executor.FALLBACK_TOKENS (case-insensitive)
+    fe_map = {k.upper(): v for k, v in getattr(TE, "FALLBACK_TOKENS", {}).items()}
+    if su in fe_map:
+        return Web3.to_checksum_address(fe_map[su])
+
     raise KeyError(f"Unknown token symbol: {sym}")
 
 def _dec(sym: str) -> int:
