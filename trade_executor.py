@@ -1,4 +1,18 @@
+#!/usr/bin/env python3
 # /bot/trade_executor.py
+#
+# On-chain execution helpers:
+#   - Token discovery (from verified_info.md + fallbacks)
+#   - GPG-based private key loading for tecbot_* wallets
+#   - ERC-20 read helpers (decimals, allowance, balance)
+#   - Uniswap V3 exactInput (single-hop) swap + quoting
+#   - approve_if_needed for ERC-20
+#
+# IMPORTANT:
+#   - We NEVER print or log private keys, only addresses.
+#   - All send functions now wait for transaction receipts and
+#     raise RuntimeError on revert (status != 1).
+
 import os
 import re
 import json
@@ -276,7 +290,11 @@ def approve_if_needed(wallet_key: str,
 
     current = get_allowance(owner_eth, token_addr, spender_eth)
     if current >= int(amount_wei):
-        return {"skipped": True, "current_allowance": str(current)}
+        return {
+            "skipped": True,
+            "current_allowance": str(current),
+            "gas_used": 0,
+        }
 
     fn = token.functions.approve(Web3.to_checksum_address(spender_eth), int(amount_wei))
     try:
@@ -302,11 +320,20 @@ def approve_if_needed(wallet_key: str,
     try:
         signed = acct.sign_transaction(tx)
         txh = w3.eth.send_raw_transaction(signed.raw_transaction).hex()
+        receipt = w3.eth.wait_for_transaction_receipt(txh, timeout=180, poll_latency=3)
     except Exception as e:
         alert_trade_failure("approve", "erc20.approve", str(e))
         raise
 
-    return {"tx_hash": txh, "allowance_before": str(current)}
+    if receipt.status != 1:
+        alert_trade_failure("approve", "erc20.approve", f"revert, status={receipt.status}")
+        raise RuntimeError(f"Approval tx reverted (status={receipt.status})")
+
+    return {
+        "tx_hash": txh,
+        "allowance_before": str(current),
+        "gas_used": int(getattr(receipt, "gasUsed", 0)),
+    }
 
 # -----------------------------------------------------------------------------
 # V3 swap — exactInput (single hop)
@@ -319,7 +346,8 @@ def swap_exact_tokens_for_tokens(wallet_key: str,
                                  gas_limit: int = 900_000,
                                  v3_fee: int = 500) -> Dict[str, Any]:
     """
-    MVP: single hop path [token_in, token_out] via V3 exactInput
+    MVP: single hop path [token_in, token_out] via V3 exactInput.
+    Waits for receipt and raises on revert.
     """
     if len(path_eth) != 2:
         raise ValueError("This MVP only supports single-hop path [token_in, token_out]")
@@ -377,9 +405,18 @@ def swap_exact_tokens_for_tokens(wallet_key: str,
     try:
         signed = acct.sign_transaction(tx)
         txh = w3.eth.send_raw_transaction(signed.raw_transaction).hex()
+        receipt = w3.eth.wait_for_transaction_receipt(txh, timeout=180, poll_latency=3)
     except Exception as e:
         alert_trade_failure(f"{path_eth[0]}->{path_eth[1]}", "swap", f"sign/send error: {e}")
         raise
+
+    if receipt.status != 1:
+        alert_trade_failure(
+            f"{path_eth[0]}->{path_eth[1]}",
+            "swap",
+            f"tx reverted (status={receipt.status})"
+        )
+        raise RuntimeError(f"Swap reverted, status={receipt.status}")
 
     alert_trade_success(
         f"{path_eth[0]}->{path_eth[1]} (v3 exactInput {v3_fee})",
@@ -388,7 +425,12 @@ def swap_exact_tokens_for_tokens(wallet_key: str,
         str(amount_out_min_wei),
         txh
     )
-    return {"tx_hash": txh, "path": path_eth, "amount_out_min": str(amount_out_min_wei)}
+    return {
+        "tx_hash": txh,
+        "path": path_eth,
+        "amount_out_min": str(amount_out_min_wei),
+        "gas_used": int(getattr(receipt, "gasUsed", 0)),
+    }
 
 # -----------------------------------------------------------------------------
 # Convenience single-hop wrapper
@@ -400,6 +442,10 @@ def swap_v3_exact_input_once(wallet_key: str,
                              fee: int = 500,
                              slippage_bps: int = 50,
                              deadline_s: int = 600) -> Dict[str, Any]:
+    """
+    Quotes via QuoterV1, sets minOut based on slippage_bps, then exactInput.
+    Waits for receipt and raises on revert.
+    """
     acct = _get_account(wallet_key)
     owner_eth = Web3.to_checksum_address(acct.address)
 
@@ -441,9 +487,18 @@ def swap_v3_exact_input_once(wallet_key: str,
     try:
         signed = acct.sign_transaction(tx)
         txh = w3.eth.send_raw_transaction(signed.raw_transaction).hex()
+        receipt = w3.eth.wait_for_transaction_receipt(txh, timeout=180, poll_latency=3)
     except Exception as e:
         alert_trade_failure(f"{token_in}->{token_out}", "swap", f"sign/send error: {e}")
         raise
+
+    if receipt.status != 1:
+        alert_trade_failure(
+            f"{token_in}->{token_out}",
+            "swap",
+            f"tx reverted (status={receipt.status})"
+        )
+        raise RuntimeError(f"Swap reverted, status={receipt.status}")
 
     alert_trade_success(
         f"{token_in}->{token_out} (v3 exactInput {fee})",
@@ -452,7 +507,12 @@ def swap_v3_exact_input_once(wallet_key: str,
         str(min_out),
         txh
     )
-    return {"tx_hash": txh, "amount_out_min": str(min_out), "path": [token_in, token_out]}
+    return {
+        "tx_hash": txh,
+        "amount_out_min": str(min_out),
+        "path": [token_in, token_out],
+        "gas_used": int(getattr(receipt, "gasUsed", 0)),
+    }
 
 # -----------------------------------------------------------------------------
 # Self-test (no tx send)
