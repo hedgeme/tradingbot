@@ -10,7 +10,7 @@
 #
 # IMPORTANT:
 #   - We NEVER print or log private keys, only addresses.
-#   - All send functions now wait for transaction receipts and
+#   - All send functions wait for transaction receipts and
 #     raise RuntimeError on revert (status != 1).
 
 import os
@@ -63,16 +63,26 @@ def _current_gas_price_wei_capped() -> int:
 ROUTER_ADDR_ETH = Web3.to_checksum_address("0x85495f44768ccbb584d9380Cc29149fDAA445F69")
 QUOTER_V1_ADDR  = Web3.to_checksum_address("0x314456E8F5efaa3dD1F036eD5900508da8A3B382")
 
+# Correct Uniswap V3 SwapRouter02 ABI for exactInput:
+#   function exactInput(ExactInputParams calldata params) external payable returns (uint256 amountOut);
+#   where ExactInputParams = (bytes path, address recipient, uint256 deadline, uint256 amountIn, uint256 amountOutMinimum)
 ROUTER_EXACT_INPUT_ABI = [{
-    "inputs":[
-        {"internalType":"bytes","name":"path","type":"bytes"},
-        {"internalType":"uint256","name":"amountIn","type":"uint256"},
-        {"internalType":"uint256","name":"amountOutMinimum","type":"uint256"},
-        {"internalType":"address","name":"recipient","type":"address"},
-        {"internalType":"uint256","name":"deadline","type":"uint256"}],
-    "name":"exactInput",
-    "outputs":[{"internalType":"uint256","name":"amountOut","type":"uint256"}],
-    "stateMutability":"payable","type":"function"
+    "inputs": [{
+        "components": [
+            {"internalType": "bytes",   "name": "path",             "type": "bytes"},
+            {"internalType": "address", "name": "recipient",        "type": "address"},
+            {"internalType": "uint256", "name": "deadline",         "type": "uint256"},
+            {"internalType": "uint256", "name": "amountIn",         "type": "uint256"},
+            {"internalType": "uint256", "name": "amountOutMinimum", "type": "uint256"},
+        ],
+        "internalType": "struct ISwapRouter.ExactInputParams",
+        "name": "params",
+        "type": "tuple",
+    }],
+    "name": "exactInput",
+    "outputs": [{"internalType": "uint256", "name": "amountOut", "type": "uint256"}],
+    "stateMutability": "payable",
+    "type": "function",
 }]
 
 QUOTER_V1_ABI = [{
@@ -373,13 +383,17 @@ def swap_exact_tokens_for_tokens(wallet_key: str,
         amount_out_min_wei = max(1, (quoted * 995) // 1000)
 
     deadline = int(deadline_ts) if deadline_ts else int(time.time()) + 600
-    fn = router.functions.exactInput(
+
+    # Build params struct for exactInput((path,recipient,deadline,amountIn,amountOutMinimum))
+    params = (
         path_bytes,
-        int(amount_in_wei),
-        int(amount_out_min_wei),
         owner_eth,
         int(deadline),
+        int(amount_in_wei),
+        int(amount_out_min_wei),
     )
+
+    fn = router.functions.exactInput(params)
     try:
         data = fn._encode_transaction_data()
     except AttributeError:
@@ -407,7 +421,11 @@ def swap_exact_tokens_for_tokens(wallet_key: str,
         txh = w3.eth.send_raw_transaction(signed.raw_transaction).hex()
         receipt = w3.eth.wait_for_transaction_receipt(txh, timeout=180, poll_latency=3)
     except Exception as e:
-        alert_trade_failure(f"{path_eth[0]}->{path_eth[1]}", "swap", f"sign/send error: {e}")
+        alert_trade_failure(
+            f"{path_eth[0]}->{path_eth[1]}",
+            "swap",
+            f"sign/send error: {e}",
+        )
         raise
 
     if receipt.status != 1:
@@ -463,7 +481,16 @@ def swap_v3_exact_input_once(wallet_key: str,
     deadline = int(time.time()) + int(deadline_s)
 
     router = w3.eth.contract(address=_find_router_address(), abi=ROUTER_EXACT_INPUT_ABI)
-    fn = router.functions.exactInput(path_bytes, int(amount_in_wei), int(min_out), owner_eth, int(deadline))
+
+    params = (
+        path_bytes,
+        owner_eth,
+        int(deadline),
+        int(amount_in_wei),
+        int(min_out),
+    )
+
+    fn = router.functions.exactInput(params)
     try:
         data = fn._encode_transaction_data()
     except AttributeError:
