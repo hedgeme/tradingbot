@@ -34,72 +34,85 @@ w3 = Web3(Web3.HTTPProvider(HMY_NODE, request_kwargs={"timeout": 25}))
 
 
 def _current_gas_price_wei_capped() -> int:
-    """Harmony uses legacy gasPrice. Cap by GAS_CAP_GWEI if set."""
+    """
+    Harmony mostly uses legacy gasPrice. Cap by GAS_CAP_GWEI if set.
+    """
     cap = int(GAS_CAP_GWEI) * 10**9 if int(GAS_CAP_GWEI) > 0 else None
     try:
         gp = int(w3.eth.gas_price)
         return min(gp, cap) if cap else gp
     except Exception:
-        # Fallback 50 gwei if RPC hiccups
+        # Fallback 50 gwei if RPC hiccups and no explicit cap
         return (50 * 10**9) if cap is None else cap
 
 
 # -----------------------------------------------------------------------------
-# SwapRouter / Quoter (Uniswap V3 on Harmony)
+# SwapRouter / Quoter (Uniswap V3 on Harmony - Swap)
 # -----------------------------------------------------------------------------
 ROUTER_ADDR_ETH = Web3.to_checksum_address("0x85495f44768ccbb584d9380Cc29149fDAA445F69")
 QUOTER_V1_ADDR  = Web3.to_checksum_address("0x314456E8F5efaa3dD1F036eD5900508da8A3B382")
 
-# from ABI_SwapRouter02: IV3SwapRouter.ExactInputParams (NO deadline)
+# exactInput(path, struct) ABI (not used by swap_v3_exact_input_once, but kept for future multi-hop)
 ROUTER_EXACT_INPUT_ABI = [{
-    "inputs": [{
-        "components": [
-            {"internalType": "bytes",   "name": "path",             "type": "bytes"},
-            {"internalType": "address", "name": "recipient",        "type": "address"},
-            {"internalType": "uint256", "name": "amountIn",         "type": "uint256"},
-            {"internalType": "uint256", "name": "amountOutMinimum", "type": "uint256"},
-        ],
-        "internalType": "struct IV3SwapRouter.ExactInputParams",
-        "name": "params",
-        "type": "tuple",
-    }],
+    "inputs": [
+        {
+            "components": [
+                {"internalType": "bytes",   "name": "path",             "type": "bytes"},
+                {"internalType": "address", "name": "recipient",        "type": "address"},
+                {"internalType": "uint256", "name": "deadline",         "type": "uint256"},
+                {"internalType": "uint256", "name": "amountIn",         "type": "uint256"},
+                {"internalType": "uint256", "name": "amountOutMinimum", "type": "uint256"},
+            ],
+            "internalType": "struct ISwapRouter.ExactInputParams",
+            "name": "params",
+            "type": "tuple",
+        }
+    ],
     "name": "exactInput",
-    "outputs": [{"internalType": "uint256", "name": "amountOut", "type": "uint256"}],
+    "outputs": [
+        {"internalType": "uint256", "name": "amountOut", "type": "uint256"},
+    ],
     "stateMutability": "payable",
     "type": "function",
 }]
 
-# from ABI_SwapRouter02: ISwapRouter.ExactInputSingleParams (WITH deadline)
+# exactInputSingle(struct) ABI – this is what we will actually use
 ROUTER_EXACT_INPUT_SINGLE_ABI = [{
-    "inputs": [{
-        "components": [
-            {"internalType": "address", "name": "tokenIn",           "type": "address"},
-            {"internalType": "address", "name": "tokenOut",          "type": "address"},
-            {"internalType": "uint24",  "name": "fee",               "type": "uint24"},
-            {"internalType": "address", "name": "recipient",         "type": "address"},
-            {"internalType": "uint256", "name": "deadline",          "type": "uint256"},
-            {"internalType": "uint256", "name": "amountIn",          "type": "uint256"},
-            {"internalType": "uint256", "name": "amountOutMinimum",  "type": "uint256"},
-            {"internalType": "uint160", "name": "sqrtPriceLimitX96", "type": "uint160"},
-        ],
-        "internalType": "struct ISwapRouter.ExactInputSingleParams",
-        "name": "params",
-        "type": "tuple",
-    }],
+    "inputs": [
+        {
+            "components": [
+                {"internalType": "address", "name": "tokenIn",           "type": "address"},
+                {"internalType": "address", "name": "tokenOut",          "type": "address"},
+                {"internalType": "uint24",  "name": "fee",               "type": "uint24"},
+                {"internalType": "address", "name": "recipient",         "type": "address"},
+                {"internalType": "uint256", "name": "deadline",          "type": "uint256"},
+                {"internalType": "uint256", "name": "amountIn",          "type": "uint256"},
+                {"internalType": "uint256", "name": "amountOutMinimum",  "type": "uint256"},
+                {"internalType": "uint160", "name": "sqrtPriceLimitX96", "type": "uint160"},
+            ],
+            "internalType": "struct ISwapRouter.ExactInputSingleParams",
+            "name": "params",
+            "type": "tuple",
+        }
+    ],
     "name": "exactInputSingle",
-    "outputs": [{"internalType": "uint256", "name": "amountOut", "type": "uint256"}],
+    "outputs": [
+        {"internalType": "uint256", "name": "amountOut", "type": "uint256"},
+    ],
     "stateMutability": "payable",
     "type": "function",
 }]
 
-# Quoter V1 ABI (minimal)
+# Quoter V1 ABI – quoteExactInput(path, amountIn)
 QUOTER_V1_ABI = [{
     "inputs": [
         {"internalType": "bytes",   "name": "path",    "type": "bytes"},
         {"internalType": "uint256", "name": "amountIn","type": "uint256"},
     ],
     "name": "quoteExactInput",
-    "outputs": [{"internalType": "uint256","name": "amountOut","type": "uint256"}],
+    "outputs": [
+        {"internalType": "uint256","name": "amountOut","type": "uint256"},
+    ],
     "stateMutability": "nonpayable",
     "type": "function",
 }]
@@ -120,7 +133,7 @@ FALLBACK_TOKENS: Dict[str, str] = {
     "1USDC": "0xbc594cabd205bd993e7ffa6f3e9cea75c1110da5",
     "TEC":   "0x0deb9a1998aae32daacf6de21161c3e942ace074",
     "1sDAI": "0xedeb95d51dbc4116039435379bd58472a2c09b1f",
-    # infra:
+    # useful infra addrs captured in your doc:
     "FactoryV3": "0x12d21f5d0Ab768c312E19653Bf3f89917866B8e8",
     "TickLens":  "0x2D7B3ae07fE5E1d9da7c2C79F953339D0450a017",
     "NFPM":      "0xE4E259BE9c84260FDC7C9a3629A0410b1Fb3C114",
@@ -140,10 +153,8 @@ def _parse_verified_addresses() -> Dict[str, str]:
             continue
         cells = [c.strip(" `") for c in s.split("|")]
         try:
-            ox_idx = next(
-                i for i, c in enumerate(cells)
-                if re.fullmatch(r"0x[a-fA-F0-9]{40}", c)
-            )
+            ox_idx = next(i for i, c in enumerate(cells)
+                          if re.fullmatch(r"0x[a-fA-F0-9]{40}", c))
             sym = cells[ox_idx - 1]
             addr = Web3.to_checksum_address(cells[ox_idx])
             if re.fullmatch(r"[A-Za-z0-9]+", sym):
@@ -224,7 +235,7 @@ ERC20_ABI = [
 def _erc20(token_addr: str):
     return w3.eth.contract(
         address=Web3.to_checksum_address(token_addr),
-        abi=ERC20_ABI
+        abi=ERC20_ABI,
     )
 
 
@@ -246,7 +257,9 @@ def get_allowance(owner_eth: str, token_addr: str, spender_eth: str) -> int:
 def get_balance(owner_eth: str, token_addr: str) -> int:
     c = _erc20(token_addr)
     return int(
-        c.functions.balanceOf(Web3.to_checksum_address(owner_eth)).call()
+        c.functions.balanceOf(
+            Web3.to_checksum_address(owner_eth)
+        ).call()
     )
 
 
@@ -269,15 +282,14 @@ def _secret_path_for(wallet_key: str) -> Path:
     if override:
         return Path(override)
     return _SECRET_FILE_BY_WALLET.get(
-        wallet_key,
-        _DEFAULT_SECRET_DIR / f"{wallet_key}.pass.gpg",
+        wallet_key, _DEFAULT_SECRET_DIR / f"{wallet_key}.pass.gpg"
     )
 
 
 def _gpg_decrypt_file(path: Path) -> str:
     """
     Decrypts a GPG file and returns the plaintext string.
-    Requires gpg-agent to be unlocked.
+    Requires gpg-agent to be unlocked (your gpgcheck helper handles this).
     """
     if not path.exists():
         raise FileNotFoundError(f"Secret file not found: {path}")
@@ -296,8 +308,8 @@ def _gpg_decrypt_file(path: Path) -> str:
 
 def _get_account(wallet_key: str):
     """
-    Returns a signer account for wallet_key using GPG-decrypted secret.
-    Falls back to env PKs if present (optional).
+    Returns a signer account for wallet_key using GPG-decrypted secret,
+    falling back to env private keys if present.
     """
     pk = None
     try:
@@ -357,7 +369,10 @@ def _v3_path_bytes(token_in: str, fee: int, token_out: str) -> bytes:
 def quote_v3_exact_input(path_bytes: bytes, amount_in_wei: int) -> int:
     quoter = w3.eth.contract(address=QUOTER_V1_ADDR, abi=QUOTER_V1_ABI)
     return int(
-        quoter.functions.quoteExactInput(path_bytes, int(amount_in_wei)).call()
+        quoter.functions.quoteExactInput(
+            path_bytes,
+            int(amount_in_wei),
+        ).call()
     )
 
 
@@ -373,7 +388,7 @@ def approve_if_needed(
 ) -> Dict[str, Any]:
     """
     If allowance < amount_wei, send approve(spender, amount_wei).
-    Returns info dict; sends Telegram alerts on failure.
+    Returns info dict; sends Telegram alerts on success/failure.
     """
     acct = _get_account(wallet_key)
     owner_eth = Web3.to_checksum_address(acct.address)
@@ -381,11 +396,7 @@ def approve_if_needed(
 
     current = get_allowance(owner_eth, token_addr, spender_eth)
     if current >= int(amount_wei):
-        return {
-            "skipped": True,
-            "current_allowance": str(current),
-            "gas_used": 0,
-        }
+        return {"skipped": True, "current_allowance": str(current), "gas_used": 0}
 
     fn = token.functions.approve(
         Web3.to_checksum_address(spender_eth),
@@ -419,14 +430,11 @@ def approve_if_needed(
         alert_trade_failure("approve", "erc20.approve", str(e))
         raise
 
-    return {
-        "tx_hash": txh,
-        "allowance_before": str(current),
-    }
+    return {"tx_hash": txh, "allowance_before": str(current)}
 
 
 # -----------------------------------------------------------------------------
-# V3 swap — exactInput (multi-hop / path bytes)  [not used by manual single-hop]
+# V3 swap – high-level path (currently unused for swaps; kept for future multi-hop)
 # -----------------------------------------------------------------------------
 def swap_exact_tokens_for_tokens(
     wallet_key: str,
@@ -438,91 +446,26 @@ def swap_exact_tokens_for_tokens(
     v3_fee: int = 500,
 ) -> Dict[str, Any]:
     """
-    V3 path-based swap using exactInput(ExactInputParams).
-    Used for multi-hop paths. For single hop, prefer swap_v3_exact_input_once().
+    General single-hop wrapper using exactInputSingle under the hood.
+    For now this is restricted to single-hop, same as swap_v3_exact_input_once.
     """
-    if len(path_eth) < 2:
-        raise ValueError("Path must have at least [token_in, token_out]")
+    if len(path_eth) != 2:
+        raise ValueError("swap_exact_tokens_for_tokens only supports single-hop [token_in, token_out] for now")
 
-    acct = _get_account(wallet_key)
-    owner_eth = Web3.to_checksum_address(acct.address)
-
-    # Build full v3 path bytes from path_eth with a single fee between hops
-    path_bytes = b""
-    for i in range(len(path_eth) - 1):
-        t_in  = Web3.to_checksum_address(path_eth[i])
-        t_out = Web3.to_checksum_address(path_eth[i + 1])
-        path_bytes += _v3_path_bytes(t_in, v3_fee, t_out)
-
-    router    = w3.eth.contract(address=_find_router_address(), abi=ROUTER_EXACT_INPUT_ABI)
-
-    # If caller passed tiny sentinel, re-quote and set minOut with default 0.5%
-    if amount_out_min_wei <= 1:
-        try:
-            quoted = quote_v3_exact_input(path_bytes, int(amount_in_wei))
-        except Exception as e:
-            alert_trade_failure("->".join(path_eth), "quote", f"Quoter revert: {e}")
-            raise
-        if quoted <= 0:
-            alert_trade_failure("->".join(path_eth), "quote", "Quote returned 0")
-            raise RuntimeError("Quote returned 0")
-        amount_out_min_wei = max(1, (quoted * 995) // 1000)
-
-    deadline = int(deadline_ts) if deadline_ts else int(time.time()) + 600
-
-    params = (
-        path_bytes,
-        owner_eth,
-        int(amount_in_wei),
-        int(amount_out_min_wei),
+    return swap_v3_exact_input_once(
+        wallet_key=wallet_key,
+        token_in=path_eth[0],
+        token_out=path_eth[1],
+        amount_in_wei=amount_in_wei,
+        fee=v3_fee,
+        slippage_bps=0,       # use caller-provided min_out
+        deadline_s=(deadline_ts - int(time.time())) if deadline_ts else 600,
+        explicit_min_out=amount_out_min_wei,
     )
-
-    fn = router.functions.exactInput(params)
-    try:
-        data = fn._encode_transaction_data()
-    except AttributeError:
-        data = fn.encode_abi()
-
-    tx = {
-        "to": Web3.to_checksum_address(_find_router_address()),
-        "value": 0,
-        "data": data,
-        "chainId": HMY_CHAIN_ID,
-        "nonce": w3.eth.get_transaction_count(owner_eth),
-        "gasPrice": _current_gas_price_wei_capped(),
-    }
-
-    # Estimate with headroom
-    try:
-        est = w3.eth.estimate_gas({**tx, "from": owner_eth})
-        gas = max(min(int(est * 1.5), 1_500_000), 300_000)
-    except Exception:
-        gas = gas_limit
-    tx["gas"] = gas
-
-    try:
-        signed = acct.sign_transaction(tx)
-        txh = w3.eth.send_raw_transaction(signed.raw_transaction).hex()
-    except Exception as e:
-        alert_trade_failure("->".join(path_eth), "swap_exact_tokens_for_tokens", f"sign/send error: {e}")
-        raise
-
-    alert_trade_success(
-        "->".join(path_eth),
-        "swap_exact_tokens_for_tokens",
-        str(amount_in_wei),
-        str(amount_out_min_wei),
-        txh,
-    )
-    return {
-        "tx_hash": txh,
-        "path": path_eth,
-        "amount_out_min": str(amount_out_min_wei),
-    }
 
 
 # -----------------------------------------------------------------------------
-# V3 swap — single hop (exactInputSingle)
+# V3 swap — exactInputSingle (canonical path we will use)
 # -----------------------------------------------------------------------------
 def swap_v3_exact_input_once(
     wallet_key: str,
@@ -532,33 +475,37 @@ def swap_v3_exact_input_once(
     fee: int = 500,
     slippage_bps: int = 50,
     deadline_s: int = 600,
+    explicit_min_out: int | None = None,
 ) -> Dict[str, Any]:
     """
-    Single-hop V3 swap using exactInputSingle(ExactInputSingleParams).
-
-    This is now wired directly to the ABI from ABI_SwapRouter02 and should
-    match the working static calls you've run via diagnostics.
+    Canonical v3 single-hop swap via SwapRouter02.exactInputSingle(ExactInputSingleParams).
+    This is what runner.execute_manual_quote should ultimately use.
     """
-    acct      = _get_account(wallet_key)
+    acct = _get_account(wallet_key)
     owner_eth = Web3.to_checksum_address(acct.address)
-    token_in  = Web3.to_checksum_address(token_in)
-    token_out = Web3.to_checksum_address(token_out)
 
-    # First, quote via Quoter V1 using the path bytes
-    path_bytes = _v3_path_bytes(token_in, fee, token_out)
+    t_in  = Web3.to_checksum_address(token_in)
+    t_out = Web3.to_checksum_address(token_out)
+
+    # 1) Quote via Quoter on the *path bytes* (tokenIn, fee, tokenOut)
+    path_bytes = _v3_path_bytes(t_in, fee, t_out)
     try:
         quoted = quote_v3_exact_input(path_bytes, int(amount_in_wei))
     except Exception as e:
-        alert_trade_failure(f"{token_in}->{token_out}", "quote", f"Quoter revert: {e}")
+        alert_trade_failure(f"{t_in}->{t_out}", "quote", f"Quoter revert: {e}")
         raise
 
     if quoted <= 0:
-        alert_trade_failure(f"{token_in}->{token_out}", "quote", "Quote returned 0")
+        alert_trade_failure(f"{t_in}->{t_out}", "quote", "Quote returned 0")
         raise RuntimeError("Quote returned 0")
 
-    # Apply slippage
-    slippage_bps = int(slippage_bps)
-    min_out = max(1, (quoted * (10_000 - slippage_bps)) // 10_000)
+    # 2) Compute amountOutMinimum
+    if explicit_min_out is not None:
+        min_out = int(explicit_min_out)
+    else:
+        bps = max(0, int(slippage_bps))
+        min_out = max(1, (quoted * (10_000 - bps)) // 10_000)
+
     deadline = int(time.time()) + int(deadline_s)
 
     router = w3.eth.contract(
@@ -567,20 +514,21 @@ def swap_v3_exact_input_once(
     )
 
     params = (
-        token_in,
-        token_out,
+        t_in,
+        t_out,
         int(fee),
         owner_eth,
         int(deadline),
         int(amount_in_wei),
         int(min_out),
-        0,  # sqrtPriceLimitX96
+        0,  # sqrtPriceLimitX96 = 0 means no limit
     )
 
     fn = router.functions.exactInputSingle(params)
     try:
         data = fn._encode_transaction_data()
     except AttributeError:
+        # Fallback, but _encode_transaction_data exists on recent web3
         data = fn.encode_abi()
 
     tx = {
@@ -592,7 +540,7 @@ def swap_v3_exact_input_once(
         "gasPrice": _current_gas_price_wei_capped(),
     }
 
-    # Gas estimate + headroom
+    # gas estimate + headroom
     try:
         est = w3.eth.estimate_gas({**tx, "from": owner_eth})
         tx["gas"] = max(min(int(est * 1.5), 1_500_000), 300_000)
@@ -603,16 +551,12 @@ def swap_v3_exact_input_once(
         signed = acct.sign_transaction(tx)
         txh = w3.eth.send_raw_transaction(signed.raw_transaction).hex()
     except Exception as e:
-        alert_trade_failure(
-            f"{token_in}->{token_out} (fee {fee})",
-            "swap_v3_exact_input_once",
-            f"sign/send error: {e}",
-        )
+        alert_trade_failure(f"{t_in}->{t_out}", "swap", f"sign/send error: {e}")
         raise
 
     alert_trade_success(
-        f"{token_in}->{token_out} (v3 exactInputSingle {fee})",
-        "swap_v3_exact_input_once",
+        f"{t_in}->{t_out} (v3 exactInputSingle {fee})",
+        "swap",
         str(amount_in_wei),
         str(min_out),
         txh,
@@ -620,7 +564,7 @@ def swap_v3_exact_input_once(
     return {
         "tx_hash": txh,
         "amount_out_min": str(min_out),
-        "path": [token_in, token_out],
+        "path": [t_in, t_out],
     }
 
 
