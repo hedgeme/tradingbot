@@ -69,6 +69,21 @@ Contracts were deployed **without modification** to official Uniswap code.
 
 The full ABI exists separately if needed (not used by bot directly).
 
+SwapRouter02 on Harmony is compiled with IV3SwapRouter.ExactInputParams
+(bytes path, address recipient, uint256 amountIn, uint256 amountOutMinimum)
+
+Verified core and most of the periphery contracts in the new explorer:
+- FactoryV3: 0x12d21f5d0Ab768c312E19653Bf3f89917866B8e8 (https://explorer.harmony.one/address/0x12d21f5d0Ab768c312E19653Bf3f89917866B8e8)
+- TickLens: 0x2D7B3ae07fE5E1d9da7c2C79F953339D0450a017 (https://explorer.harmony.one/address/0x2d7b3ae07fe5e1d9da7c2c79f953339d0450a017)
+- NonfungiblePositionManager: 0xE4E259BE9c84260FDC7C9a3629A0410b1Fb3C114 (https://explorer.harmony.one/address/0xE4E259BE9c84260FDC7C9a3629A0410b1Fb3C114)
+- SwapRouter02: 0x85495f44768ccbb584d9380Cc29149fDAA445F69 (https://explorer.harmony.one/address/0x85495f44768ccbb584d9380Cc29149fDAA445F69) 
+
+Contracts were deployed using official Uniswap code, nothing was changed in it.
+Main contract repositories: 
+https://github.com/Uniswap/v3-core 
+https://github.com/Uniswap/v3-periphery 
+https://github.com/Uniswap/swap-router-contracts
+
 ---
 
 ## 🌐 Network Info
