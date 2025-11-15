@@ -69,8 +69,8 @@ Contracts were deployed **without modification** to official Uniswap code.
 
 The full ABI exists separately if needed (not used by bot directly).
 
-SwapRouter02 on Harmony is compiled with IV3SwapRouter.ExactInputParams
-(bytes path, address recipient, uint256 amountIn, uint256 amountOutMinimum)
+**SwapRouter02 on Harmony is compiled with IV3SwapRouter.ExactInputParams
+(bytes path, address recipient, uint256 amountIn, uint256 amountOutMinimum)**
 
 Verified core and most of the periphery contracts in the new explorer:
 - FactoryV3: 0x12d21f5d0Ab768c312E19653Bf3f89917866B8e8 (https://explorer.harmony.one/address/0x12d21f5d0Ab768c312E19653Bf3f89917866B8e8)
