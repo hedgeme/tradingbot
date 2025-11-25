@@ -7,6 +7,7 @@ import struct
 import subprocess
 from pathlib import Path
 from typing import Dict, Any, List
+from decimal import Decimal, ROUND_DOWN
 
 from dotenv import load_dotenv
 from web3 import Web3
@@ -15,6 +16,7 @@ from app.alert import (
     alert_trade_success,
     alert_trade_failure,
     alert_preflight_fail,
+    sym_for,
 )
 from app.wallet import WALLETS
 
@@ -353,6 +355,25 @@ def quote_v3_exact_input(path_bytes: bytes, amount_in_wei: int) -> int:
 
 
 # -----------------------------------------------------------------------------
+# Amount formatting helpers
+# -----------------------------------------------------------------------------
+def _format_amount_human(decimals: int, amount_wei: int, token_hint: str) -> str:
+    """
+    Convert raw wei to human-readable string like '0.50 1USDC' or '0.435057 1sDAI'.
+    token_hint can be address or symbol; sym_for() will clean it up.
+    """
+    d = Decimal(amount_wei) / (Decimal(10) ** decimals)
+    # 6-dec or more: show up to 6; else 2 decimals
+    if decimals <= 6:
+        q = Decimal("0.01")
+        txt = f"{d.quantize(q, rounding=ROUND_DOWN):f}"
+    else:
+        q = Decimal("0.000001")
+        txt = f"{d.quantize(q, rounding=ROUND_DOWN):f}"
+    return f"{txt} {sym_for(token_hint)}"
+
+
+# -----------------------------------------------------------------------------
 # Approve-if-needed
 # -----------------------------------------------------------------------------
 def approve_if_needed(
@@ -438,6 +459,9 @@ def swap_exact_tokens_for_tokens(
     token_in  = _normalize_token(path_eth[0])
     token_out = _normalize_token(path_eth[1])
 
+    dec_in  = get_decimals(token_in)
+    dec_out = get_decimals(token_out)
+
     # Build bytes path for v3
     path_bytes = _v3_path_bytes(token_in, v3_fee, token_out)
 
@@ -462,6 +486,9 @@ def swap_exact_tokens_for_tokens(
         "gasPrice": _current_gas_price_wei_capped(),
     }
 
+    # Pre-swap out balance for actual fill
+    pre_out = get_balance(owner_eth, token_out)
+
     # Estimate with headroom
     try:
         est = w3.eth.estimate_gas({**tx, "from": owner_eth})
@@ -481,17 +508,36 @@ def swap_exact_tokens_for_tokens(
         )
         raise
 
+    # Wait for receipt, compute actual out + gas
+    actual_out_wei = None
+    gas_used = 0
+    try:
+        r = w3.eth.wait_for_transaction_receipt(txh, timeout=180)
+        gas_used = getattr(r, "gasUsed", 0)
+        post_out = get_balance(owner_eth, token_out)
+        if post_out >= pre_out:
+            actual_out_wei = post_out - pre_out
+    except Exception:
+        pass
+
+    amt_in_str   = _format_amount_human(dec_in, amount_in_wei, token_in)
+    min_out_str  = _format_amount_human(dec_out, amount_out_min_wei, token_out)
+    filled_str   = _format_amount_human(dec_out, actual_out_wei, token_out) if actual_out_wei is not None else None
+
     alert_trade_success(
         f"{token_in}->{token_out} (v3 exactInput {v3_fee})",
         "swap_exact_tokens_for_tokens",
-        str(amount_in_wei),
-        str(amount_out_min_wei),
+        amt_in_str,
+        min_out_str,
         txh,
+        filled_actual=filled_str,
     )
     return {
         "tx_hash": txh,
         "path": [token_in, token_out],
         "amount_out_min": str(amount_out_min_wei),
+        "amount_out_actual": str(actual_out_wei) if actual_out_wei is not None else None,
+        "gas_used": gas_used,
     }
 
 
@@ -518,6 +564,9 @@ def swap_v3_exact_input_once(
 
     t_in  = _normalize_token(token_in)
     t_out = _normalize_token(token_out)
+
+    dec_in  = get_decimals(t_in)
+    dec_out = get_decimals(t_out)
 
     # local deadline for safety
     local_deadline = int(time.time()) + int(deadline_s)
@@ -558,6 +607,10 @@ def swap_v3_exact_input_once(
         "nonce": w3.eth.get_transaction_count(owner_eth),
         "gasPrice": _current_gas_price_wei_capped(),
     }
+
+    # Pre-swap out balance for actual fill
+    pre_out = get_balance(owner_eth, t_out)
+
     try:
         est = w3.eth.estimate_gas({**tx, "from": owner_eth})
         tx["gas"] = max(min(int(est * 1.5), 1_500_000), 300_000)
@@ -571,14 +624,37 @@ def swap_v3_exact_input_once(
         alert_trade_failure(f"{t_in}->{t_out}", "swap", f"sign/send error: {e}")
         raise
 
+    # Wait for receipt & compute actual out + gas
+    actual_out_wei = None
+    gas_used = 0
+    try:
+        r = w3.eth.wait_for_transaction_receipt(txh, timeout=180)
+        gas_used = getattr(r, "gasUsed", 0)
+        post_out = get_balance(owner_eth, t_out)
+        if post_out >= pre_out:
+            actual_out_wei = post_out - pre_out
+    except Exception:
+        pass
+
+    amt_in_str  = _format_amount_human(dec_in, amount_in_wei, t_in)
+    min_out_str = _format_amount_human(dec_out, min_out, t_out)
+    filled_str  = _format_amount_human(dec_out, actual_out_wei, t_out) if actual_out_wei is not None else None
+
     alert_trade_success(
         f"{t_in}->{t_out} (v3 exactInput {fee})",
         "swap",
-        str(amount_in_wei),
-        str(min_out),
+        amt_in_str,
+        min_out_str,
         txh,
+        filled_actual=filled_str,
     )
-    return {"tx_hash": txh, "amount_out_min": str(min_out), "path": [t_in, t_out]}
+    return {
+        "tx_hash": txh,
+        "amount_out_min": str(min_out),
+        "amount_out_actual": str(actual_out_wei) if actual_out_wei is not None else None,
+        "path": [t_in, t_out],
+        "gas_used": gas_used,
+    }
 
 
 # -----------------------------------------------------------------------------
