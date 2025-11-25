@@ -12,7 +12,7 @@ TELEGRAM_CHAT_ID   = os.getenv("TELEGRAM_CHAT_ID", "")
 
 # Harmony explorer link
 def explorer_tx_url(tx_hash: str) -> str:
-    if not tx_hash: 
+    if not tx_hash:
         return ""
     h = tx_hash if tx_hash.startswith("0x") else "0x" + tx_hash
     return f"https://explorer.harmony.one/tx/{h}"
@@ -68,9 +68,24 @@ def alert_preflight_fail(reason: str) -> None:
     reason = html.escape(reason)
     _send(f"❌ <b>Preflight FAILED</b>\n<code>{reason}</code>")
 
-def alert_trade_success(pair_or_in: str, action: str, amt_in: str, amt_out_min: str, tx_hash: str | None = None) -> None:
+def alert_trade_success(
+    pair_or_in: str,
+    action: str,
+    amt_in: str,
+    amt_out_min: str,
+    tx_hash: str | None = None,
+    filled_actual: str | None = None,
+) -> None:
+    """
+    amt_in / amt_out_min / filled_actual are expected to be human-readable strings
+    (e.g. '0.50 1USDC', '0.43 1sDAI').
+    """
     # pair_or_in may be "0x...->0x..." or "1USDC->1sDAI"
-    pretty = "->".join(sym_for(p.strip()) for p in pair_or_in.split("->")) if "->" in pair_or_in else sym_for(pair_or_in)
+    pretty = (
+        "->".join(sym_for(p.strip()) for p in pair_or_in.split("->"))
+        if "->" in pair_or_in
+        else sym_for(pair_or_in)
+    )
     link = explorer_tx_url(tx_hash or "")
     msg  = (
         f"✅ <b>Trade OK</b>\n"
@@ -79,12 +94,18 @@ def alert_trade_success(pair_or_in: str, action: str, amt_in: str, amt_out_min: 
         f"<b>amountIn:</b> {html.escape(str(amt_in))}\n"
         f"<b>amountOutMin:</b> {html.escape(str(amt_out_min))}"
     )
+    if filled_actual:
+        msg += f"\n<b>filled:</b> {html.escape(str(filled_actual))}"
     if link:
         msg += f"\n<b>tx:</b> <a href='{link}'>{html.escape(tx_hash)}</a>"
     _send(msg)
 
 def alert_trade_failure(pair_or_in: str, action: str, reason: str, tx_hash: str | None = None) -> None:
-    pretty = "->".join(sym_for(p.strip()) for p in pair_or_in.split("->")) if "->" in pair_or_in else sym_for(pair_or_in)
+    pretty = (
+        "->".join(sym_for(p.strip()) for p in pair_or_in.split("->"))
+        if "->" in pair_or_in
+        else sym_for(pair_or_in)
+    )
     link = explorer_tx_url(tx_hash or "")
     msg  = (
         f"❌ <b>Trade FAILED</b>\n"
@@ -104,4 +125,3 @@ def alert_low_balance(wallet_name: str, symbol: str, balance_str: str, threshold
         f"<b>Balance:</b> {html.escape(balance_str)} (min {html.escape(threshold_str)})"
     )
     _send(msg)
-
