@@ -4,8 +4,8 @@
 # - /trade uses runner.build_manual_quote() for live quotes
 # - /trade Approve uses trade_executor.approve_if_needed(...) for exact amount
 # - /trade Execute uses runner.execute_manual_quote() (admin-gated)
-# - /withdraw sends ONE or ERC20 to TREASURY_ADDR (admin-gated)
 # - Users can type the amount (captured before catch-all logger)
+# - /withdraw sends ONE or ERC-20 (1USDC, 1sDAI, TEC, 1ETH) to treasury
 #
 import os, sys, logging, subprocess, shlex
 from datetime import datetime, timezone
@@ -125,11 +125,7 @@ def is_admin(user_id: int) -> bool:
 
 def _git_short_rev() -> Optional[str]:
     try:
-        out = subprocess.check_output(
-            shlex.split("git rev-parse --short HEAD"),
-            cwd="/bot",
-            stderr=subprocess.DEVNULL,
-        )
+        out = subprocess.check_output(shlex.split("git rev-parse --short HEAD"), cwd="/bot", stderr=subprocess.DEVNULL)
         return out.decode().strip()
     except Exception:
         return None
@@ -354,7 +350,8 @@ def cmd_balances(update: Update, context: CallbackContext):
 
     update.message.reply_text(f"<pre>\n{chr(10).join(lines)}\n</pre>", parse_mode=ParseMode.HTML)
 
-# ---- price helpers (Option 1: full ETH LP vs Coinbase) ----
+# ---- price helpers ----
+
 def _coinbase_eth() -> Optional[Decimal]:
     try:
         import coinbase_client
@@ -364,12 +361,15 @@ def _coinbase_eth() -> Optional[Decimal]:
         return None
 
 def _eth_best_side_and_route() -> Tuple[Optional[Decimal], str]:
+    """
+    Compute best ETH/USDC price using Harmony LP Quoter; choose fwd or reverse route
+    and compare to Coinbase to pick the tighter side (Option 1).
+    """
     if PR is None:
         return None, "fwd"
     try:
         from app.chain import get_ctx
         ctx = get_ctx(C.HARMONY_RPC)
-
         ABI = [{
           "inputs":[{"internalType":"bytes","name":"path","type":"bytes"},
                     {"internalType":"uint256","name":"amountIn","type":"uint256"}],
@@ -379,7 +379,6 @@ def _eth_best_side_and_route() -> Tuple[Optional[Decimal], str]:
                      {"internalType":"uint32","name":"initializedTicksCrossed","type":"uint32"},
                      {"internalType":"uint256","name":"gasEstimate","type":"uint256"}],
           "stateMutability":"nonpayable","type":"function"}]
-
         q = ctx.w3.eth.contract(address=Web3.to_checksum_address(C.QUOTER_ADDR), abi=ABI)
 
         def addr(s): return Web3.to_checksum_address(PR._addr(s))
@@ -388,7 +387,7 @@ def _eth_best_side_and_route() -> Tuple[Optional[Decimal], str]:
         dec_e = PR._dec("1ETH")
         dec_u = PR._dec("1USDC")
 
-        # Reverse: USDC -> WONE -> 1ETH
+        # Reverse side: USDC -> WONE -> 1ETH (compute USDC per ETH)
         choices = []
         for usdc_in in (Decimal("25"), Decimal("50"), Decimal("100"), Decimal("250")):
             wei = int(usdc_in * (Decimal(10)**dec_u))
@@ -402,7 +401,7 @@ def _eth_best_side_and_route() -> Tuple[Optional[Decimal], str]:
 
         rev = min(choices) if choices else None
 
-        # Forward: 1ETH -> WONE -> 1USDC
+        # Forward side: 1ETH -> WONE -> 1USDC
         wei_in = int(Decimal("1") * (Decimal(10)**dec_e))
         path_f = (Web3.to_bytes(hexstr=addr("1ETH")) + fee3(3000) +
                   Web3.to_bytes(hexstr=addr("WONE")) + fee3(3000) +
@@ -477,15 +476,11 @@ def cmd_prices(update: Update, context: CallbackContext):
         slip_str = slip_txt.rjust(w_slip)
         lines.append(f"{s:<{w_asset}} | {lp_str} | {basis_str} | {slip_str} | {route_text:<{w_route}}")
 
-    # Extract ETH LP price from table for comparison
     eth_lp_display = None
     try:
-        for ln in lines:
-            if ln.startswith("1ETH "):
-                part = ln.split("|")[1].strip()
-                val = part.replace("$", "").replace(",", "")
-                eth_lp_display = Decimal(val)
-                break
+        eth_lp_display = next((Decimal(lines[i].split("|")[1].strip().replace("$","").replace(",",""))
+                               for i in range(len(lines))
+                               if lines[i].startswith("1ETH ")), None)
     except Exception:
         eth_lp_display = None
 
@@ -502,6 +497,7 @@ def cmd_prices(update: Update, context: CallbackContext):
     update.message.reply_text(f"<pre>\n{chr(10).join(lines)}\n</pre>", parse_mode=ParseMode.HTML)
 
 # ---- SLIPPAGE TABLE ----
+
 def _mid_usdc_per_unit(token_in: str) -> Optional[Decimal]:
     if PR is None:
         return None
@@ -525,7 +521,7 @@ def _mid_usdc_per_unit(token_in: str) -> Optional[Decimal]:
             dec_e = PR._dec("1ETH")
             dec_u = PR._dec("1USDC")
             choices = []
-            for usdc_in in (Decimal("10"), Decimal("50"), Decimal("100"), Decimal("250")):
+            for usdc_in in (Decimal("25"), Decimal("50"), Decimal("100"), Decimal("250")):
                 wei = int(usdc_in * (Decimal(10)**dec_u))
                 path = (Web3.to_bytes(hexstr=addr("1USDC")) + fee3(3000) +
                         Web3.to_bytes(hexstr=addr("WONE"))  + fee3(3000) +
@@ -681,7 +677,30 @@ def on_exec_cancel(update: Update, context: CallbackContext):
 # -----------------------------------------------------------------------------
 # /trade wizard state mgmt
 # -----------------------------------------------------------------------------
+
 _TRADE_STATE: Dict[int, Dict[str, str]] = {}
+
+def cmd_trade(update: Update, context: CallbackContext):
+    uid = update.effective_user.id
+    _TRADE_STATE[uid] = {
+        "step": "wallet",
+        "wallet": "",
+        "from": "",
+        "to": "",
+        "amount": "",
+        "slip_bps": str(getattr(C, "SLIPPAGE_DEFAULT_BPS", 30)),  # default
+        "waiting_amount": "0",
+    }
+
+    wallets = getattr(C, "WALLETS", {})
+    kb = [[InlineKeyboardButton(name, callback_data=f"tw_wallet:{name}")]
+          for name in sorted(wallets.keys())]
+    kb.append([InlineKeyboardButton("❌ Cancel", callback_data="tw_cancel")])
+
+    update.message.reply_text(
+        "Select wallet:",
+        reply_markup=InlineKeyboardMarkup(kb)
+    )
 
 def _tw_reply_edit(q, text, kb=None, html=False):
     try:
@@ -746,11 +765,6 @@ def _tw_amount_keyboard(uid, wallet, token_in):
         [InlineKeyboardButton("❌ Cancel", callback_data="tw_cancel")],
     ]
     return kb, bal_display
-
-def _tw_set_amount(uid, st, amount_text):
-    st["amount"] = amount_text
-    st["step"] = "slip"
-    return True
 
 def _tw_render_manual_quote(uid, st):
     if runner is None or not hasattr(runner, "build_manual_quote"):
@@ -828,27 +842,10 @@ def _tw_render_manual_quote(uid, st):
     kb_rows.append([InlineKeyboardButton("❌ Cancel", callback_data="tw_cancel")])
     return (txt, kb_rows, mq)
 
-def cmd_trade(update: Update, context: CallbackContext):
-    uid = update.effective_user.id
-    _TRADE_STATE[uid] = {
-        "step": "wallet",
-        "wallet": "",
-        "from": "",
-        "to": "",
-        "amount": "",
-        "slip_bps": str(getattr(C, "SLIPPAGE_DEFAULT_BPS", 30)),  # default
-        "waiting_amount": "0",
-    }
-
-    wallets = getattr(C, "WALLETS", {})
-    kb = [[InlineKeyboardButton(name, callback_data=f"tw_wallet:{name}")]
-          for name in sorted(wallets.keys())]
-    kb.append([InlineKeyboardButton("❌ Cancel", callback_data="tw_cancel")])
-
-    update.message.reply_text(
-        "Select wallet:",
-        reply_markup=InlineKeyboardMarkup(kb)
-    )
+def _tw_set_amount(uid, st, amount_text):
+    st["amount"] = amount_text
+    st["step"] = "slip"
+    return True
 
 def _tw_handle_wallet(q, uid, wallet):
     st = _tw_require_state(uid)
@@ -949,11 +946,10 @@ def _tw_handle_approve(q, uid):
         amt = Decimal(st["amount"])
         sym = st["from"]
         wallet_key = st["wallet"]
-        token_addr = runner._addr(sym)  # symbol -> address via runner map
+        token_addr = runner._addr(sym)  # resolve symbol -> address using runner map
         dec = TE.get_decimals(token_addr)
-        wei = int(amt * (Decimal(10) ** dec))
+        wei = int(amt * (Decimal(10)**dec))
         TE.approve_if_needed(wallet_key, token_addr, TE.ROUTER_ADDR_ETH, wei)
-        # Re-render quote after approval
         txt, kb_rows, _ = _tw_render_manual_quote(uid, st)
         _tw_reply_edit(q, txt, kb_rows)
         q.answer("Approve sent.")
@@ -985,11 +981,6 @@ def _tw_handle_execute(q, uid):
         gas_used = txr.get("gas_used","—")
         explorer = txr.get("explorer_url","")
         _tw_reply_edit(q, f"✅ Executed manual trade\n{filled}\nGas used: {gas_used}\nTx: {txh}\n{explorer}".strip())
-        if ALERT is not None:
-            try:
-                ALERT.send_alert(f"✅ Manual trade\n{filled}\nTx: {txh}")
-            except Exception:
-                pass
         q.answer("Executed.")
     except Exception as e:
         _tw_reply_edit(q, f"❌ Execution failed\n{e}")
@@ -1042,6 +1033,7 @@ def on_trade_callback(update: Update, context: CallbackContext):
 # -----------------------------------------------------------------------------
 # /withdraw (implementation)
 # -----------------------------------------------------------------------------
+
 _WITHDRAW_STATE: Dict[int, Dict[str,str]] = {}
 TREASURY_ADDR = "0x360c48a44f513b5781854588d2f1A40E90093c60"
 
@@ -1198,6 +1190,7 @@ def _perform_withdraw(wallet_key: str, asset: str, amount_dec: Decimal) -> Dict[
     """
     Send a withdrawal from the given bot wallet to TREASURY_ADDR.
     Handles native ONE and ERC20 (1USDC, 1sDAI, TEC, 1ETH).
+    Uses a dedicated ERC-20 ABI including transfer().
     """
     if TE is None or W is None:
         raise RuntimeError("trade_executor/wallet module unavailable")
@@ -1210,6 +1203,7 @@ def _perform_withdraw(wallet_key: str, asset: str, amount_dec: Decimal) -> Dict[
     txh = ""
     gas_used = 0
 
+    # Native ONE withdrawal
     if asset_u == "ONE":
         dec = 18
         amount_wei = int((amount_dec * (Decimal(10) ** dec)).to_integral_value(rounding=ROUND_DOWN))
@@ -1234,7 +1228,7 @@ def _perform_withdraw(wallet_key: str, asset: str, amount_dec: Decimal) -> Dict[
             pass
         return {"tx_hash": txh, "gas_used": gas_used, "asset": asset_u, "amount_wei": amount_wei}
 
-    # ERC-20 path
+    # ERC-20 withdrawal (use full ABI with transfer)
     if runner is not None and hasattr(runner, "_addr"):
         token_addr = runner._addr(asset)
     else:
@@ -1243,7 +1237,22 @@ def _perform_withdraw(wallet_key: str, asset: str, amount_dec: Decimal) -> Dict[
     dec = TE.get_decimals(token_addr)
     amount_wei = int((amount_dec * (Decimal(10) ** dec)).to_integral_value(rounding=ROUND_DOWN))
 
-    token = TE._erc20(token_addr)
+    ERC20_TRANSFER_ABI = [{
+        "inputs": [
+            {"internalType": "address", "name": "recipient", "type": "address"},
+            {"internalType": "uint256", "name": "amount", "type": "uint256"}
+        ],
+        "name": "transfer",
+        "outputs": [{"internalType": "bool", "name": "", "type": "bool"}],
+        "stateMutability": "nonpayable",
+        "type": "function"
+    }]
+
+    token = TE.w3.eth.contract(
+        address=Web3.to_checksum_address(token_addr),
+        abi=ERC20_TRANSFER_ABI
+    )
+
     fn = token.functions.transfer(to_addr, int(amount_wei))
     try:
         data = fn._encode_transaction_data()
@@ -1410,7 +1419,7 @@ def main():
     dp.add_handler(CommandHandler("dryrun", cmd_dryrun))
     dp.add_handler(CommandHandler("cooldowns", cmd_cooldowns, pass_args=True))
 
-    # NEW
+    # Trade & withdraw
     dp.add_handler(CommandHandler("trade", cmd_trade))
     dp.add_handler(CommandHandler("withdraw", cmd_withdraw))
 
@@ -1419,7 +1428,6 @@ def main():
     dp.add_handler(CallbackQueryHandler(on_exec_confirm, pattern=r"^exec_go:[A-Za-z0-9_\-]+$"))
     dp.add_handler(CallbackQueryHandler(on_exec_cancel, pattern=r"^exec_cancel$"))
 
-    # NEW callback groups for trade/withdraw
     dp.add_handler(CallbackQueryHandler(on_trade_callback, pattern=r"^tw_"))
     dp.add_handler(CallbackQueryHandler(on_withdraw_callback, pattern=r"^wd_"))
 
