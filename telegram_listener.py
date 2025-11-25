@@ -4,6 +4,7 @@
 # - /trade uses runner.build_manual_quote() for live quotes
 # - /trade Approve uses trade_executor.approve_if_needed(...) for exact amount
 # - /trade Execute uses runner.execute_manual_quote() (admin-gated)
+# - /withdraw sends ONE or ERC20 to TREASURY_ADDR (admin-gated)
 # - Users can type the amount (captured before catch-all logger)
 #
 import os, sys, logging, subprocess, shlex
@@ -79,7 +80,7 @@ except Exception:
         log.warning("runner module not available: %s", e)
         runner = None
 
-# wallet + trade_executor (for approve + gas helpers)
+# wallet + trade_executor (for approve + gas helpers + withdraw)
 try:
     from app import wallet as W
     log.info("Loaded wallet from app.wallet")
@@ -124,7 +125,11 @@ def is_admin(user_id: int) -> bool:
 
 def _git_short_rev() -> Optional[str]:
     try:
-        out = subprocess.check_output(shlex.split("git rev-parse --short HEAD"), cwd="/bot", stderr=subprocess.DEVNULL)
+        out = subprocess.check_output(
+            shlex.split("git rev-parse --short HEAD"),
+            cwd="/bot",
+            stderr=subprocess.DEVNULL,
+        )
         return out.decode().strip()
     except Exception:
         return None
@@ -349,10 +354,242 @@ def cmd_balances(update: Update, context: CallbackContext):
 
     update.message.reply_text(f"<pre>\n{chr(10).join(lines)}\n</pre>", parse_mode=ParseMode.HTML)
 
-# ---- price helpers ----
-# (unchanged)
-# ...  [KEEP YOUR EXISTING _eth_best_side_and_route, _coinbase_eth, cmd_prices, _mid_usdc_per_unit, cmd_slippage]
-# Due to length, I’m not modifying those sections; they can remain exactly as in your current file.
+# ---- price helpers (Option 1: full ETH LP vs Coinbase) ----
+def _coinbase_eth() -> Optional[Decimal]:
+    try:
+        import coinbase_client
+        val = coinbase_client.fetch_eth_usd_price()
+        return Decimal(str(val)) if val is not None else None
+    except Exception:
+        return None
+
+def _eth_best_side_and_route() -> Tuple[Optional[Decimal], str]:
+    if PR is None:
+        return None, "fwd"
+    try:
+        from app.chain import get_ctx
+        ctx = get_ctx(C.HARMONY_RPC)
+
+        ABI = [{
+          "inputs":[{"internalType":"bytes","name":"path","type":"bytes"},
+                    {"internalType":"uint256","name":"amountIn","type":"uint256"}],
+          "name":"quoteExactInput",
+          "outputs":[{"internalType":"uint256","name":"amountOut","type":"uint256"},
+                     {"internalType":"uint160","name":"sqrtPriceX96After","type":"uint160"},
+                     {"internalType":"uint32","name":"initializedTicksCrossed","type":"uint32"},
+                     {"internalType":"uint256","name":"gasEstimate","type":"uint256"}],
+          "stateMutability":"nonpayable","type":"function"}]
+
+        q = ctx.w3.eth.contract(address=Web3.to_checksum_address(C.QUOTER_ADDR), abi=ABI)
+
+        def addr(s): return Web3.to_checksum_address(PR._addr(s))
+        def fee3(f): return int(f).to_bytes(3, "big")
+
+        dec_e = PR._dec("1ETH")
+        dec_u = PR._dec("1USDC")
+
+        # Reverse: USDC -> WONE -> 1ETH
+        choices = []
+        for usdc_in in (Decimal("25"), Decimal("50"), Decimal("100"), Decimal("250")):
+            wei = int(usdc_in * (Decimal(10)**dec_u))
+            path = (Web3.to_bytes(hexstr=addr("1USDC")) + fee3(3000) +
+                    Web3.to_bytes(hexstr=addr("WONE"))  + fee3(3000) +
+                    Web3.to_bytes(hexstr=addr("1ETH")))
+            out = q.functions.quoteExactInput(path, wei).call()[0]
+            eth_out = Decimal(out) / (Decimal(10)**dec_e)
+            if eth_out > 0:
+                choices.append(usdc_in / eth_out)
+
+        rev = min(choices) if choices else None
+
+        # Forward: 1ETH -> WONE -> 1USDC
+        wei_in = int(Decimal("1") * (Decimal(10)**dec_e))
+        path_f = (Web3.to_bytes(hexstr=addr("1ETH")) + fee3(3000) +
+                  Web3.to_bytes(hexstr=addr("WONE")) + fee3(3000) +
+                  Web3.to_bytes(hexstr=addr("1USDC")))
+        out_f = q.functions.quoteExactInput(path_f, wei_in).call()[0]
+        fwd = (Decimal(out_f) / (Decimal(10)**dec_u)) if out_f else None
+
+        if rev is not None and fwd is not None:
+            cb = _coinbase_eth()
+            if cb:
+                d_rev = abs(rev - cb)
+                d_fwd = abs(fwd - cb)
+                return (rev, "rev") if d_rev <= d_fwd else (fwd, "fwd")
+            if abs(rev - fwd) / max(Decimal("1"), rev) > Decimal("0.05"):
+                return rev, "rev"
+            return fwd, "fwd"
+        return (rev or fwd), ("rev" if rev else "fwd")
+    except Exception:
+        return None, "fwd"
+
+def cmd_prices(update: Update, context: CallbackContext):
+    if PR is None:
+        update.message.reply_text("Prices unavailable (module not loaded)."); return
+
+    syms = ["ONE", "1USDC", "1sDAI", "TEC", "1ETH"]
+
+    w_asset, w_lp, w_basis, w_slip, w_route = 6, 11, 12, 9, 27
+    header = (
+        f"{'Asset':<{w_asset}} | {'LP Price':>{w_lp}} | {'Quote Basis':>{w_basis}} | "
+        f"{'Slippage':>{w_slip}} | {'Route':<{w_route}}"
+    )
+    sep = "-" * (len(header) + 0)
+    lines = ["LP Prices", header, sep]
+
+    cb_eth = _coinbase_eth()
+    lp_eth_pref, side = _eth_best_side_and_route()
+
+    for s in syms:
+        route_text = "—"
+        basis = Decimal("1")
+        slip_txt = "0 bps"
+        price: Optional[Decimal] = None
+
+        try:
+            if s == "ONE":
+                price = PR.price_usd("WONE", Decimal("1"))
+                route_text = "WONE → 1USDC (fwd)" if price is not None else "—"
+            elif s == "1USDC":
+                price = Decimal("1")
+                route_text = "—"
+            elif s == "1sDAI":
+                price = PR.price_usd("1sDAI", Decimal("1"))
+                route_text = "1sDAI → 1USDC (fwd)" if price is not None else "—"
+            elif s == "TEC":
+                basis = Decimal("100")
+                out = PR.price_usd("TEC", basis)
+                price = (out / basis) if out is not None and basis > 0 else None
+                route_text = "TEC → WONE → 1USDC"
+                slip_txt = "—" if price is None else "  "
+            elif s == "1ETH":
+                price = lp_eth_pref or PR.price_usd("1ETH", Decimal("1"))
+                route_text = ("1USDC → WONE → 1ETH (rev)" if side == "rev"
+                              else "1ETH → WONE → 1USDC (fwd)")
+            else:
+                price = PR.price_usd(s, Decimal("1"))
+                route_text = "—" if price is None else "(direct/best)"
+        except Exception:
+            price = None
+
+        lp_str = _fmt_money(price).rjust(w_lp)
+        basis_str = f"{basis:.5f}".rjust(w_basis)
+        slip_str = slip_txt.rjust(w_slip)
+        lines.append(f"{s:<{w_asset}} | {lp_str} | {basis_str} | {slip_str} | {route_text:<{w_route}}")
+
+    # Extract ETH LP price from table for comparison
+    eth_lp_display = None
+    try:
+        for ln in lines:
+            if ln.startswith("1ETH "):
+                part = ln.split("|")[1].strip()
+                val = part.replace("$", "").replace(",", "")
+                eth_lp_display = Decimal(val)
+                break
+    except Exception:
+        eth_lp_display = None
+
+    lines += ["", "ETH: Harmony LP vs Coinbase"]
+    lines.append(f"  LP:       {_fmt_money(eth_lp_display)}")
+    lines.append(f"  Coinbase: {_fmt_money(cb_eth)}")
+    if eth_lp_display is not None and cb_eth not in (None, Decimal(0)):
+        try:
+            diff = (Decimal(eth_lp_display) - Decimal(cb_eth)) / Decimal(cb_eth) * Decimal(100)
+            lines.append(f"  Diff:     {diff:+.2f}%")
+        except Exception:
+            pass
+
+    update.message.reply_text(f"<pre>\n{chr(10).join(lines)}\n</pre>", parse_mode=ParseMode.HTML)
+
+# ---- SLIPPAGE TABLE ----
+def _mid_usdc_per_unit(token_in: str) -> Optional[Decimal]:
+    if PR is None:
+        return None
+    t = token_in.upper()
+    try:
+        if t == "1ETH":
+            from app.chain import get_ctx
+            ctx = get_ctx(C.HARMONY_RPC)
+            ABI = [{
+              "inputs":[{"internalType":"bytes","name":"path","type":"bytes"},
+                        {"internalType":"uint256","name":"amountIn","type":"uint256"}],
+              "name":"quoteExactInput",
+              "outputs":[{"internalType":"uint256","name":"amountOut","type":"uint256"},
+                         {"internalType":"uint160","name":"sqrtPriceX96After","type":"uint160"},
+                         {"internalType":"uint32","name":"initializedTicksCrossed","type":"uint32"},
+                         {"internalType":"uint256","name":"gasEstimate","type":"uint256"}],
+              "stateMutability":"nonpayable","type":"function"}]
+            q = ctx.w3.eth.contract(address=Web3.to_checksum_address(C.QUOTER_ADDR), abi=ABI)
+            def addr(s): return Web3.to_checksum_address(PR._addr(s))
+            def fee3(f): return int(f).to_bytes(3, "big")
+            dec_e = PR._dec("1ETH")
+            dec_u = PR._dec("1USDC")
+            choices = []
+            for usdc_in in (Decimal("10"), Decimal("50"), Decimal("100"), Decimal("250")):
+                wei = int(usdc_in * (Decimal(10)**dec_u))
+                path = (Web3.to_bytes(hexstr=addr("1USDC")) + fee3(3000) +
+                        Web3.to_bytes(hexstr=addr("WONE"))  + fee3(3000) +
+                        Web3.to_bytes(hexstr=addr("1ETH")))
+                out = q.functions.quoteExactInput(path, wei).call()[0]
+                eth_out = Decimal(out) / (Decimal(10)**dec_e)
+                if eth_out > 0:
+                    choices.append(usdc_in / eth_out)
+            return min(choices) if choices else None
+        if t == "ONE":
+            return PR.price_usd("WONE", Decimal("1"))
+        return PR.price_usd(t, Decimal("1"))
+    except Exception:
+        return None
+
+def cmd_slippage(update: Update, context: CallbackContext):
+    args = context.args or []
+    if not args:
+        update.message.reply_text(
+            "Usage: /slippage <TOKEN_IN> [AMOUNT] [TOKEN_OUT]\n"
+            "Examples:\n"
+            "  /slippage 1ETH            (defaults: 1 unit to 1USDC)\n"
+            "  /slippage 1ETH 0.5 1USDC  (0.5 1ETH to 1USDC)"
+        ); return
+
+    token_in = args[0].upper()
+    amount_in = Decimal(args[1]) if len(args) >= 2 else Decimal("1")
+    token_out = args[2].upper() if len(args) >= 3 else "1USDC"
+
+    w1, w2, w3, w4 = 12, 16, 12, 16
+
+    mid = _mid_usdc_per_unit(token_in)
+
+    targets = [Decimal("10"), Decimal("100"), Decimal("1000"), Decimal("10000")]
+    rows = []
+    for usdc in targets:
+        if mid and mid > 0:
+            est_in = (usdc / mid).quantize(Decimal("0.000001"))
+        else:
+            est_in = Decimal("0")
+        try:
+            if token_in == "ONE":
+                px_usd = PR.price_usd("WONE", est_in)
+            else:
+                px_usd = PR.price_usd(token_in, est_in)
+            eff = (px_usd / est_in) if (px_usd and est_in > 0) else None
+            slip = ((eff - mid) / mid * Decimal("100")) if (eff and mid) else None
+            rows.append((f"{usdc:,.0f}", f"{est_in:.6f}", f"{eff:,.2f}" if eff else "—", f"{slip:+.2f}%" if slip is not None else "—"))
+        except Exception:
+            rows.append((f"{usdc:,.0f}", "—", "—", "—"))
+
+    col1, col2, col3, col4 = "Size (USDC)", "Amount In (sym)", "Eff. Price", "Slippage vs mid"
+    line_hdr = f"{col1:>{w1}} | {col2:>{w2}} | {col3:>{w3}} | {col4:>{w4}}"
+    line_sep = "-" * len(line_hdr)
+    tbl = [line_hdr, line_sep]
+    for a,b,c,d in rows:
+        tbl.append(f"{a:>{w1}} | {b:>{w2}} | {('$'+c) if c!='—' else '—':>{w3}} | {d:>{w4}}")
+
+    out = [f"Slippage curve: {token_in} → {token_out}"]
+    if mid:
+        out.append(f"Baseline (mid): ${mid:,.2f} per 1{token_in}")
+    out.append("")
+    out.extend(tbl)
+    update.message.reply_text(f"<pre>\n{chr(10).join(out)}\n</pre>", parse_mode=ParseMode.HTML)
 
 # ---------- Core bot health ----------
 def cmd_ping(update: Update, context: CallbackContext):
@@ -444,58 +681,367 @@ def on_exec_cancel(update: Update, context: CallbackContext):
 # -----------------------------------------------------------------------------
 # /trade wizard state mgmt
 # -----------------------------------------------------------------------------
+_TRADE_STATE: Dict[int, Dict[str, str]] = {}
 
-# (trade section unchanged except for using updated runner, so keep your current
-# cmd_trade/on_trade_callback/etc. from the file you provided.)
+def _tw_reply_edit(q, text, kb=None, html=False):
+    try:
+        q.edit_message_text(text, parse_mode=(ParseMode.HTML if html else None))
+        if kb:
+            q.edit_message_reply_markup(InlineKeyboardMarkup(kb))
+        else:
+            q.edit_message_reply_markup(None)
+    except Exception:
+        q.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb) if kb else None, parse_mode=(ParseMode.HTML if html else None))
 
-# ---- Amount capture (typed number) ----
-def on_text_amount_capture(update: Update, context: CallbackContext):
-    """
-    Capture free-text numeric input for:
-      - /trade amount step
-      - /withdraw amount step
-    """
-    uid = update.effective_user.id if update.effective_user else None
-    if uid is None:
+def _tw_require_state(uid):
+    st = _TRADE_STATE.get(uid)
+    if not st:
+        st = {
+            "step": "wallet",
+            "wallet": "",
+            "from": "",
+            "to": "",
+            "amount": "",
+            "slip_bps": str(getattr(C, "SLIPPAGE_DEFAULT_BPS", 30)),
+            "waiting_amount": "0",
+        }
+        _TRADE_STATE[uid] = st
+    return st
+
+def _tw_assets_keyboard(uid, which):
+    syms = ["ONE", "1USDC", "1sDAI", "TEC", "1ETH"]
+    kb = [[InlineKeyboardButton(s, callback_data=f"tw_{which}:{s}")] for s in syms]
+    kb.append([InlineKeyboardButton("⬅ Back", callback_data="tw_back_wallet" if which=="from" else "tw_back_from")])
+    kb.append([InlineKeyboardButton("❌ Cancel", callback_data="tw_cancel")])
+    return kb
+
+def _tw_slip_keyboard(uid):
+    choices = [
+        ("0.10% max", 10),
+        ("0.50% max", 50),
+        ("1.00% max", 100),
+        ("Use default", getattr(C, "SLIPPAGE_DEFAULT_BPS", 30)),
+    ]
+    kb = [[InlineKeyboardButton(f"{label}", callback_data=f"tw_slip:{bps}")] for label,bps in choices]
+    kb.append([InlineKeyboardButton("⬅ Back", callback_data="tw_back_amount")])
+    kb.append([InlineKeyboardButton("❌ Cancel", callback_data="tw_cancel")])
+    return kb
+
+def _tw_amount_keyboard(uid, wallet, token_in):
+    bal_display = "?"
+    if BL:
+        try:
+            table = BL.all_balances()
+            row = table.get(wallet, {})
+            if token_in.upper() == "ONE":
+                bal_display = str(_resolve_one_value(row))
+            else:
+                bal_display = str(row.get(token_in.upper(), "0"))
+        except Exception:
+            pass
+
+    kb = [
+        [InlineKeyboardButton(f"All ({bal_display} {token_in})", callback_data="tw_amt_all")],
+        [InlineKeyboardButton("⬅ Back", callback_data="tw_back_to")],
+        [InlineKeyboardButton("❌ Cancel", callback_data="tw_cancel")],
+    ]
+    return kb, bal_display
+
+def _tw_set_amount(uid, st, amount_text):
+    st["amount"] = amount_text
+    st["step"] = "slip"
+    return True
+
+def _tw_render_manual_quote(uid, st):
+    if runner is None or not hasattr(runner, "build_manual_quote"):
+        return ("Runner manual quote not available.", None, None)
+
+    wallet_key   = st["wallet"]
+    token_in_ui  = st["from"]
+    token_out_ui = st["to"]
+    amt_str      = st["amount"]
+    slip_bps     = int(st["slip_bps"])
+
+    if not (wallet_key and token_in_ui and token_out_ui and amt_str):
+        return ("Trade is incomplete.", None, None)
+
+    try:
+        amt_dec = Decimal(amt_str)
+    except Exception:
+        return ("Bad amount.", None, None)
+
+    mq = runner.build_manual_quote(
+        wallet_key=wallet_key,
+        token_in=token_in_ui,
+        token_out=token_out_ui,
+        amount_in=amt_dec,
+        slippage_bps=slip_bps,
+    )
+
+    path     = getattr(mq, "path_text", f"{token_in_ui} → {token_out_ui}")
+    ain_txt  = getattr(mq, "amount_in_text", f"{amt_str} {token_in_ui}")
+    qout_txt = getattr(mq, "quote_out_text", f"? {token_out_ui}")
+    imp_bps  = getattr(mq, "impact_bps", None)
+    slip_bps_val = getattr(mq, "slippage_bps", slip_bps)
+    min_out  = getattr(mq, "min_out_text", f"? {token_out_ui}")
+
+    gas_est  = getattr(mq, "gas_estimate", "—")
+    nonce    = getattr(mq, "nonce", "—")
+    allow_ok = getattr(mq, "allowance_ok", False)
+    tx_prev  = getattr(mq, "tx_preview_text", "(tx preview)")
+    slip_ok  = getattr(mq, "slippage_ok", True)
+    need_appr_txt = getattr(mq, "approval_required_amount_text", None)
+
+    lines = []
+    lines.append(f"Review Trade — {wallet_key}")
+    lines.append(f"Path     : {path}")
+    lines.append(f"AmountIn : {ain_txt}")
+    lines.append(f"QuoteOut : {qout_txt}")
+    if imp_bps is not None:
+        lines.append(f"Impact   : {imp_bps:.2f} bps")
+    else:
+        lines.append("Impact   : —")
+    pct = Decimal(slip_bps_val) / Decimal(100)
+    lines.append(f"Slippage : {pct:.2f}% max → minOut {min_out}")
+    lines.append(f"Gas Est  : {gas_est}")
+    lines.append(f"Nonce    : {nonce}")
+    lines.append(f"Allowance: {'OK' if allow_ok else 'NOT APPROVED'}")
+    if not allow_ok and need_appr_txt:
+        lines.append(f"Required : approve {need_appr_txt}")
+    if not slip_ok:
+        lines.append("⚠ Price already worse than allowed slippage")
+
+    lines.append("")
+    lines.append("Would send:")
+    lines.append(tx_prev)
+
+    txt = "\n".join(lines)
+
+    kb_rows = []
+    if not allow_ok and need_appr_txt:
+        kb_rows.append([InlineKeyboardButton("✅ Approve spend first", callback_data="tw_do_approve")])
+    elif allow_ok and slip_ok:
+        kb_rows.append([InlineKeyboardButton("✅ Execute Trade", callback_data="tw_do_execute")])
+    else:
+        kb_rows.append([InlineKeyboardButton("⚠ Adjust Slippage", callback_data="tw_back_slip")])
+
+    kb_rows.append([InlineKeyboardButton("❌ Cancel", callback_data="tw_cancel")])
+    return (txt, kb_rows, mq)
+
+def cmd_trade(update: Update, context: CallbackContext):
+    uid = update.effective_user.id
+    _TRADE_STATE[uid] = {
+        "step": "wallet",
+        "wallet": "",
+        "from": "",
+        "to": "",
+        "amount": "",
+        "slip_bps": str(getattr(C, "SLIPPAGE_DEFAULT_BPS", 30)),  # default
+        "waiting_amount": "0",
+    }
+
+    wallets = getattr(C, "WALLETS", {})
+    kb = [[InlineKeyboardButton(name, callback_data=f"tw_wallet:{name}")]
+          for name in sorted(wallets.keys())]
+    kb.append([InlineKeyboardButton("❌ Cancel", callback_data="tw_cancel")])
+
+    update.message.reply_text(
+        "Select wallet:",
+        reply_markup=InlineKeyboardMarkup(kb)
+    )
+
+def _tw_handle_wallet(q, uid, wallet):
+    st = _tw_require_state(uid)
+    st["wallet"] = wallet
+    st["step"] = "from"
+    kb = _tw_assets_keyboard(uid, "from")
+    _tw_reply_edit(q, f"Wallet: {wallet}\n\nSelect FROM asset:", kb)
+
+def _tw_handle_from(q, uid, sym):
+    st = _tw_require_state(uid)
+    st["from"] = sym
+    st["step"] = "to"
+    kb = _tw_assets_keyboard(uid, "to")
+    _tw_reply_edit(q, f"FROM: {sym}\n\nSelect TO asset:", kb)
+
+def _tw_handle_to(q, uid, sym):
+    st = _tw_require_state(uid)
+    st["to"] = sym
+    st["step"] = "amount"
+    st["waiting_amount"] = "1"
+    kb, bal_disp = _tw_amount_keyboard(uid, st["wallet"], st["from"])
+    _tw_reply_edit(q,
+        f"FROM {st['from']} TO {sym}\n\nEnter amount of {st['from']} to trade (type a number in chat).\nBalance: {bal_disp} {st['from']}",
+        kb
+    )
+
+def _tw_handle_amt_all(q, uid):
+    st = _tw_require_state(uid)
+    amt = "0"
+    if BL:
+        try:
+            table = BL.all_balances()
+            row = table.get(st["wallet"], {})
+            if st["from"].upper() == "ONE":
+                amt = str(_resolve_one_value(row))
+            else:
+                amt = str(row.get(st["from"].upper(), "0"))
+        except Exception:
+            pass
+    _tw_set_amount(uid, st, amt)
+    kb = _tw_slip_keyboard(uid)
+    _tw_reply_edit(q,
+        f"Amount set to ALL ({amt} {st['from']}).\nSelect slippage limit:",
+        kb
+    )
+
+def _tw_handle_slip(q, uid, bps_str):
+    st = _tw_require_state(uid)
+    st["slip_bps"] = bps_str
+    st["step"] = "review"
+
+    txt, kb_rows, mq = _tw_render_manual_quote(uid, st)
+    _tw_reply_edit(q, txt, kb_rows)
+
+def _tw_handle_back(q, uid, dest):
+    st = _tw_require_state(uid)
+    if dest == "wallet":
+        st["step"] = "wallet"
+        wallets = getattr(C, "WALLETS", {})
+        kb = [[InlineKeyboardButton(name, callback_data=f"tw_wallet:{name}")]
+              for name in sorted(wallets.keys())]
+        kb.append([InlineKeyboardButton("❌ Cancel", callback_data="tw_cancel")])
+        _tw_reply_edit(q, "Select wallet:", kb)
+    elif dest == "from":
+        st["step"] = "from"
+        kb = _tw_assets_keyboard(uid, "from")
+        _tw_reply_edit(q, f"Wallet: {st['wallet']}\n\nSelect FROM asset:", kb)
+    elif dest == "to":
+        st["step"] = "to"
+        kb = _tw_assets_keyboard(uid, "to")
+        _tw_reply_edit(q,
+            f"FROM: {st['from']}\n\nSelect TO asset:",
+            kb
+        )
+    elif dest == "amount":
+        st["step"] = "amount"
+        st["waiting_amount"] = "1"
+        kb, bal_disp = _tw_amount_keyboard(uid, st["wallet"], st["from"])
+        _tw_reply_edit(q,
+            f"FROM {st['from']} TO {st['to']}\n\nEnter amount of {st['from']} to trade (type a number in chat).\nBalance: {bal_disp} {st['from']}",
+            kb
+        )
+    elif dest == "slip":
+        st["step"] = "slip"
+        kb = _tw_slip_keyboard(uid)
+        _tw_reply_edit(q,
+            f"Amount: {st.get('amount','?')} {st.get('from','?')}\nSelect slippage limit:",
+            kb
+        )
+
+def _tw_handle_approve(q, uid):
+    if not is_admin(q.from_user.id):
+        q.answer("Not authorized.", show_alert=True); return
+    st = _tw_require_state(uid)
+    if TE is None or runner is None:
+        q.answer("Approve backend missing.", show_alert=True); return
+    try:
+        amt = Decimal(st["amount"])
+        sym = st["from"]
+        wallet_key = st["wallet"]
+        token_addr = runner._addr(sym)  # symbol -> address via runner map
+        dec = TE.get_decimals(token_addr)
+        wei = int(amt * (Decimal(10) ** dec))
+        TE.approve_if_needed(wallet_key, token_addr, TE.ROUTER_ADDR_ETH, wei)
+        # Re-render quote after approval
+        txt, kb_rows, _ = _tw_render_manual_quote(uid, st)
+        _tw_reply_edit(q, txt, kb_rows)
+        q.answer("Approve sent.")
+    except Exception as e:
+        _tw_reply_edit(q, f"Approval failed:\n<code>{e}</code>", html=True)
+        q.answer("Failed.", show_alert=True)
+
+def _tw_handle_execute(q, uid):
+    if not is_admin(q.from_user.id):
+        q.answer("Not authorized.", show_alert=True); return
+    st = _tw_require_state(uid)
+    if runner is None or not hasattr(runner, "execute_manual_quote"):
+        q.answer("Execution backend missing.", show_alert=True); return
+    try:
+        amt_dec = Decimal(st["amount"])
+    except Exception:
+        q.answer("Bad amount.", show_alert=True); return
+
+    try:
+        txr = runner.execute_manual_quote(
+            wallet_key=st["wallet"],
+            token_in=st["from"],
+            token_out=st["to"],
+            amount_in=amt_dec,
+            slippage_bps=int(st["slip_bps"]),
+        )
+        txh = txr.get("tx_hash","0x")
+        filled = txr.get("filled_text","")
+        gas_used = txr.get("gas_used","—")
+        explorer = txr.get("explorer_url","")
+        _tw_reply_edit(q, f"✅ Executed manual trade\n{filled}\nGas used: {gas_used}\nTx: {txh}\n{explorer}".strip())
+        if ALERT is not None:
+            try:
+                ALERT.send_alert(f"✅ Manual trade\n{filled}\nTx: {txh}")
+            except Exception:
+                pass
+        q.answer("Executed.")
+    except Exception as e:
+        _tw_reply_edit(q, f"❌ Execution failed\n{e}")
+        q.answer("Failed.", show_alert=True)
+
+def on_trade_callback(update: Update, context: CallbackContext):
+    q = update.callback_query
+    uid = q.from_user.id
+    data = q.data or ""
+
+    if data == "tw_cancel":
+        _TRADE_STATE.pop(uid, None)
+        q.edit_message_text("Canceled. No transaction sent.")
+        q.answer()
         return
 
-    txt = (update.message.text or "").strip()
+    if data.startswith("tw_wallet:"):
+        _tw_handle_wallet(q, uid, data.split(":",1)[1]); q.answer(); return
 
-    # 1) /trade amount capture
-    st_trade = _TRADE_STATE.get(uid)
-    if st_trade and st_trade.get("step") == "amount" and st_trade.get("waiting_amount") == "1":
-        try:
-            amt = Decimal(txt)
-            if amt <= 0:
-                raise ValueError("non-positive")
-            st_trade["waiting_amount"] = "0"
-            _tw_set_amount(uid, st_trade, str(amt))
-            kb = _tw_slip_keyboard(uid)
-            update.message.reply_text(
-                f"Amount set to {amt} {st_trade['from']}. Select slippage:",
-                reply_markup=InlineKeyboardMarkup(kb)
-            )
-            return
-        except Exception:
-            update.message.reply_text("Please send a positive numeric amount (e.g., 10 or 0.5).")
-            return
+    if data.startswith("tw_from:"):
+        _tw_handle_from(q, uid, data.split(":",1)[1]); q.answer(); return
 
-    # 2) /withdraw amount capture
-    st_wd = _WITHDRAW_STATE.get(uid)
-    if st_wd and st_wd.get("step") == "amount":
-        try:
-            amt = Decimal(txt)
-            if amt <= 0:
-                raise ValueError("non-positive")
-            _wd_set_amount(uid, st_wd, str(amt))
-            _wd_render_review(update, uid, via_message=True)
-        except Exception:
-            update.message.reply_text("Please send a positive numeric amount (e.g., 10 or 0.5).")
+    if data.startswith("tw_to:"):
+        _tw_handle_to(q, uid, data.split(":",1)[1]); q.answer(); return
+
+    if data == "tw_amt_all":
+        _tw_handle_amt_all(q, uid); q.answer(); return
+
+    if data == "tw_back_wallet":
+        _tw_handle_back(q, uid, "wallet"); q.answer(); return
+    if data == "tw_back_from":
+        _tw_handle_back(q, uid, "from"); q.answer(); return
+    if data == "tw_back_to":
+        _tw_handle_back(q, uid, "to"); q.answer(); return
+    if data == "tw_back_amount":
+        _tw_handle_back(q, uid, "amount"); q.answer(); return
+    if data == "tw_back_slip":
+        _tw_handle_back(q, uid, "slip"); q.answer(); return
+
+    if data.startswith("tw_slip:"):
+        _tw_handle_slip(q, uid, data.split(":",1)[1]); q.answer(); return
+
+    if data == "tw_do_approve":
+        _tw_handle_approve(q, uid); return
+    if data == "tw_do_execute":
+        _tw_handle_execute(q, uid); return
+
+    q.answer()
 
 # -----------------------------------------------------------------------------
 # /withdraw (implementation)
 # -----------------------------------------------------------------------------
-
 _WITHDRAW_STATE: Dict[int, Dict[str,str]] = {}
 TREASURY_ADDR = "0x360c48a44f513b5781854588d2f1A40E90093c60"
 
@@ -689,7 +1235,6 @@ def _perform_withdraw(wallet_key: str, asset: str, amount_dec: Decimal) -> Dict[
         return {"tx_hash": txh, "gas_used": gas_used, "asset": asset_u, "amount_wei": amount_wei}
 
     # ERC-20 path
-    # Prefer runner._addr mapping if available so symbols match trade routing
     if runner is not None and hasattr(runner, "_addr"):
         token_addr = runner._addr(asset)
     else:
@@ -796,6 +1341,50 @@ def on_withdraw_callback(update: Update, context: CallbackContext):
         _wd_handle_send(q, uid); return
 
     q.answer()
+
+# ---- Amount capture (typed number) ----
+def on_text_amount_capture(update: Update, context: CallbackContext):
+    """
+    Capture free-text numeric input for:
+      - /trade amount step
+      - /withdraw amount step
+    """
+    uid = update.effective_user.id if update.effective_user else None
+    if uid is None:
+        return
+
+    txt = (update.message.text or "").strip()
+
+    # 1) /trade amount capture
+    st_trade = _TRADE_STATE.get(uid)
+    if st_trade and st_trade.get("step") == "amount" and st_trade.get("waiting_amount") == "1":
+        try:
+            amt = Decimal(txt)
+            if amt <= 0:
+                raise ValueError("non-positive")
+            st_trade["waiting_amount"] = "0"
+            _tw_set_amount(uid, st_trade, str(amt))
+            kb = _tw_slip_keyboard(uid)
+            update.message.reply_text(
+                f"Amount set to {amt} {st_trade['from']}. Select slippage:",
+                reply_markup=InlineKeyboardMarkup(kb)
+            )
+            return
+        except Exception:
+            update.message.reply_text("Please send a positive numeric amount (e.g., 10 or 0.5).")
+            return
+
+    # 2) /withdraw amount capture
+    st_wd = _WITHDRAW_STATE.get(uid)
+    if st_wd and st_wd.get("step") == "amount":
+        try:
+            amt = Decimal(txt)
+            if amt <= 0:
+                raise ValueError("non-positive")
+            _wd_set_amount(uid, st_wd, str(amt))
+            _wd_render_review(update, uid, via_message=True)
+        except Exception:
+            update.message.reply_text("Please send a positive numeric amount (e.g., 10 or 0.5).")
 
 # ---------- Main ----------
 def main():
