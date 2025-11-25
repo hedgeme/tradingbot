@@ -139,7 +139,6 @@ def _fee_for_pair(token_in: str, token_out: str) -> int:
             a, b = pair.split("/", 1)
             if _canon(a) == ins and _canon(b) == outs:
                 return int(fee)
-            # also allow reverse check if code accidentally flips (we keep fwd here)
         except Exception:
             continue
     # Default harmony tiers commonly 500 for stable/WONE
@@ -308,15 +307,15 @@ def _prepare_manual_trade_for_wallet(
     # Build tx data for preview + gas estimate (same function signature as send path)
     fee = _fee_for_pair(token_in, token_out)
     path_bytes = TE._v3_path_bytes(addr_in, fee, addr_out)
+    gas = 300_000
     try:
-        # We use Quoter for the preview quote (already done in slippage), now encode swap
         router_c = TE.w3.eth.contract(address=router, abi=TE.ROUTER_EXACT_INPUT_ABI)
-        fn = router_c.functions.exactInput(path_bytes, int(amount_in_wei), int(min_out_wei), Web3.to_checksum_address(owner), int(TE.time.time()) + 600)
+        params = (path_bytes, Web3.to_checksum_address(owner), int(amount_in_wei), int(min_out_wei))
+        fn = router_c.functions.exactInput(params)
         try:
             data = fn._encode_transaction_data()
         except AttributeError:
             data = fn.encode_abi()
-        # Estimate gas with headroom inline (like TE.swap_v3_exact_input_once)
         tx = {
             "to": router,
             "value": 0,
@@ -331,7 +330,6 @@ def _prepare_manual_trade_for_wallet(
         except Exception:
             gas = 300_000
     except Exception:
-        gas = 300_000
         data = b""
 
     # Pretty tx preview (matches your dryrun style)
@@ -388,11 +386,28 @@ def execute_manual_quote(
     )
     txh = res.get("tx_hash", "")
     min_out_wei = int(res.get("amount_out_min", "0") or 0)
+    actual_out_wei = int(res.get("amount_out_actual", "0") or 0)
+    gas_used = int(res.get("gas_used", 0) or 0)
+
     min_out = (Decimal(min_out_wei) / (Decimal(10) ** dec_out)) if min_out_wei > 0 else Decimal("0")
+    actual_out = (Decimal(actual_out_wei) / (Decimal(10) ** dec_out)) if actual_out_wei > 0 else None
+
+    if actual_out is not None:
+        filled_text = (
+            f"Sent {_fmt_amt(token_in, amount_in)} {_display_sym(token_in)} → "
+            f"received {_fmt_amt(token_out, actual_out)} {_display_sym(token_out)} "
+            f"(min {_fmt_amt(token_out, min_out)} {_display_sym(token_out)})"
+        )
+    else:
+        filled_text = (
+            f"Sent {_fmt_amt(token_in, amount_in)} {_display_sym(token_in)} → "
+            f"min {_fmt_amt(token_out, min_out)} {_display_sym(token_out)} "
+            f"(fill pending / unknown)"
+        )
 
     return {
         "tx_hash": txh,
-        "filled_text": f"Sent {_fmt_amt(token_in, amount_in)} {_display_sym(token_in)} → min {_fmt_amt(token_out, min_out)} {_display_sym(token_out)}",
-        "gas_used": 0,   # you can enrich later with a receipt read if desired
+        "filled_text": filled_text,
+        "gas_used": gas_used,
         "explorer_url": f"https://explorer.harmony.one/tx/{txh}" if txh else "",
     }
