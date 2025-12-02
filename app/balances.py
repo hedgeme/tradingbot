@@ -1,108 +1,70 @@
-# app/balances.py
+#!/usr/bin/env python3
+# app/balances.py — unified balance fetcher for ONE(native) + ERC20
+#
+# Updated for full WONE support
+
 from __future__ import annotations
+import os
 from decimal import Decimal
-from typing import Dict
+from typing import Dict, Any
+
 from web3 import Web3
+from app.wallet import w3, WALLETS, get_erc20_decimals, get_erc20_balance_wei, get_native_balance_wei
 
-# Tolerant imports: config and get_ctx from either app.* or root
-try:
-    from app import config as C  # type: ignore
-except Exception:
-    import config as C  # type: ignore
 
-try:
-    from app.chain import get_ctx  # type: ignore
-except Exception:
-    from chain import get_ctx  # type: ignore
+# ---------------------------------------------------------------------
+# Contract addresses for ERC-20 tokens we track
+# ---------------------------------------------------------------------
+TOKENS: Dict[str, str] = {
+    # Wrapped ONE (ERC-20)
+    "WONE": Web3.to_checksum_address("0xcF664087a5bB0237a0BAd6742852ec6c8d69A27a"),
 
-# --- constants / mini ABIs ---
-_ERC20_DECIMALS_ABI = [{
-    "inputs": [],
-    "name": "decimals",
-    "outputs": [{"internalType": "uint8", "name": "", "type": "uint8"}],
-    "stateMutability": "view",
-    "type": "function"
-}]
-_ERC20_BAL_ABI = [{
-    "inputs": [{"internalType": "address", "name": "account", "type": "address"}],
-    "name": "balanceOf",
-    "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}],
-    "stateMutability": "view",
-    "type": "function"
-}]
+    # Harmony tokens
+    "1USDC": Web3.to_checksum_address("0xBC594CABd205bD993e7FfA6F3e9ceA75c1110da5"),
+    "1ETH":  Web3.to_checksum_address("0x4cC435d7b9557d54d6EF02d69Bbf72634905Bf11"),
+    "TEC":   Web3.to_checksum_address("0x0DEB9A1998aAE32dAAcF6de21161c3E942aCe074"),
+    "1sDAI": Web3.to_checksum_address("0xeDEb95D51dBc4116039435379Bd58472A2c09b1f"),
+}
 
-def _ctx():
-    return get_ctx(getattr(C, "HARMONY_RPC", "https://api.s0.t.hmny.io"))
 
-def _to_checksum(a: str) -> str:
-    return Web3.to_checksum_address(a)
+# ---------------------------------------------------------------------
+# Helper: fetch ERC20 balance
+# ---------------------------------------------------------------------
+def _erc20_human(symbol: str, wallet: str) -> Decimal:
+    addr = TOKENS[symbol]
+    raw = get_erc20_balance_wei(addr, wallet)
+    dec = get_erc20_decimals(addr)
+    return Decimal(raw) / (Decimal(10) ** dec)
 
-def _decimals_for(sym: str, token_addr: str) -> int:
-    """Prefer config hint; otherwise query chain safely."""
-    symU = sym.upper()
-    conf = getattr(C, "DECIMALS", {})
-    if conf and symU in conf:
-        return int(conf[symU])
-    w3 = _ctx().w3
-    try:
-        erc = w3.eth.contract(address=_to_checksum(token_addr), abi=_ERC20_DECIMALS_ABI)
-        return int(erc.functions.decimals().call())
-    except Exception:
-        # Conservative default
-        return 18
 
-def native_one_balance(wallet: str) -> Decimal:
-    w3 = _ctx().w3
-    wei = w3.eth.get_balance(_to_checksum(wallet))
-    # 1 ONE = 1e18 wei
-    return (Decimal(wei) / Decimal(10 ** 18)).quantize(Decimal("0.00000001"))
-
-def erc20_balance(sym: str, wallet: str) -> Decimal:
-    symU = sym.upper()
-    tokens: Dict[str, str] = {k.upper(): v for k, v in getattr(C, "TOKENS", {}).items()}
-    addr = tokens.get(symU)
-    if not addr:
-        return Decimal(0)
-    dec = _decimals_for(symU, addr)
-    w3 = _ctx().w3
-    try:
-        erc = w3.eth.contract(address=_to_checksum(addr), abi=_ERC20_BAL_ABI)
-        raw = erc.functions.balanceOf(_to_checksum(wallet)).call()
-        return (Decimal(raw) / Decimal(10 ** dec)).quantize(Decimal("0.00000001"))
-    except Exception:
-        return Decimal(0)
-
+# ---------------------------------------------------------------------
+# Main: fetch balances for all wallets
+# Returns:
+#   { wallet_name: { "ONE": dec, "WONE": dec, "1USDC": dec, ... } }
+# ---------------------------------------------------------------------
 def all_balances() -> Dict[str, Dict[str, Decimal]]:
-    """
-    Returns a dict: { wallet_name: { 'ONE(native)': Decimal, 'ONE': Decimal, <ERC20>: Decimal, ... } }
-    - 'ONE(native)' is always present and equals the native ONE balance.
-    - 'ONE' mirrors native ONE (so UI can drop '(native)' in the column header without breaking).
-    - Skips ERC-20 'ONE' and 'WONE' to avoid duplicate/confusing columns.
-    """
     out: Dict[str, Dict[str, Decimal]] = {}
-    wallets: Dict[str, str] = getattr(C, "WALLETS", {})
-    tokens: Dict[str, str] = {k.upper(): v for k, v in getattr(C, "TOKENS", {}).items()}
 
-    for w_name, w_addr in wallets.items():
+    for w_name, w_addr in WALLETS.items():
         row: Dict[str, Decimal] = {}
-        # Native ONE
-        try:
-            one_native = native_one_balance(w_addr)
-        except Exception:
-            one_native = Decimal(0)
-        # Expose as both keys for UI flexibility (you can choose which to display)
-        row["ONE(native)"] = one_native
-        row["ONE"] = one_native
 
-        # ERC-20 tokens — skip ONE/WONE to avoid duplicate display
-        for symU in tokens.keys():
-            if symU in ("ONE", "WONE"):
-                continue
+        # Native ONE (always exists)
+        try:
+            native = get_native_balance_wei(w_addr)
+            row["ONE"] = Decimal(native) / Decimal(10**18)
+        except Exception:
+            row["ONE"] = Decimal(0)
+
+        # ERC20 tokens
+        for sym in TOKENS.keys():
             try:
-                row[symU] = erc20_balance(symU, w_addr)
+                row[sym] = _erc20_human(sym, w_addr)
             except Exception:
-                row[symU] = Decimal(0)
+                row[sym] = Decimal(0)
 
         out[w_name] = row
 
     return out
+
+
+__all__ = ["all_balances", "TOKENS"]
