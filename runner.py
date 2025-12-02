@@ -94,8 +94,7 @@ def _display_sym(sym: str) -> str:
     """What we show back to the user."""
     u = (sym or "").upper()
     if u == "WONE":
-        return "ONE"
-    # Preserve 1sDAI exact casing for user display
+        return "WONE"
     if u == "1SDAI":
         return "1sDAI"
     return u
@@ -307,9 +306,9 @@ def _prepare_manual_trade_for_wallet(
     # Build tx data for preview + gas estimate (same function signature as send path)
     fee = _fee_for_pair(token_in, token_out)
     path_bytes = TE._v3_path_bytes(addr_in, fee, addr_out)
-    gas = 300_000
     try:
         router_c = TE.w3.eth.contract(address=router, abi=TE.ROUTER_EXACT_INPUT_ABI)
+        # NOTE: exactInput(params) layout differs from Quoter; here we stick to IV3SwapRouter.ExactInputParams
         params = (path_bytes, Web3.to_checksum_address(owner), int(amount_in_wei), int(min_out_wei))
         fn = router_c.functions.exactInput(params)
         try:
@@ -330,6 +329,7 @@ def _prepare_manual_trade_for_wallet(
         except Exception:
             gas = 300_000
     except Exception:
+        gas = 300_000
         data = b""
 
     # Pretty tx preview (matches your dryrun style)
@@ -386,28 +386,20 @@ def execute_manual_quote(
     )
     txh = res.get("tx_hash", "")
     min_out_wei = int(res.get("amount_out_min", "0") or 0)
-    actual_out_wei = int(res.get("amount_out_actual", "0") or 0)
-    gas_used = int(res.get("gas_used", 0) or 0)
-
     min_out = (Decimal(min_out_wei) / (Decimal(10) ** dec_out)) if min_out_wei > 0 else Decimal("0")
-    actual_out = (Decimal(actual_out_wei) / (Decimal(10) ** dec_out)) if actual_out_wei > 0 else None
 
-    if actual_out is not None:
-        filled_text = (
-            f"Sent {_fmt_amt(token_in, amount_in)} {_display_sym(token_in)} → "
-            f"received {_fmt_amt(token_out, actual_out)} {_display_sym(token_out)} "
-            f"(min {_fmt_amt(token_out, min_out)} {_display_sym(token_out)})"
-        )
-    else:
-        filled_text = (
-            f"Sent {_fmt_amt(token_in, amount_in)} {_display_sym(token_in)} → "
-            f"min {_fmt_amt(token_out, min_out)} {_display_sym(token_out)} "
-            f"(fill pending / unknown)"
-        )
+    gas_used = int(res.get("gas_used", 0) or 0)
+    gas_price_wei = int(res.get("gas_price_wei", 0) or 0)
+    gas_cost_wei = int(res.get("gas_cost_wei", gas_used * gas_price_wei))
+    gas_one = Decimal("0")
+    if gas_cost_wei:
+        gas_one = Decimal(gas_cost_wei) / (Decimal(10) ** 18)
+    gas_one_text = f"{gas_one:.6f}" if gas_cost_wei else "0"
 
     return {
         "tx_hash": txh,
-        "filled_text": filled_text,
+        "filled_text": f"Sent {_fmt_amt(token_in, amount_in)} {_display_sym(token_in)} → min {_fmt_amt(token_out, min_out)} {_display_sym(token_out)}",
         "gas_used": gas_used,
+        "gas_one_text": gas_one_text,
         "explorer_url": f"https://explorer.harmony.one/tx/{txh}" if txh else "",
     }
