@@ -5,7 +5,6 @@
 # - /trade Approve uses trade_executor.approve_if_needed(...) for exact amount
 # - /trade Execute uses runner.execute_manual_quote() (admin-gated)
 # - Users can type the amount (captured before catch-all logger)
-# - /withdraw sends ONE or ERC-20 (1USDC, 1sDAI, TEC, 1ETH) to treasury
 #
 import os, sys, logging, subprocess, shlex
 from datetime import datetime, timezone
@@ -80,7 +79,7 @@ except Exception:
         log.warning("runner module not available: %s", e)
         runner = None
 
-# wallet + trade_executor (for approve + gas helpers + withdraw)
+# wallet + trade_executor (for approve + gas helpers)
 try:
     from app import wallet as W
     log.info("Loaded wallet from app.wallet")
@@ -164,7 +163,7 @@ def _sym_for_route(sym: str) -> str:
 def _sym_for_display(sym: str) -> str:
     s = sym.upper()
     if s == "WONE":
-        return "ONE"
+        return "WONE"
     return s
 
 # ---------- Logging helpers ----------
@@ -252,7 +251,7 @@ def cmd_help(update: Update, context: CallbackContext):
         "  /ping — health check\n"
         "  /trade — manual trade (wallet, route, size, slippage, execute)\n"
         "  /withdraw — withdraw funds to treasury wallet\n"
-        "  /balances — per-wallet balances (ONE, USDC, ETH, TEC, sDAI)\n"
+        "  /balances — per-wallet balances (ONE, WONE, USDC, ETH, TEC, sDAI)\n"
         "  /prices — on-chain quotes in USDC\n"
         "  /slippage <IN> [AMOUNT] [OUT] — impact curve\n"
         "  /cooldowns [bot|route] — show cooldowns\n"
@@ -332,7 +331,8 @@ def cmd_balances(update: Update, context: CallbackContext):
         log.exception("balances failure")
         update.message.reply_text(f"Balances error: {e}"); return
 
-    cols = ["ONE", "1USDC", "1ETH", "TEC", "1sDAI"]
+    # Include WONE explicitly now
+    cols = ["ONE", "WONE", "1USDC", "1ETH", "TEC", "1sDAI"]
     w_wallet = 22
     w_amt    = 11
     header = f"{'Wallet':<{w_wallet}}  " + "  ".join(f"{c:>{w_amt}}" for c in cols)
@@ -343,28 +343,22 @@ def cmd_balances(update: Update, context: CallbackContext):
         row = table[w_name]
         vals: List[str] = []
         one_val = _resolve_one_value(row)
-        vals.append(_fmt_amt("ONE", one_val))
-        for c in cols[1:]:
+        vals.append(_fmt_amt("ONE", one_val))  # ONE (native)
+
+        # WONE explicit column (if present)
+        vals.append(_fmt_amt("WONE", row.get("WONE", 0)))
+
+        for c in cols[2:]:
             vals.append(_fmt_amt(c, row.get(c, 0)))
         lines.append(f"{w_name:<{w_wallet}}  " + "  ".join(f"{v:>{w_amt}}" for v in vals))
 
     update.message.reply_text(f"<pre>\n{chr(10).join(lines)}\n</pre>", parse_mode=ParseMode.HTML)
 
 # ---- price helpers ----
-
-def _coinbase_eth() -> Optional[Decimal]:
-    try:
-        import coinbase_client
-        val = coinbase_client.fetch_eth_usd_price()
-        return Decimal(str(val)) if val is not None else None
-    except Exception:
-        return None
+# (reuse your existing _eth_best_side_and_route, _coinbase_eth, cmd_prices,
+#  _mid_usdc_per_unit, cmd_slippage, but with WONE added to the syms list.)
 
 def _eth_best_side_and_route() -> Tuple[Optional[Decimal], str]:
-    """
-    Compute best ETH/USDC price using Harmony LP Quoter; choose fwd or reverse route
-    and compare to Coinbase to pick the tighter side (Option 1).
-    """
     if PR is None:
         return None, "fwd"
     try:
@@ -380,14 +374,12 @@ def _eth_best_side_and_route() -> Tuple[Optional[Decimal], str]:
                      {"internalType":"uint256","name":"gasEstimate","type":"uint256"}],
           "stateMutability":"nonpayable","type":"function"}]
         q = ctx.w3.eth.contract(address=Web3.to_checksum_address(C.QUOTER_ADDR), abi=ABI)
-
         def addr(s): return Web3.to_checksum_address(PR._addr(s))
         def fee3(f): return int(f).to_bytes(3, "big")
 
         dec_e = PR._dec("1ETH")
         dec_u = PR._dec("1USDC")
 
-        # Reverse side: USDC -> WONE -> 1ETH (compute USDC per ETH)
         choices = []
         for usdc_in in (Decimal("25"), Decimal("50"), Decimal("100"), Decimal("250")):
             wei = int(usdc_in * (Decimal(10)**dec_u))
@@ -401,7 +393,6 @@ def _eth_best_side_and_route() -> Tuple[Optional[Decimal], str]:
 
         rev = min(choices) if choices else None
 
-        # Forward side: 1ETH -> WONE -> 1USDC
         wei_in = int(Decimal("1") * (Decimal(10)**dec_e))
         path_f = (Web3.to_bytes(hexstr=addr("1ETH")) + fee3(3000) +
                   Web3.to_bytes(hexstr=addr("WONE")) + fee3(3000) +
@@ -422,11 +413,20 @@ def _eth_best_side_and_route() -> Tuple[Optional[Decimal], str]:
     except Exception:
         return None, "fwd"
 
+def _coinbase_eth() -> Optional[Decimal]:
+    try:
+        import coinbase_client
+        val = coinbase_client.fetch_eth_usd_price()
+        return Decimal(str(val)) if val is not None else None
+    except Exception:
+        return None
+
 def cmd_prices(update: Update, context: CallbackContext):
     if PR is None:
         update.message.reply_text("Prices unavailable (module not loaded)."); return
 
-    syms = ["ONE", "1USDC", "1sDAI", "TEC", "1ETH"]
+    # Include WONE explicitly
+    syms = ["ONE", "WONE", "1USDC", "1sDAI", "TEC", "1ETH"]
 
     w_asset, w_lp, w_basis, w_slip, w_route = 6, 11, 12, 9, 27
     header = (
@@ -448,6 +448,9 @@ def cmd_prices(update: Update, context: CallbackContext):
         try:
             if s == "ONE":
                 price = PR.price_usd("WONE", Decimal("1"))
+                route_text = "Native ONE ≈ WONE → 1USDC" if price is not None else "—"
+            elif s == "WONE":
+                price = PR.price_usd("WONE", Decimal("1"))
                 route_text = "WONE → 1USDC (fwd)" if price is not None else "—"
             elif s == "1USDC":
                 price = Decimal("1")
@@ -468,6 +471,7 @@ def cmd_prices(update: Update, context: CallbackContext):
             else:
                 price = PR.price_usd(s, Decimal("1"))
                 route_text = "—" if price is None else "(direct/best)"
+
         except Exception:
             price = None
 
@@ -495,8 +499,6 @@ def cmd_prices(update: Update, context: CallbackContext):
             pass
 
     update.message.reply_text(f"<pre>\n{chr(10).join(lines)}\n</pre>", parse_mode=ParseMode.HTML)
-
-# ---- SLIPPAGE TABLE ----
 
 def _mid_usdc_per_unit(token_in: str) -> Optional[Decimal]:
     if PR is None:
@@ -728,7 +730,8 @@ def _tw_require_state(uid):
     return st
 
 def _tw_assets_keyboard(uid, which):
-    syms = ["ONE", "1USDC", "1sDAI", "TEC", "1ETH"]
+    # Include WONE explicitly
+    syms = ["ONE", "WONE", "1USDC", "1sDAI", "TEC", "1ETH"]
     kb = [[InlineKeyboardButton(s, callback_data=f"tw_{which}:{s}")] for s in syms]
     kb.append([InlineKeyboardButton("⬅ Back", callback_data="tw_back_wallet" if which=="from" else "tw_back_from")])
     kb.append([InlineKeyboardButton("❌ Cancel", callback_data="tw_cancel")])
@@ -946,9 +949,9 @@ def _tw_handle_approve(q, uid):
         amt = Decimal(st["amount"])
         sym = st["from"]
         wallet_key = st["wallet"]
-        token_addr = runner._addr(sym)  # resolve symbol -> address using runner map
+        token_addr = runner._addr(sym)
         dec = TE.get_decimals(token_addr)
-        wei = int(amt * (Decimal(10)**dec))
+        wei = int(amt * (Decimal(10) ** dec))
         TE.approve_if_needed(wallet_key, token_addr, TE.ROUTER_ADDR_ETH, wei)
         txt, kb_rows, _ = _tw_render_manual_quote(uid, st)
         _tw_reply_edit(q, txt, kb_rows)
@@ -979,8 +982,25 @@ def _tw_handle_execute(q, uid):
         txh = txr.get("tx_hash","0x")
         filled = txr.get("filled_text","")
         gas_used = txr.get("gas_used","—")
+        gas_one_text = txr.get("gas_one_text")
         explorer = txr.get("explorer_url","")
-        _tw_reply_edit(q, f"✅ Executed manual trade\n{filled}\nGas used: {gas_used}\nTx: {txh}\n{explorer}".strip())
+        wallet = st["wallet"]
+
+        gas_line = f"Gas used: {gas_used}"
+        if gas_one_text:
+            gas_line += f" (~{gas_one_text} ONE)"
+
+        msg_lines = [
+            "✅ Executed manual trade",
+            f"Wallet: {wallet}",
+            filled,
+            gas_line,
+            f"Tx: {txh}",
+        ]
+        if explorer:
+            msg_lines.append(explorer)
+
+        _tw_reply_edit(q, "\n".join(msg_lines).strip())
         q.answer("Executed.")
     except Exception as e:
         _tw_reply_edit(q, f"❌ Execution failed\n{e}")
@@ -1030,6 +1050,50 @@ def on_trade_callback(update: Update, context: CallbackContext):
 
     q.answer()
 
+# ---- Amount capture (typed number) ----
+def on_text_amount_capture(update: Update, context: CallbackContext):
+    """
+    Capture free-text numeric input for:
+      - /trade amount step
+      - /withdraw amount step
+    """
+    uid = update.effective_user.id if update.effective_user else None
+    if uid is None:
+        return
+
+    txt = (update.message.text or "").strip()
+
+    # 1) /trade amount capture
+    st_trade = _TRADE_STATE.get(uid)
+    if st_trade and st_trade.get("step") == "amount" and st_trade.get("waiting_amount") == "1":
+        try:
+            amt = Decimal(txt)
+            if amt <= 0:
+                raise ValueError("non-positive")
+            st_trade["waiting_amount"] = "0"
+            _tw_set_amount(uid, st_trade, str(amt))
+            kb = _tw_slip_keyboard(uid)
+            update.message.reply_text(
+                f"Amount set to {amt} {st_trade['from']}. Select slippage:",
+                reply_markup=InlineKeyboardMarkup(kb)
+            )
+            return
+        except Exception:
+            update.message.reply_text("Please send a positive numeric amount (e.g., 10 or 0.5).")
+            return
+
+    # 2) /withdraw amount capture
+    st_wd = _WITHDRAW_STATE.get(uid)
+    if st_wd and st_wd.get("step") == "amount":
+        try:
+            amt = Decimal(txt)
+            if amt <= 0:
+                raise ValueError("non-positive")
+            _wd_set_amount(uid, st_wd, str(amt))
+            _wd_render_review(update, uid, via_message=True)
+        except Exception:
+            update.message.reply_text("Please send a positive numeric amount (e.g., 10 or 0.5).")
+
 # -----------------------------------------------------------------------------
 # /withdraw (implementation)
 # -----------------------------------------------------------------------------
@@ -1073,7 +1137,8 @@ def _wd_require_state(uid):
     return st
 
 def _wd_assets_keyboard():
-    syms = ["ONE", "1USDC", "1sDAI", "TEC", "1ETH"]
+    # Include WONE explicitly
+    syms = ["ONE", "WONE", "1USDC", "1sDAI", "TEC", "1ETH"]
     kb = [[InlineKeyboardButton(s, callback_data=f"wd_asset:{s}")] for s in syms]
     kb.append([InlineKeyboardButton("⬅ Back", callback_data="wd_back_wallet")])
     kb.append([InlineKeyboardButton("❌ Cancel", callback_data="wd_cancel")])
@@ -1189,8 +1254,7 @@ def _wd_handle_back(q, uid, dest):
 def _perform_withdraw(wallet_key: str, asset: str, amount_dec: Decimal) -> Dict[str, Any]:
     """
     Send a withdrawal from the given bot wallet to TREASURY_ADDR.
-    Handles native ONE and ERC20 (1USDC, 1sDAI, TEC, 1ETH).
-    Uses a dedicated ERC-20 ABI including transfer().
+    Handles native ONE and ERC20 (1USDC, 1sDAI, TEC, 1ETH, WONE).
     """
     if TE is None or W is None:
         raise RuntimeError("trade_executor/wallet module unavailable")
@@ -1202,8 +1266,10 @@ def _perform_withdraw(wallet_key: str, asset: str, amount_dec: Decimal) -> Dict[
     asset_u = asset.upper()
     txh = ""
     gas_used = 0
+    gas_price = 0
+    gas_cost_wei = 0
 
-    # Native ONE withdrawal
+    # Native ONE transfer
     if asset_u == "ONE":
         dec = 18
         amount_wei = int((amount_dec * (Decimal(10) ** dec)).to_integral_value(rounding=ROUND_DOWN))
@@ -1219,16 +1285,26 @@ def _perform_withdraw(wallet_key: str, asset: str, amount_dec: Decimal) -> Dict[
             tx["gas"] = max(int(est * 1.2), 50_000)
         except Exception:
             tx["gas"] = 100_000
+        gas_price = tx["gasPrice"]
         signed = acct.sign_transaction(tx)
         txh = TE.w3.eth.send_raw_transaction(signed.raw_transaction).hex()
         try:
             r = TE.w3.eth.wait_for_transaction_receipt(txh, timeout=180)
-            gas_used = getattr(r, "gasUsed", 0)
+            gas_used = int(getattr(r, "gasUsed", 0) or 0)
         except Exception:
-            pass
-        return {"tx_hash": txh, "gas_used": gas_used, "asset": asset_u, "amount_wei": amount_wei}
+            gas_used = 0
+        if gas_used and gas_price:
+            gas_cost_wei = int(gas_price) * gas_used
+        return {
+            "tx_hash": txh,
+            "gas_used": gas_used,
+            "gas_price_wei": int(gas_price),
+            "gas_cost_wei": int(gas_cost_wei),
+            "asset": asset_u,
+            "amount_wei": amount_wei,
+        }
 
-    # ERC-20 withdrawal (use full ABI with transfer)
+    # ERC-20 path
     if runner is not None and hasattr(runner, "_addr"):
         token_addr = runner._addr(asset)
     else:
@@ -1237,22 +1313,7 @@ def _perform_withdraw(wallet_key: str, asset: str, amount_dec: Decimal) -> Dict[
     dec = TE.get_decimals(token_addr)
     amount_wei = int((amount_dec * (Decimal(10) ** dec)).to_integral_value(rounding=ROUND_DOWN))
 
-    ERC20_TRANSFER_ABI = [{
-        "inputs": [
-            {"internalType": "address", "name": "recipient", "type": "address"},
-            {"internalType": "uint256", "name": "amount", "type": "uint256"}
-        ],
-        "name": "transfer",
-        "outputs": [{"internalType": "bool", "name": "", "type": "bool"}],
-        "stateMutability": "nonpayable",
-        "type": "function"
-    }]
-
-    token = TE.w3.eth.contract(
-        address=Web3.to_checksum_address(token_addr),
-        abi=ERC20_TRANSFER_ABI
-    )
-
+    token = TE._erc20(token_addr)
     fn = token.functions.transfer(to_addr, int(amount_wei))
     try:
         data = fn._encode_transaction_data()
@@ -1273,15 +1334,25 @@ def _perform_withdraw(wallet_key: str, asset: str, amount_dec: Decimal) -> Dict[
     except Exception:
         tx["gas"] = 200_000
 
+    gas_price = tx["gasPrice"]
     signed = acct.sign_transaction(tx)
     txh = TE.w3.eth.send_raw_transaction(signed.raw_transaction).hex()
     try:
         r = TE.w3.eth.wait_for_transaction_receipt(txh, timeout=180)
-        gas_used = getattr(r, "gasUsed", 0)
+        gas_used = int(getattr(r, "gasUsed", 0) or 0)
     except Exception:
-        pass
+        gas_used = 0
+    if gas_used and gas_price:
+        gas_cost_wei = int(gas_price) * gas_used
 
-    return {"tx_hash": txh, "gas_used": gas_used, "asset": asset_u, "amount_wei": amount_wei}
+    return {
+        "tx_hash": txh,
+        "gas_used": gas_used,
+        "gas_price_wei": int(gas_price),
+        "gas_cost_wei": int(gas_cost_wei),
+        "asset": asset_u,
+        "amount_wei": amount_wei,
+    }
 
 def _wd_handle_send(q, uid):
     if not is_admin(q.from_user.id):
@@ -1297,7 +1368,14 @@ def _wd_handle_send(q, uid):
     try:
         res = _perform_withdraw(wallet_key, asset, amount_dec)
         txh = res.get("tx_hash", "")
-        gas_used = res.get("gas_used", 0)
+        gas_used = int(res.get("gas_used", 0) or 0)
+        gas_price_wei = int(res.get("gas_price_wei", 0) or 0)
+        gas_cost_wei = int(res.get("gas_cost_wei", gas_used * gas_price_wei))
+        gas_one_text = "0"
+        if gas_cost_wei:
+            gas_one = Decimal(gas_cost_wei) / (Decimal(10) ** 18)
+            gas_one_text = f"{gas_one:.6f}"
+
         explorer = f"https://explorer.harmony.one/tx/{txh}" if txh else ""
         msg = (
             "✅ Withdrawal sent\n"
@@ -1305,7 +1383,7 @@ def _wd_handle_send(q, uid):
             f"Asset: {asset}\n"
             f"Amount: {st['amount']} {asset}\n"
             f"To: {TREASURY_ADDR}\n"
-            f"Gas used: {gas_used}\n"
+            f"Gas: {gas_used} (~{gas_one_text} ONE)\n"
             f"Tx: {txh}\n"
             f"{explorer}"
         ).strip()
@@ -1351,50 +1429,6 @@ def on_withdraw_callback(update: Update, context: CallbackContext):
 
     q.answer()
 
-# ---- Amount capture (typed number) ----
-def on_text_amount_capture(update: Update, context: CallbackContext):
-    """
-    Capture free-text numeric input for:
-      - /trade amount step
-      - /withdraw amount step
-    """
-    uid = update.effective_user.id if update.effective_user else None
-    if uid is None:
-        return
-
-    txt = (update.message.text or "").strip()
-
-    # 1) /trade amount capture
-    st_trade = _TRADE_STATE.get(uid)
-    if st_trade and st_trade.get("step") == "amount" and st_trade.get("waiting_amount") == "1":
-        try:
-            amt = Decimal(txt)
-            if amt <= 0:
-                raise ValueError("non-positive")
-            st_trade["waiting_amount"] = "0"
-            _tw_set_amount(uid, st_trade, str(amt))
-            kb = _tw_slip_keyboard(uid)
-            update.message.reply_text(
-                f"Amount set to {amt} {st_trade['from']}. Select slippage:",
-                reply_markup=InlineKeyboardMarkup(kb)
-            )
-            return
-        except Exception:
-            update.message.reply_text("Please send a positive numeric amount (e.g., 10 or 0.5).")
-            return
-
-    # 2) /withdraw amount capture
-    st_wd = _WITHDRAW_STATE.get(uid)
-    if st_wd and st_wd.get("step") == "amount":
-        try:
-            amt = Decimal(txt)
-            if amt <= 0:
-                raise ValueError("non-positive")
-            _wd_set_amount(uid, st_wd, str(amt))
-            _wd_render_review(update, uid, via_message=True)
-        except Exception:
-            update.message.reply_text("Please send a positive numeric amount (e.g., 10 or 0.5).")
-
 # ---------- Main ----------
 def main():
     token = os.environ.get("TELEGRAM_BOT_TOKEN") or getattr(C, "TELEGRAM_BOT_TOKEN", None)
@@ -1419,7 +1453,7 @@ def main():
     dp.add_handler(CommandHandler("dryrun", cmd_dryrun))
     dp.add_handler(CommandHandler("cooldowns", cmd_cooldowns, pass_args=True))
 
-    # Trade & withdraw
+    # NEW
     dp.add_handler(CommandHandler("trade", cmd_trade))
     dp.add_handler(CommandHandler("withdraw", cmd_withdraw))
 
@@ -1428,6 +1462,7 @@ def main():
     dp.add_handler(CallbackQueryHandler(on_exec_confirm, pattern=r"^exec_go:[A-Za-z0-9_\-]+$"))
     dp.add_handler(CallbackQueryHandler(on_exec_cancel, pattern=r"^exec_cancel$"))
 
+    # NEW callback groups for trade/withdraw
     dp.add_handler(CallbackQueryHandler(on_trade_callback, pattern=r"^tw_"))
     dp.add_handler(CallbackQueryHandler(on_withdraw_callback, pattern=r"^wd_"))
 
