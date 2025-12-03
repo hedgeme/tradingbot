@@ -1,15 +1,31 @@
 #!/usr/bin/env python3
 # app/balances.py — unified balance fetcher for ONE(native) + ERC20
 #
-# Updated for full WONE support
+# Updated for:
+#   - Full WONE support
+#   - Only wallets listed in config.WALLETS are shown in /balances
 
 from __future__ import annotations
 import os
 from decimal import Decimal
-from typing import Dict, Any
+from typing import Dict
 
 from web3 import Web3
-from app.wallet import w3, WALLETS, get_erc20_decimals, get_erc20_balance_wei, get_native_balance_wei
+
+# Core wallet helpers (RPC + low-level balance functions + default wallet map)
+from app.wallet import (
+    w3,
+    WALLETS as WALLET_DEFAULTS,
+    get_erc20_decimals,
+    get_erc20_balance_wei,
+    get_native_balance_wei,
+)
+
+# Try to use config.WALLETS as the authoritative list shown in /balances
+try:
+    from app import config as C
+except Exception:
+    import config as C  # type: ignore
 
 
 # ---------------------------------------------------------------------
@@ -28,7 +44,7 @@ TOKENS: Dict[str, str] = {
 
 
 # ---------------------------------------------------------------------
-# Helper: fetch ERC20 balance
+# Helper: fetch ERC20 balance as Decimal
 # ---------------------------------------------------------------------
 def _erc20_human(symbol: str, wallet: str) -> Decimal:
     addr = TOKENS[symbol]
@@ -41,11 +57,26 @@ def _erc20_human(symbol: str, wallet: str) -> Decimal:
 # Main: fetch balances for all wallets
 # Returns:
 #   { wallet_name: { "ONE": dec, "WONE": dec, "1USDC": dec, ... } }
+#
+# Wallets shown:
+#   - Prefer config.WALLETS (what your Telegram bot uses)
+#   - Fallback to app.wallet.WALLETS if config has no WALLETS
 # ---------------------------------------------------------------------
 def all_balances() -> Dict[str, Dict[str, Decimal]]:
     out: Dict[str, Dict[str, Decimal]] = {}
 
-    for w_name, w_addr in WALLETS.items():
+    # Prefer the curated wallet list from config (tecbot_eth, tecbot_usdc, etc.)
+    cfg_wallets = getattr(C, "WALLETS", None) or {}
+    if cfg_wallets:
+        wallets = cfg_wallets
+    else:
+        wallets = WALLET_DEFAULTS
+
+    for w_name, w_addr in wallets.items():
+        if not w_addr:
+            # Skip empty / unconfigured wallet entries
+            continue
+
         row: Dict[str, Decimal] = {}
 
         # Native ONE (always exists)
