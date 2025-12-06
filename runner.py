@@ -1,5 +1,6 @@
 # /bot/runner.py
 # Minimal dryrun stubs (kept) + real manual quote/execute wired to trade_executor
+# Extended with ONE<->WONE wrap/unwrap support and gas tracking.
 
 from dataclasses import dataclass
 from typing import List, Optional, Dict, Any, NamedTuple
@@ -55,10 +56,10 @@ def execute_action(action_id: str) -> ExecResult:
     if action_id not in _CACHE:
         raise RuntimeError("Action not prepared (dry-run cache miss).")
     return ExecResult(
-        tx_hash="0x" + "ab"*16,
+        tx_hash="0x" + "ab" * 16,
         filled_text="Filled: 1,500.00 USDC → 1,499.92 sDAI",
         gas_used=212144,
-        explorer_url="https://explorer.harmony.one/tx/0x" + "ab"*16,
+        explorer_url="https://explorer.harmony.one/tx/0x" + "ab" * 16,
     )
 
 # ---------------------------------------------------------------------------------
@@ -94,7 +95,7 @@ def _display_sym(sym: str) -> str:
     """What we show back to the user."""
     u = (sym or "").upper()
     if u == "WONE":
-        return "WONE"
+        return "WONE"  # keep separate from ONE in UI
     if u == "1SDAI":
         return "1sDAI"
     return u
@@ -104,7 +105,7 @@ def _addr(sym: str) -> str:
     Resolve symbol to checksum address via config first, then TE.FALLBACK_TOKENS.
     Case-insensitive matching; supports 1sDAI/1SDAI, ONE/WONE, etc.
     """
-    s = _canon(sym)            # e.g. "1sDAI"
+    s = _canon(sym)            # e.g. "1sDAI" or "WONE"
     su = s.upper()             # e.g. "1SDAI"
 
     # Try config.TOKENS first (case-insensitive)
@@ -160,6 +161,155 @@ def _path_human_with_fee(token_in: str, token_out: str, fee: int) -> str:
 
 def _router_addr() -> str:
     return Web3.to_checksum_address(getattr(TE, "ROUTER_ADDR_ETH"))
+
+# ---------- WONE wrap/unwrap helpers ----------
+# Simple WONE ABI subset (deposit/withdraw) — Harmony’s WONE is WETH-style.
+_WONE_ABI = [
+    {
+        "name": "deposit",
+        "type": "function",
+        "stateMutability": "payable",
+        "inputs": [],
+        "outputs": []
+    },
+    {
+        "name": "withdraw",
+        "type": "function",
+        "stateMutability": "nonpayable",
+        "inputs": [{"name": "wad", "type": "uint256"}],
+        "outputs": []
+    },
+]
+
+def _wone_address() -> str:
+    return _addr("WONE")
+
+def _wone_contract():
+    return TE.w3.eth.contract(
+        address=Web3.to_checksum_address(_wone_address()),
+        abi=_WONE_ABI
+    )
+
+def _gas_cost_summary(gas_used: int, gas_price_wei: Optional[int]) -> Dict[str, Any]:
+    """
+    Compute gas cost in ONE given gasUsed and gasPrice (wei).
+    Returns dict with 'gas_used', 'gas_cost_wei', 'gas_cost_one' (Decimal).
+    """
+    if not gas_used or not gas_price_wei or gas_used <= 0 or gas_price_wei <= 0:
+        return {"gas_used": int(gas_used or 0), "gas_cost_wei": 0, "gas_cost_one": Decimal("0")}
+    cost_wei = int(gas_used) * int(gas_price_wei)
+    cost_one = Decimal(cost_wei) / (Decimal(10) ** 18)
+    return {"gas_used": int(gas_used), "gas_cost_wei": cost_wei, "gas_cost_one": cost_one}
+
+def _wrap_one(wallet_key: str, amount: Decimal) -> Dict[str, Any]:
+    """
+    Wrap native ONE into WONE by calling deposit() on the WONE contract.
+    This sends ONE from the strategy wallet and mints equal WONE.
+    """
+    if amount <= 0:
+        return {"tx_hash": "", "gas_used": 0, "gas_cost_wei": 0, "gas_cost_one": Decimal("0")}
+
+    acct = TE._get_account(wallet_key)
+    from_addr = Web3.to_checksum_address(acct.address)
+    wone = _wone_contract()
+
+    dec = 18  # native ONE decimals
+    amount_wei = int((amount * (Decimal(10) ** dec)).to_integral_value(rounding=ROUND_DOWN))
+
+    fn = wone.functions.deposit()
+    try:
+        data = fn._encode_transaction_data()
+    except AttributeError:
+        data = fn.encode_abi()
+
+    gas_price = TE._current_gas_price_wei_capped() if hasattr(TE, "_current_gas_price_wei_capped") else W.suggest_gas_price_wei()
+
+    tx = {
+        "to": Web3.to_checksum_address(_wone_address()),
+        "value": amount_wei,
+        "data": data,
+        "chainId": TE.HMY_CHAIN_ID,
+        "nonce": TE.w3.eth.get_transaction_count(from_addr),
+        "gasPrice": int(gas_price),
+    }
+
+    try:
+        est = TE.w3.eth.estimate_gas({**tx, "from": from_addr})
+        tx["gas"] = max(int(est * 1.2), 80_000)
+    except Exception:
+        tx["gas"] = 120_000
+
+    signed = acct.sign_transaction(tx)
+    txh = TE.w3.eth.send_raw_transaction(signed.raw_transaction).hex()
+
+    gas_used = 0
+    gp_effective = int(gas_price)
+    try:
+        r = TE.w3.eth.wait_for_transaction_receipt(txh, timeout=180)
+        gas_used = int(getattr(r, "gasUsed", 0))
+        # effectiveGasPrice may exist on some nodes
+        gp_effective = int(getattr(r, "effectiveGasPrice", getattr(r, "gasPrice", gas_price)))
+    except Exception:
+        pass
+
+    gas_info = _gas_cost_summary(gas_used, gp_effective)
+    gas_info["tx_hash"] = txh
+    return gas_info
+
+def _unwrap_one(wallet_key: str, amount: Decimal) -> Dict[str, Any]:
+    """
+    Unwrap WONE into native ONE by calling withdraw(wad) on the WONE contract.
+    NOTE: Uses the provided Decimal amount (commonly minOut). Any extra WONE
+    from the swap (if actualOut > minOut) remains as WONE, which is safe.
+    """
+    if amount <= 0:
+        return {"tx_hash": "", "gas_used": 0, "gas_cost_wei": 0, "gas_cost_one": Decimal("0")}
+
+    acct = TE._get_account(wallet_key)
+    from_addr = Web3.to_checksum_address(acct.address)
+    wone = _wone_contract()
+
+    dec = 18
+    amount_wei = int((amount * (Decimal(10) ** dec)).to_integral_value(rounding=ROUND_DOWN))
+
+    fn = wone.functions.withdraw(int(amount_wei))
+    try:
+        data = fn._encode_transaction_data()
+    except AttributeError:
+        data = fn.encode_abi()
+
+    gas_price = TE._current_gas_price_wei_capped() if hasattr(TE, "_current_gas_price_wei_capped") else W.suggest_gas_price_wei()
+
+    tx = {
+        "to": Web3.to_checksum_address(_wone_address()),
+        "value": 0,
+        "data": data,
+        "chainId": TE.HMY_CHAIN_ID,
+        "nonce": TE.w3.eth.get_transaction_count(from_addr),
+        "gasPrice": int(gas_price),
+    }
+
+    try:
+        est = TE.w3.eth.estimate_gas({**tx, "from": from_addr})
+        tx["gas"] = max(int(est * 1.2), 80_000)
+    except Exception:
+        tx["gas"] = 120_000
+
+    signed = acct.sign_transaction(tx)
+    txh = TE.w3.eth.send_raw_transaction(signed.raw_transaction).hex()
+
+    gas_used = 0
+    gp_effective = int(gas_price)
+    try:
+        r = TE.w3.eth.wait_for_transaction_receipt(txh, timeout=180)
+        gas_used = int(getattr(r, "gasUsed", 0))
+        gp_effective = int(getattr(r, "effectiveGasPrice", getattr(r, "gasPrice", gas_price)))
+    except Exception:
+        pass
+
+    gas_info = _gas_cost_summary(gas_used, gp_effective)
+    gas_info["tx_hash"] = txh
+    return gas_info
 
 # ---------- Result container for /trade preview ----------
 class ManualQuoteResult(NamedTuple):
@@ -245,8 +395,14 @@ def build_manual_quote(
     )
 
     amount_in_text = f"{_fmt_amt(token_in, amount_in)} {_display_sym(token_in)}"
-    quote_out_text = f"{_fmt_amt(token_out, quoted_out)} {_display_sym(token_out)}" if quoted_out is not None else f"~? {_display_sym(token_out)}"
-    min_out_text   = f"{_fmt_amt(token_out, min_out)} {_display_sym(token_out)}" if min_out is not None else f"? {_display_sym(token_out)}"
+    quote_out_text = (
+        f"{_fmt_amt(token_out, quoted_out)} {_display_sym(token_out)}"
+        if quoted_out is not None else f"~? {_display_sym(token_out)}"
+    )
+    min_out_text   = (
+        f"{_fmt_amt(token_out, min_out)} {_display_sym(token_out)}"
+        if min_out is not None else f"? {_display_sym(token_out)}"
+    )
 
     return ManualQuoteResult(
         action_id="manual",
@@ -307,21 +463,31 @@ def _prepare_manual_trade_for_wallet(
     fee = _fee_for_pair(token_in, token_out)
     path_bytes = TE._v3_path_bytes(addr_in, fee, addr_out)
     try:
+        # We use Quoter for the preview quote (already done in slippage), now encode swap
         router_c = TE.w3.eth.contract(address=router, abi=TE.ROUTER_EXACT_INPUT_ABI)
-        # NOTE: exactInput(params) layout differs from Quoter; here we stick to IV3SwapRouter.ExactInputParams
-        params = (path_bytes, Web3.to_checksum_address(owner), int(amount_in_wei), int(min_out_wei))
-        fn = router_c.functions.exactInput(params)
+        fn = router_c.functions.exactInput(
+            path_bytes,
+            int(amount_in_wei),
+            int(min_out_wei),
+            Web3.to_checksum_address(owner),
+            int(TE.time.time()) + 600
+        )
         try:
             data = fn._encode_transaction_data()
         except AttributeError:
             data = fn.encode_abi()
+        # Estimate gas with headroom inline (like TE.swap_v3_exact_input_once)
         tx = {
             "to": router,
             "value": 0,
             "data": data,
             "chainId": TE.HMY_CHAIN_ID,
             "nonce": TE.w3.eth.get_transaction_count(Web3.to_checksum_address(owner)),
-            "gasPrice": TE._current_gas_price_wei_capped() if hasattr(TE, "_current_gas_price_wei_capped") else W.suggest_gas_price_wei(),
+            "gasPrice": (
+                TE._current_gas_price_wei_capped()
+                if hasattr(TE, "_current_gas_price_wei_capped")
+                else W.suggest_gas_price_wei()
+            ),
         }
         try:
             est = TE.w3.eth.estimate_gas({**tx, "from": Web3.to_checksum_address(owner)})
@@ -356,10 +522,19 @@ def execute_manual_quote(
     amount_in: Decimal,
     slippage_bps: int
 ) -> Dict[str, Any]:
+    """
+    Execute a single-hop v3 swap with optional ONE<->WONE wrapping:
+      - If FROM = ONE: wrap ONE -> WONE, then trade WONE -> token_out
+      - If TO   = ONE: trade token_in -> WONE, then unwrap WONE -> ONE (minOut)
+    Returns tx hash, filled text, total gas used, gas cost in ONE, explorer URL.
+    """
 
     owner = W.WALLETS.get(wallet_key) or ""
     if not owner:
         raise RuntimeError(f"Unknown wallet key: {wallet_key}")
+
+    base_in  = token_in.upper()
+    base_out = token_out.upper()
 
     addr_in  = _addr(token_in)
     addr_out = _addr(token_out)
@@ -370,6 +545,19 @@ def execute_manual_quote(
 
     amount_in_wei = int((amount_in * (Decimal(10) ** dec_in)).to_integral_value(rounding=ROUND_DOWN))
 
+    total_gas_used = 0
+    total_cost_wei = 0
+
+    # 1) If FROM = ONE (native), wrap into WONE first.
+    if base_in == "ONE":
+        wrap_info = _wrap_one(wallet_key, amount_in)
+        total_gas_used += int(wrap_info.get("gas_used", 0))
+        total_cost_wei += int(wrap_info.get("gas_cost_wei", 0))
+        # After wrap, on-chain we now spend WONE for the swap.
+        addr_in = _addr("WONE")
+        dec_in = 18
+        amount_in_wei = int((amount_in * (Decimal(10) ** dec_in)).to_integral_value(rounding=ROUND_DOWN))
+
     # Approve exact if needed (no unlimited)
     TE.approve_if_needed(wallet_key, addr_in, router, int(amount_in_wei))
 
@@ -378,7 +566,7 @@ def execute_manual_quote(
     res = TE.swap_v3_exact_input_once(
         wallet_key=wallet_key,
         token_in=addr_in,
-        token_out=addr_out,
+        token_out=_addr("WONE") if base_out == "ONE" else addr_out,
         amount_in_wei=int(amount_in_wei),
         fee=int(fee),
         slippage_bps=int(slippage_bps),
@@ -388,18 +576,45 @@ def execute_manual_quote(
     min_out_wei = int(res.get("amount_out_min", "0") or 0)
     min_out = (Decimal(min_out_wei) / (Decimal(10) ** dec_out)) if min_out_wei > 0 else Decimal("0")
 
-    gas_used = int(res.get("gas_used", 0) or 0)
-    gas_price_wei = int(res.get("gas_price_wei", 0) or 0)
-    gas_cost_wei = int(res.get("gas_cost_wei", gas_used * gas_price_wei))
-    gas_one = Decimal("0")
-    if gas_cost_wei:
-        gas_one = Decimal(gas_cost_wei) / (Decimal(10) ** 18)
-    gas_one_text = f"{gas_one:.6f}" if gas_cost_wei else "0"
+    # Read gas for the swap itself
+    gas_swap = 0
+    gp_swap = None
+    if txh:
+        try:
+            r = TE.w3.eth.wait_for_transaction_receipt(txh, timeout=180)
+            gas_swap = int(getattr(r, "gasUsed", 0))
+            gp_swap = int(getattr(r, "effectiveGasPrice", getattr(r, "gasPrice", 0)))
+        except Exception:
+            gas_swap = 0
+    gas_swap_info = _gas_cost_summary(gas_swap, gp_swap or 0)
+    total_gas_used += gas_swap_info["gas_used"]
+    total_cost_wei += gas_swap_info["gas_cost_wei"]
+
+    # 2) If TO = ONE, unwrap WONE -> ONE using minOut as safe lower bound
+    unwrap_info = {"gas_used": 0, "gas_cost_wei": 0, "gas_cost_one": Decimal("0"), "tx_hash": ""}
+    if base_out == "ONE" and min_out > 0:
+        unwrap_info = _unwrap_one(wallet_key, min_out)
+        total_gas_used += int(unwrap_info.get("gas_used", 0))
+        total_cost_wei += int(unwrap_info.get("gas_cost_wei", 0))
+
+    # Convert total gas cost to ONE
+    gas_cost_one = Decimal("0")
+    if total_cost_wei > 0:
+        gas_cost_one = Decimal(total_cost_wei) / (Decimal(10) ** 18)
+
+    # Build output message
+    display_in  = _display_sym(token_in)
+    display_out = _display_sym(token_out)
+
+    filled = (
+        f"Sent {_fmt_amt(token_in, amount_in)} {display_in} → "
+        f"min {_fmt_amt(token_out, min_out)} {display_out}"
+    )
 
     return {
         "tx_hash": txh,
-        "filled_text": f"Sent {_fmt_amt(token_in, amount_in)} {_display_sym(token_in)} → min {_fmt_amt(token_out, min_out)} {_display_sym(token_out)}",
-        "gas_used": gas_used,
-        "gas_one_text": gas_one_text,
+        "filled_text": filled,
+        "gas_used": int(total_gas_used),
+        "gas_cost_one": f"{gas_cost_one:.6f}",
         "explorer_url": f"https://explorer.harmony.one/tx/{txh}" if txh else "",
     }
