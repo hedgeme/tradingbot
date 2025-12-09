@@ -112,6 +112,29 @@ except Exception:
 
 from web3 import Web3  # used for withdraw TX building
 
+# ---------- Constants / WONE unwrap helpers ----------
+# Try to take WONE address from config.TOKENS; fallback to known WONE on Harmony
+try:
+    _cfg_wone = (getattr(C, "TOKENS", {}) or {}).get("WONE", "")
+    if _cfg_wone:
+        WONE_ADDR = Web3.to_checksum_address(_cfg_wone)
+    else:
+        # Known WONE on Harmony one:0x... (same as in alert.py)
+        WONE_ADDR = Web3.to_checksum_address("0xcF664087a5bB0237a0BAd6742852ec6c8d69A27a")
+except Exception:
+    WONE_ADDR = Web3.to_checksum_address("0xcF664087a5bB0237a0BAd6742852ec6c8d69A27a")
+
+# Minimal WETH-style ABI just for withdraw()
+WONE_ABI = [
+    {
+        "name": "withdraw",
+        "type": "function",
+        "stateMutability": "nonpayable",
+        "inputs": [{"name": "wad", "type": "uint256"}],
+        "outputs": [],
+    }
+]
+
 # ---------- Utilities ----------
 def now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
@@ -163,7 +186,7 @@ def _sym_for_route(sym: str) -> str:
 def _sym_for_display(sym: str) -> str:
     s = sym.upper()
     if s == "WONE":
-        return "WONE"
+        return "ONE"
     return s
 
 # ---------- Logging helpers ----------
@@ -331,7 +354,6 @@ def cmd_balances(update: Update, context: CallbackContext):
         log.exception("balances failure")
         update.message.reply_text(f"Balances error: {e}"); return
 
-    # Include WONE explicitly now
     cols = ["ONE", "WONE", "1USDC", "1ETH", "TEC", "1sDAI"]
     w_wallet = 22
     w_amt    = 11
@@ -343,11 +365,8 @@ def cmd_balances(update: Update, context: CallbackContext):
         row = table[w_name]
         vals: List[str] = []
         one_val = _resolve_one_value(row)
-        vals.append(_fmt_amt("ONE", one_val))  # ONE (native)
-
-        # WONE explicit column (if present)
+        vals.append(_fmt_amt("ONE", one_val))
         vals.append(_fmt_amt("WONE", row.get("WONE", 0)))
-
         for c in cols[2:]:
             vals.append(_fmt_amt(c, row.get(c, 0)))
         lines.append(f"{w_name:<{w_wallet}}  " + "  ".join(f"{v:>{w_amt}}" for v in vals))
@@ -355,8 +374,13 @@ def cmd_balances(update: Update, context: CallbackContext):
     update.message.reply_text(f"<pre>\n{chr(10).join(lines)}\n</pre>", parse_mode=ParseMode.HTML)
 
 # ---- price helpers ----
-# (reuse your existing _eth_best_side_and_route, _coinbase_eth, cmd_prices,
-#  _mid_usdc_per_unit, cmd_slippage, but with WONE added to the syms list.)
+def _coinbase_eth() -> Optional[Decimal]:
+    try:
+        import coinbase_client
+        val = coinbase_client.fetch_eth_usd_price()
+        return Decimal(str(val)) if val is not None else None
+    except Exception:
+        return None
 
 def _eth_best_side_and_route() -> Tuple[Optional[Decimal], str]:
     if PR is None:
@@ -413,19 +437,10 @@ def _eth_best_side_and_route() -> Tuple[Optional[Decimal], str]:
     except Exception:
         return None, "fwd"
 
-def _coinbase_eth() -> Optional[Decimal]:
-    try:
-        import coinbase_client
-        val = coinbase_client.fetch_eth_usd_price()
-        return Decimal(str(val)) if val is not None else None
-    except Exception:
-        return None
-
 def cmd_prices(update: Update, context: CallbackContext):
     if PR is None:
         update.message.reply_text("Prices unavailable (module not loaded)."); return
 
-    # Include WONE explicitly
     syms = ["ONE", "WONE", "1USDC", "1sDAI", "TEC", "1ETH"]
 
     w_asset, w_lp, w_basis, w_slip, w_route = 6, 11, 12, 9, 27
@@ -500,6 +515,7 @@ def cmd_prices(update: Update, context: CallbackContext):
 
     update.message.reply_text(f"<pre>\n{chr(10).join(lines)}\n</pre>", parse_mode=ParseMode.HTML)
 
+# ---- SLIPPAGE TABLE ----
 def _mid_usdc_per_unit(token_in: str) -> Optional[Decimal]:
     if PR is None:
         return None
@@ -730,7 +746,6 @@ def _tw_require_state(uid):
     return st
 
 def _tw_assets_keyboard(uid, which):
-    # Include WONE explicitly
     syms = ["ONE", "WONE", "1USDC", "1sDAI", "TEC", "1ETH"]
     kb = [[InlineKeyboardButton(s, callback_data=f"tw_{which}:{s}")] for s in syms]
     kb.append([InlineKeyboardButton("⬅ Back", callback_data="tw_back_wallet" if which=="from" else "tw_back_from")])
@@ -787,6 +802,7 @@ def _tw_render_manual_quote(uid, st):
     except Exception:
         return ("Bad amount.", None, None)
 
+    # For now, we let runner handle ONE/WONE routing as before.
     mq = runner.build_manual_quote(
         wallet_key=wallet_key,
         token_in=token_in_ui,
@@ -949,9 +965,9 @@ def _tw_handle_approve(q, uid):
         amt = Decimal(st["amount"])
         sym = st["from"]
         wallet_key = st["wallet"]
-        token_addr = runner._addr(sym)
+        token_addr = runner._addr(sym)  # resolve symbol -> address
         dec = TE.get_decimals(token_addr)
-        wei = int(amt * (Decimal(10) ** dec))
+        wei = int(amt * (Decimal(10)**dec))
         TE.approve_if_needed(wallet_key, token_addr, TE.ROUTER_ADDR_ETH, wei)
         txt, kb_rows, _ = _tw_render_manual_quote(uid, st)
         _tw_reply_edit(q, txt, kb_rows)
@@ -982,25 +998,13 @@ def _tw_handle_execute(q, uid):
         txh = txr.get("tx_hash","0x")
         filled = txr.get("filled_text","")
         gas_used = txr.get("gas_used","—")
-        gas_one_text = txr.get("gas_one_text")
         explorer = txr.get("explorer_url","")
-        wallet = st["wallet"]
-
-        gas_line = f"Gas used: {gas_used}"
-        if gas_one_text:
-            gas_line += f" (~{gas_one_text} ONE)"
-
-        msg_lines = [
-            "✅ Executed manual trade",
-            f"Wallet: {wallet}",
-            filled,
-            gas_line,
-            f"Tx: {txh}",
-        ]
-        if explorer:
-            msg_lines.append(explorer)
-
-        _tw_reply_edit(q, "\n".join(msg_lines).strip())
+        _tw_reply_edit(q, f"✅ Executed manual trade\nWallet: {st['wallet']}\n{filled}\nGas used: {gas_used}\nTx: {txh}\n{explorer}".strip())
+        if ALERT is not None:
+            try:
+                ALERT.send_alert(f"✅ Manual trade\nWallet: {st['wallet']}\n{filled}\nTx: {txh}")
+            except Exception:
+                pass
         q.answer("Executed.")
     except Exception as e:
         _tw_reply_edit(q, f"❌ Execution failed\n{e}")
@@ -1137,7 +1141,6 @@ def _wd_require_state(uid):
     return st
 
 def _wd_assets_keyboard():
-    # Include WONE explicitly
     syms = ["ONE", "WONE", "1USDC", "1sDAI", "TEC", "1ETH"]
     kb = [[InlineKeyboardButton(s, callback_data=f"wd_asset:{s}")] for s in syms]
     kb.append([InlineKeyboardButton("⬅ Back", callback_data="wd_back_wallet")])
@@ -1254,7 +1257,10 @@ def _wd_handle_back(q, uid, dest):
 def _perform_withdraw(wallet_key: str, asset: str, amount_dec: Decimal) -> Dict[str, Any]:
     """
     Send a withdrawal from the given bot wallet to TREASURY_ADDR.
-    Handles native ONE and ERC20 (1USDC, 1sDAI, TEC, 1ETH, WONE).
+    Handles:
+      - ONE: native transfer
+      - WONE: unwrap WONE -> ONE, then native transfer
+      - ERC-20: direct transfer(token, treasury)
     """
     if TE is None or W is None:
         raise RuntimeError("trade_executor/wallet module unavailable")
@@ -1265,46 +1271,129 @@ def _perform_withdraw(wallet_key: str, asset: str, amount_dec: Decimal) -> Dict[
 
     asset_u = asset.upper()
     txh = ""
-    gas_used = 0
-    gas_price = 0
-    gas_cost_wei = 0
+    gas_used_total = 0
+    gas_cost_total_one = Decimal("0")
 
-    # Native ONE transfer
+    # Helper: compute gas cost in ONE given gas_used and gas_price
+    def _gas_cost_one(g_used: int, g_price_wei: int) -> Decimal:
+        if not g_used or not g_price_wei:
+            return Decimal("0")
+        return (Decimal(g_used) * Decimal(g_price_wei)) / (Decimal(10) ** 18)
+
+    # ---- Case 1: native ONE withdrawal (no unwrap) ----
     if asset_u == "ONE":
         dec = 18
         amount_wei = int((amount_dec * (Decimal(10) ** dec)).to_integral_value(rounding=ROUND_DOWN))
+        gas_price = TE._current_gas_price_wei_capped()
         tx = {
             "to": to_addr,
             "value": amount_wei,
             "chainId": TE.HMY_CHAIN_ID,
             "nonce": TE.w3.eth.get_transaction_count(from_addr),
-            "gasPrice": TE._current_gas_price_wei_capped(),
+            "gasPrice": gas_price,
         }
         try:
             est = TE.w3.eth.estimate_gas({**tx, "from": from_addr})
             tx["gas"] = max(int(est * 1.2), 50_000)
         except Exception:
             tx["gas"] = 100_000
-        gas_price = tx["gasPrice"]
         signed = acct.sign_transaction(tx)
         txh = TE.w3.eth.send_raw_transaction(signed.raw_transaction).hex()
+        gas_used = 0
         try:
             r = TE.w3.eth.wait_for_transaction_receipt(txh, timeout=180)
-            gas_used = int(getattr(r, "gasUsed", 0) or 0)
+            gas_used = int(getattr(r, "gasUsed", 0))
         except Exception:
             gas_used = 0
-        if gas_used and gas_price:
-            gas_cost_wei = int(gas_price) * gas_used
+        gas_used_total = gas_used
+        gas_cost_total_one = _gas_cost_one(gas_used, gas_price)
         return {
             "tx_hash": txh,
-            "gas_used": gas_used,
-            "gas_price_wei": int(gas_price),
-            "gas_cost_wei": int(gas_cost_wei),
+            "gas_used": gas_used_total,
+            "gas_one": gas_cost_total_one,
             "asset": asset_u,
             "amount_wei": amount_wei,
         }
 
-    # ERC-20 path
+    # ---- Case 2: WONE withdrawal — unwrap then send ONE ----
+    if asset_u == "WONE":
+        # Step 1: unwrap WONE -> ONE via withdraw(amount)
+        dec = TE.get_decimals(WONE_ADDR)
+        amount_wei = int((amount_dec * (Decimal(10) ** dec)).to_integral_value(rounding=ROUND_DOWN))
+
+        wone_contract = TE.w3.eth.contract(address=WONE_ADDR, abi=WONE_ABI)
+        fn = wone_contract.functions.withdraw(int(amount_wei))
+        try:
+            data_unwrap = fn._encode_transaction_data()
+        except AttributeError:
+            data_unwrap = fn.encode_abi()
+
+        nonce0 = TE.w3.eth.get_transaction_count(from_addr)
+        gas_price_unwrap = TE._current_gas_price_wei_capped()
+        tx_unwrap = {
+            "to": WONE_ADDR,
+            "value": 0,
+            "data": data_unwrap,
+            "chainId": TE.HMY_CHAIN_ID,
+            "nonce": nonce0,
+            "gasPrice": gas_price_unwrap,
+        }
+        try:
+            est_unwrap = TE.w3.eth.estimate_gas({**tx_unwrap, "from": from_addr})
+            tx_unwrap["gas"] = max(int(est_unwrap * 1.2), 120_000)
+        except Exception:
+            tx_unwrap["gas"] = 150_000
+
+        signed_unwrap = acct.sign_transaction(tx_unwrap)
+        txh_unwrap = TE.w3.eth.send_raw_transaction(signed_unwrap.raw_transaction).hex()
+        gas_used_unwrap = 0
+        try:
+            r_unwrap = TE.w3.eth.wait_for_transaction_receipt(txh_unwrap, timeout=180)
+            gas_used_unwrap = int(getattr(r_unwrap, "gasUsed", 0))
+        except Exception:
+            gas_used_unwrap = 0
+
+        cost_unwrap = _gas_cost_one(gas_used_unwrap, gas_price_unwrap)
+
+        # Step 2: send native ONE to treasury (same amount_dec)
+        gas_price_send = TE._current_gas_price_wei_capped()
+        tx_send = {
+            "to": to_addr,
+            "value": amount_wei,
+            "chainId": TE.HMY_CHAIN_ID,
+            "nonce": nonce0 + 1,
+            "gasPrice": gas_price_send,
+        }
+        try:
+            est_send = TE.w3.eth.estimate_gas({**tx_send, "from": from_addr})
+            tx_send["gas"] = max(int(est_send * 1.2), 50_000)
+        except Exception:
+            tx_send["gas"] = 100_000
+
+        signed_send = acct.sign_transaction(tx_send)
+        txh_send = TE.w3.eth.send_raw_transaction(signed_send.raw_transaction).hex()
+        gas_used_send = 0
+        try:
+            r_send = TE.w3.eth.wait_for_transaction_receipt(txh_send, timeout=180)
+            gas_used_send = int(getattr(r_send, "gasUsed", 0))
+        except Exception:
+            gas_used_send = 0
+
+        cost_send = _gas_cost_one(gas_used_send, gas_price_send)
+
+        gas_used_total = gas_used_unwrap + gas_used_send
+        gas_cost_total_one = cost_unwrap + cost_send
+
+        return {
+            "tx_hash": txh_send,           # final send tx
+            "unwrap_tx_hash": txh_unwrap,  # unwrap tx
+            "gas_used": gas_used_total,
+            "gas_one": gas_cost_total_one,
+            "asset": asset_u,
+            "amount_wei": amount_wei,
+        }
+
+    # ---- Case 3: generic ERC-20 withdrawal (no unwrap) ----
     if runner is not None and hasattr(runner, "_addr"):
         token_addr = runner._addr(asset)
     else:
@@ -1320,13 +1409,14 @@ def _perform_withdraw(wallet_key: str, asset: str, amount_dec: Decimal) -> Dict[
     except AttributeError:
         data = fn.encode_abi()
 
+    gas_price = TE._current_gas_price_wei_capped()
     tx = {
         "to": Web3.to_checksum_address(token_addr),
         "value": 0,
         "data": data,
         "chainId": TE.HMY_CHAIN_ID,
         "nonce": TE.w3.eth.get_transaction_count(from_addr),
-        "gasPrice": TE._current_gas_price_wei_capped(),
+        "gasPrice": gas_price,
     }
     try:
         est = TE.w3.eth.estimate_gas({**tx, "from": from_addr})
@@ -1334,22 +1424,22 @@ def _perform_withdraw(wallet_key: str, asset: str, amount_dec: Decimal) -> Dict[
     except Exception:
         tx["gas"] = 200_000
 
-    gas_price = tx["gasPrice"]
     signed = acct.sign_transaction(tx)
     txh = TE.w3.eth.send_raw_transaction(signed.raw_transaction).hex()
+    gas_used = 0
     try:
         r = TE.w3.eth.wait_for_transaction_receipt(txh, timeout=180)
-        gas_used = int(getattr(r, "gasUsed", 0) or 0)
+        gas_used = int(getattr(r, "gasUsed", 0))
     except Exception:
         gas_used = 0
-    if gas_used and gas_price:
-        gas_cost_wei = int(gas_price) * gas_used
+
+    gas_used_total = gas_used
+    gas_cost_total_one = _gas_cost_one(gas_used, gas_price)
 
     return {
         "tx_hash": txh,
-        "gas_used": gas_used,
-        "gas_price_wei": int(gas_price),
-        "gas_cost_wei": int(gas_cost_wei),
+        "gas_used": gas_used_total,
+        "gas_one": gas_cost_total_one,
         "asset": asset_u,
         "amount_wei": amount_wei,
     }
@@ -1368,25 +1458,31 @@ def _wd_handle_send(q, uid):
     try:
         res = _perform_withdraw(wallet_key, asset, amount_dec)
         txh = res.get("tx_hash", "")
-        gas_used = int(res.get("gas_used", 0) or 0)
-        gas_price_wei = int(res.get("gas_price_wei", 0) or 0)
-        gas_cost_wei = int(res.get("gas_cost_wei", gas_used * gas_price_wei))
-        gas_one_text = "0"
-        if gas_cost_wei:
-            gas_one = Decimal(gas_cost_wei) / (Decimal(10) ** 18)
-            gas_one_text = f"{gas_one:.6f}"
+        unwrap_txh = res.get("unwrap_tx_hash", "")
+        gas_used = res.get("gas_used", 0)
+        gas_one = res.get("gas_one", Decimal("0"))
+        explorer_main = f"https://explorer.harmony.one/tx/{txh}" if txh else ""
+        explorer_unwrap = f"https://explorer.harmony.one/tx/{unwrap_txh}" if unwrap_txh else ""
 
-        explorer = f"https://explorer.harmony.one/tx/{txh}" if txh else ""
-        msg = (
-            "✅ Withdrawal sent\n"
-            f"From: {wallet_key}\n"
-            f"Asset: {asset}\n"
-            f"Amount: {st['amount']} {asset}\n"
-            f"To: {TREASURY_ADDR}\n"
-            f"Gas: {gas_used} (~{gas_one_text} ONE)\n"
-            f"Tx: {txh}\n"
-            f"{explorer}"
-        ).strip()
+        lines = []
+        lines.append("✅ Withdrawal sent")
+        lines.append(f"From Wallet : {wallet_key}")
+        lines.append(f"Asset       : {asset}")
+        lines.append(f"Amount      : {st['amount']} {asset}")
+        lines.append(f"To          : {TREASURY_ADDR}")
+        if unwrap_txh:
+            lines.append("")
+            lines.append("Unwrap WONE → ONE:")
+            lines.append(f"  tx: {unwrap_txh}")
+            if explorer_unwrap:
+                lines.append(f"  {explorer_unwrap}")
+        lines.append("")
+        lines.append(f"Gas used    : {gas_used} (~{gas_one:.6f} ONE)")
+        lines.append(f"Tx          : {txh}")
+        if explorer_main:
+            lines.append(explorer_main)
+
+        msg = "\n".join(lines).strip()
         q.edit_message_text(msg)
         if ALERT is not None:
             try:
