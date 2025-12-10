@@ -16,6 +16,8 @@ from telegram.ext import (
     Updater, CommandHandler, CallbackQueryHandler, MessageHandler, Filters, CallbackContext
 )
 
+from web3 import Web3  # used for withdraw TX building
+
 # ---------- Logging ----------
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s:%(name)s:%(message)s")
 log = logging.getLogger("telegram_listener")
@@ -110,8 +112,6 @@ except Exception:
         log.warning("trade_executor not available: %s", e)
         TE = None  # type: ignore
 
-from web3 import Web3  # used for withdraw TX building
-
 # ---------- Constants / WONE unwrap helpers ----------
 # Try to take WONE address from config.TOKENS; fallback to known WONE on Harmony
 try:
@@ -119,6 +119,7 @@ try:
     if _cfg_wone:
         WONE_ADDR = Web3.to_checksum_address(_cfg_wone)
     else:
+        # Known WONE on Harmony (same as in alert.py)
         WONE_ADDR = Web3.to_checksum_address("0xcF664087a5bB0237a0BAd6742852ec6c8d69A27a")
 except Exception:
     WONE_ADDR = Web3.to_checksum_address("0xcF664087a5bB0237a0BAd6742852ec6c8d69A27a")
@@ -134,7 +135,18 @@ WONE_ABI = [
     }
 ]
 
-# ---------- Utilities ----------
+# ---------- Small helpers ----------
+def _norm_tx_hash(txh: str) -> str:
+    """
+    Normalize tx hash to '0x...' form. Returns '' if empty.
+    """
+    if not txh:
+        return ""
+    txh = txh.strip()
+    if not txh.startswith("0x"):
+        txh = "0x" + txh
+    return txh
+
 def now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
@@ -676,10 +688,13 @@ def on_exec_confirm(update: Update, context: CallbackContext):
     aid = data.split(":",1)[1]
     try:
         txr = runner.execute_action(aid)
-        txh = getattr(txr, "tx_hash", getattr(txr, "tx_hash", "0x"))
-        filled = getattr(txr, "filled_text", "")
+        txh = getattr(txr, "tx_hash", "0x")
         gas_used = getattr(txr, "gas_used", "—")
         explorer = getattr(txr, "explorer_url", "")
+        txh = _norm_tx_hash(str(txh))
+        if not explorer and txh:
+            explorer = f"https://explorer.harmony.one/tx/{txh}?shard=0"
+        filled = getattr(txr, "filled_text", "")
         q.edit_message_text(f"✅ Executed {aid}\n{filled}\nGas used: {gas_used}\nTx: {txh}\n{explorer}".strip())
         q.answer("Executed.")
     except Exception as e:
@@ -884,8 +899,7 @@ def _tw_handle_to(q, uid, sym):
     st["step"] = "amount"
     st["waiting_amount"] = "1"
     kb, bal_disp = _tw_amount_keyboard(uid, st["wallet"], st["from"])
-    _tw_reply_edit(
-        q,
+    _tw_reply_edit(q,
         f"FROM {st['from']} TO {sym}\n\nEnter amount of {st['from']} to trade (type a number in chat).\nBalance: {bal_disp} {st['from']}",
         kb
     )
@@ -905,8 +919,7 @@ def _tw_handle_amt_all(q, uid):
             pass
     _tw_set_amount(uid, st, amt)
     kb = _tw_slip_keyboard(uid)
-    _tw_reply_edit(
-        q,
+    _tw_reply_edit(q,
         f"Amount set to ALL ({amt} {st['from']}).\nSelect slippage limit:",
         kb
     )
@@ -935,8 +948,7 @@ def _tw_handle_back(q, uid, dest):
     elif dest == "to":
         st["step"] = "to"
         kb = _tw_assets_keyboard(uid, "to")
-        _tw_reply_edit(
-            q,
+        _tw_reply_edit(q,
             f"FROM: {st['from']}\n\nSelect TO asset:",
             kb
         )
@@ -944,16 +956,14 @@ def _tw_handle_back(q, uid, dest):
         st["step"] = "amount"
         st["waiting_amount"] = "1"
         kb, bal_disp = _tw_amount_keyboard(uid, st["wallet"], st["from"])
-        _tw_reply_edit(
-            q,
+        _tw_reply_edit(q,
             f"FROM {st['from']} TO {st['to']}\n\nEnter amount of {st['from']} to trade (type a number in chat).\nBalance: {bal_disp} {st['from']}",
             kb
         )
     elif dest == "slip":
         st["step"] = "slip"
         kb = _tw_slip_keyboard(uid)
-        _tw_reply_edit(
-            q,
+        _tw_reply_edit(q,
             f"Amount: {st.get('amount','?')} {st.get('from','?')}\nSelect slippage limit:",
             kb
         )
@@ -998,47 +1008,21 @@ def _tw_handle_execute(q, uid):
             amount_in=amt_dec,
             slippage_bps=int(st["slip_bps"]),
         )
-        txh = txr.get("tx_hash", "0x")
-        filled = txr.get("filled_text", "")
-        explorer = txr.get("explorer_url", "")
-
-        gas_used = txr.get("gas_used", None)
-        fee_one = None
-
-        # Try to get exact gasUsed * effectiveGasPrice from receipt
-        if TE is not None and getattr(TE, "w3", None) is not None and txh and txh != "0x":
-            try:
-                r = TE.w3.eth.wait_for_transaction_receipt(txh, timeout=180)
-                gas_used = int(getattr(r, "gasUsed", r.get("gasUsed", 0)))
-                eff_gp = getattr(r, "effectiveGasPrice", None)
-                if eff_gp is None:
-                    try:
-                        tx_obj = TE.w3.eth.get_transaction(txh)
-                        eff_gp = tx_obj.get("gasPrice") or getattr(tx_obj, "gasPrice", None)
-                    except Exception:
-                        eff_gp = None
-                if eff_gp is not None:
-                    fee_one = (Decimal(gas_used) * Decimal(int(eff_gp))) / Decimal(10**18)
-            except Exception:
-                pass
-
-        if gas_used is None:
-            gas_line = "Gas used: —"
-        elif fee_one is not None:
-            gas_line = f"Gas used: {gas_used} (~{fee_one:.6f} ONE)"
-        else:
-            gas_line = f"Gas used: {gas_used}"
-
-        msg = f"✅ Executed manual trade\nWallet: {st['wallet']}\n{filled}\n{gas_line}\nTx: {txh}\n{explorer}".strip()
-        _tw_reply_edit(q, msg)
-
+        txh = _norm_tx_hash(str(txr.get("tx_hash","")))
+        filled = txr.get("filled_text","")
+        gas_used = txr.get("gas_used","—")
+        explorer = txr.get("explorer_url","")
+        if not explorer and txh:
+            explorer = f"https://explorer.harmony.one/tx/{txh}?shard=0"
+        _tw_reply_edit(
+            q,
+            f"✅ Executed manual trade\nWallet: {st['wallet']}\n{filled}\nGas used: {gas_used}\nTx: {txh}\n{explorer}".strip()
+        )
         if ALERT is not None:
             try:
-                alert_msg = f"✅ Manual trade\nWallet: {st['wallet']}\n{filled}\n{gas_line}\nTx: {txh}"
-                ALERT.send_alert(alert_msg)
+                ALERT.send_alert(f"✅ Manual trade\nWallet: {st['wallet']}\n{filled}\nTx: {txh}")
             except Exception:
                 pass
-
         q.answer("Executed.")
     except Exception as e:
         _tw_reply_edit(q, f"❌ Execution failed\n{e}")
@@ -1205,8 +1189,7 @@ def _wd_handle_wallet(q, uid, wallet):
     st["wallet"] = wallet
     st["step"] = "asset"
     kb = _wd_assets_keyboard()
-    _wd_reply_edit(
-        q,
+    _wd_reply_edit(q,
         f"Treasury: {TREASURY_ADDR}\nWallet: {wallet}\n\nSelect asset:",
         kb
     )
@@ -1216,8 +1199,7 @@ def _wd_handle_asset(q, uid, asset):
     st["asset"] = asset
     st["step"] = "amount"
     kb, bal_disp = _wd_amount_keyboard(uid, st["wallet"], asset)
-    _wd_reply_edit(
-        q,
+    _wd_reply_edit(q,
         f"Treasury: {TREASURY_ADDR}\nWallet: {st['wallet']}\nAsset: {asset}\n\nEnter withdrawal amount.\nBalance: {bal_disp} {asset}",
         kb
     )
@@ -1271,24 +1253,21 @@ def _wd_handle_back(q, uid, dest):
         kb = [[InlineKeyboardButton(name, callback_data=f"wd_wallet:{name}")]
               for name in sorted(wallets.keys())]
         kb.append([InlineKeyboardButton("❌ Cancel", callback_data="wd_cancel")])
-        _wd_reply_edit(
-            q,
+        _wd_reply_edit(q,
             f"Treasury: {TREASURY_ADDR}\nSelect wallet:",
             kb
         )
     elif dest == "asset":
         st["step"] = "asset"
         kb = _wd_assets_keyboard()
-        _wd_reply_edit(
-            q,
+        _wd_reply_edit(q,
             f"Treasury: {TREASURY_ADDR}\nWallet: {st['wallet']}\n\nSelect asset:",
             kb
         )
     elif dest == "amount":
         st["step"] = "amount"
         kb, bal_disp = _wd_amount_keyboard(uid, st["wallet"], st["asset"])
-        _wd_reply_edit(
-            q,
+        _wd_reply_edit(q,
             f"Treasury: {TREASURY_ADDR}\nWallet: {st['wallet']}\nAsset: {st['asset']}\n\nEnter withdrawal amount.\nBalance: {bal_disp} {st['asset']}",
             kb
         )
@@ -1297,19 +1276,9 @@ def _perform_withdraw(wallet_key: str, asset: str, amount_dec: Decimal) -> Dict[
     """
     Send a withdrawal from the given bot wallet to TREASURY_ADDR.
     Handles:
-      - ONE  : native transfer
-      - WONE : unwrap WONE -> ONE, then native transfer
+      - ONE: native transfer
+      - WONE: unwrap WONE -> ONE, then native transfer
       - ERC-20: direct transfer(token, treasury)
-
-    Returns a dict including:
-      - tx_hash            : main send tx hash
-      - gas_used           : total gas used across all legs
-      - fee_one            : total fee in ONE (Decimal)
-      - unwrap_tx_hash     : unwrap tx hash (if WONE)
-      - unwrap_gas_used    : gas used for unwrap
-      - unwrap_fee_one     : fee in ONE for unwrap
-      - asset              : final asset (ONE for WONE path)
-      - amount_wei         : amount transferred (raw units)
     """
     if TE is None or W is None:
         raise RuntimeError("trade_executor/wallet module unavailable")
@@ -1319,49 +1288,20 @@ def _perform_withdraw(wallet_key: str, asset: str, amount_dec: Decimal) -> Dict[
     to_addr = Web3.to_checksum_address(TREASURY_ADDR)
 
     asset_u = asset.upper()
+    gas_used_total = 0
+    gas_cost_total_one = Decimal("0")
 
-    total_gas_used = 0
-    total_fee_wei = 0
+    def _gas_cost_one(g_used: int, g_price_wei: int) -> Decimal:
+        if not g_used or not g_price_wei:
+            return Decimal("0")
+        return (Decimal(g_used) * Decimal(g_price_wei)) / (Decimal(10) ** 18)
 
-    unwrap_txh = None
-    unwrap_gas_used = 0
-    unwrap_fee_wei = 0
-
-    def _send_and_track(tx_dict: Dict[str, Any], signed_raw: bytes) -> Dict[str, Any]:
-        nonlocal total_gas_used, total_fee_wei
-        txh_local = TE.w3.eth.send_raw_transaction(signed_raw).hex()
-        gas_used_local = 0
-        fee_wei_local = 0
-        try:
-            r = TE.w3.eth.wait_for_transaction_receipt(txh_local, timeout=180)
-            gas_used_local = int(getattr(r, "gasUsed", r.get("gasUsed", 0)))
-            eff_gp = getattr(r, "effectiveGasPrice", None)
-            if eff_gp is None:
-                try:
-                    tx_obj = TE.w3.eth.get_transaction(txh_local)
-                    eff_gp = tx_obj.get("gasPrice") or getattr(tx_obj, "gasPrice", None)
-                except Exception:
-                    eff_gp = tx_dict.get("gasPrice", 0)
-            if eff_gp:
-                fee_wei_local = gas_used_local * int(eff_gp)
-        except Exception:
-            gas_used_local = 0
-            fee_wei_local = 0
-
-        total_gas_used += gas_used_local
-        total_fee_wei += fee_wei_local
-        return {
-            "tx_hash": txh_local,
-            "gas_used": gas_used_local,
-            "fee_wei": fee_wei_local,
-        }
-
-    # ---- Case 1: native ONE withdrawal (no unwrap) ----
+    # ---- Case 1: native ONE withdrawal ----
     if asset_u == "ONE":
         dec = 18
         amount_wei = int((amount_dec * (Decimal(10) ** dec)).to_integral_value(rounding=ROUND_DOWN))
         gas_price = TE._current_gas_price_wei_capped()
-        base_tx = {
+        tx = {
             "to": to_addr,
             "value": amount_wei,
             "chainId": TE.HMY_CHAIN_ID,
@@ -1369,39 +1309,43 @@ def _perform_withdraw(wallet_key: str, asset: str, amount_dec: Decimal) -> Dict[
             "gasPrice": gas_price,
         }
         try:
-            est = TE.w3.eth.estimate_gas({**base_tx, "from": from_addr})
-            gas_limit = max(int(est * 1.2), 50_000)
+            est = TE.w3.eth.estimate_gas({**tx, "from": from_addr})
+            tx["gas"] = max(int(est * 1.2), 50_000)
         except Exception:
-            gas_limit = 100_000
-
-        tx = {**base_tx, "gas": gas_limit}
+            tx["gas"] = 100_000
         signed = acct.sign_transaction(tx)
-        res = _send_and_track(tx, signed.raw_transaction)
-        fee_one = Decimal(total_fee_wei) / Decimal(10**18)
+        txh = TE.w3.eth.send_raw_transaction(signed.raw_transaction).hex()
+        gas_used = 0
+        try:
+            r = TE.w3.eth.wait_for_transaction_receipt(txh, timeout=180)
+            gas_used = int(getattr(r, "gasUsed", 0))
+        except Exception:
+            gas_used = 0
+        gas_used_total = gas_used
+        gas_cost_total_one = _gas_cost_one(gas_used, gas_price)
         return {
-            "tx_hash": res["tx_hash"],
-            "gas_used": total_gas_used,
-            "fee_one": fee_one,
-            "asset": "ONE",
+            "tx_hash": txh,
+            "gas_used": gas_used_total,
+            "gas_one": gas_cost_total_one,
+            "asset": asset_u,
             "amount_wei": amount_wei,
         }
 
     # ---- Case 2: WONE withdrawal — unwrap then send ONE ----
     if asset_u == "WONE":
-        # Resolve decimals from WONE
         dec = TE.get_decimals(WONE_ADDR)
         amount_wei = int((amount_dec * (Decimal(10) ** dec)).to_integral_value(rounding=ROUND_DOWN))
 
         wone_contract = TE.w3.eth.contract(address=WONE_ADDR, abi=WONE_ABI)
-        fn_unwrap = wone_contract.functions.withdraw(int(amount_wei))
+        fn = wone_contract.functions.withdraw(int(amount_wei))
         try:
-            data_unwrap = fn_unwrap._encode_transaction_data()
+            data_unwrap = fn._encode_transaction_data()
         except AttributeError:
-            data_unwrap = fn_unwrap.encode_abi()
+            data_unwrap = fn.encode_abi()
 
         nonce0 = TE.w3.eth.get_transaction_count(from_addr)
         gas_price_unwrap = TE._current_gas_price_wei_capped()
-        unwrap_tx_base = {
+        tx_unwrap = {
             "to": WONE_ADDR,
             "value": 0,
             "data": data_unwrap,
@@ -1410,22 +1354,24 @@ def _perform_withdraw(wallet_key: str, asset: str, amount_dec: Decimal) -> Dict[
             "gasPrice": gas_price_unwrap,
         }
         try:
-            est_unwrap = TE.w3.eth.estimate_gas({**unwrap_tx_base, "from": from_addr})
-            gas_unwrap = max(int(est_unwrap * 1.2), 120_000)
+            est_unwrap = TE.w3.eth.estimate_gas({**tx_unwrap, "from": from_addr})
+            tx_unwrap["gas"] = max(int(est_unwrap * 1.2), 120_000)
         except Exception:
-            gas_unwrap = 150_000
+            tx_unwrap["gas"] = 150_000
 
-        unwrap_tx = {**unwrap_tx_base, "gas": gas_unwrap}
-        unwrap_signed = acct.sign_transaction(unwrap_tx)
-        unwrap_res = _send_and_track(unwrap_tx, unwrap_signed.raw_transaction)
+        signed_unwrap = acct.sign_transaction(tx_unwrap)
+        txh_unwrap = TE.w3.eth.send_raw_transaction(signed_unwrap.raw_transaction).hex()
+        gas_used_unwrap = 0
+        try:
+            r_unwrap = TE.w3.eth.wait_for_transaction_receipt(txh_unwrap, timeout=180)
+            gas_used_unwrap = int(getattr(r_unwrap, "gasUsed", 0))
+        except Exception:
+            gas_used_unwrap = 0
 
-        unwrap_txh = unwrap_res["tx_hash"]
-        unwrap_gas_used = unwrap_res["gas_used"]
-        unwrap_fee_wei = unwrap_res["fee_wei"]
+        cost_unwrap = _gas_cost_one(gas_used_unwrap, gas_price_unwrap)
 
-        # Step 2: send native ONE to treasury (same amount_dec)
         gas_price_send = TE._current_gas_price_wei_capped()
-        send_tx_base = {
+        tx_send = {
             "to": to_addr,
             "value": amount_wei,
             "chainId": TE.HMY_CHAIN_ID,
@@ -1433,30 +1379,35 @@ def _perform_withdraw(wallet_key: str, asset: str, amount_dec: Decimal) -> Dict[
             "gasPrice": gas_price_send,
         }
         try:
-            est_send = TE.w3.eth.estimate_gas({**send_tx_base, "from": from_addr})
-            gas_send = max(int(est_send * 1.2), 50_000)
+            est_send = TE.w3.eth.estimate_gas({**tx_send, "from": from_addr})
+            tx_send["gas"] = max(int(est_send * 1.2), 50_000)
         except Exception:
-            gas_send = 100_000
+            tx_send["gas"] = 100_000
 
-        send_tx = {**send_tx_base, "gas": gas_send}
-        send_signed = acct.sign_transaction(send_tx)
-        send_res = _send_and_track(send_tx, send_signed.raw_transaction)
+        signed_send = acct.sign_transaction(tx_send)
+        txh_send = TE.w3.eth.send_raw_transaction(signed_send.raw_transaction).hex()
+        gas_used_send = 0
+        try:
+            r_send = TE.w3.eth.wait_for_transaction_receipt(txh_send, timeout=180)
+            gas_used_send = int(getattr(r_send, "gasUsed", 0))
+        except Exception:
+            gas_used_send = 0
 
-        fee_one_total = Decimal(total_fee_wei) / Decimal(10**18)
-        unwrap_fee_one = Decimal(unwrap_fee_wei) / Decimal(10**18) if unwrap_fee_wei else Decimal("0")
+        cost_send = _gas_cost_one(gas_used_send, gas_price_send)
+
+        gas_used_total = gas_used_unwrap + gas_used_send
+        gas_cost_total_one = cost_unwrap + cost_send
 
         return {
-            "tx_hash": send_res["tx_hash"],
-            "gas_used": total_gas_used,
-            "fee_one": fee_one_total,
-            "asset": "ONE",
+            "tx_hash": txh_send,           # final send tx
+            "unwrap_tx_hash": txh_unwrap,  # unwrap tx
+            "gas_used": gas_used_total,
+            "gas_one": gas_cost_total_one,
+            "asset": asset_u,
             "amount_wei": amount_wei,
-            "unwrap_tx_hash": unwrap_txh,
-            "unwrap_gas_used": unwrap_gas_used,
-            "unwrap_fee_one": unwrap_fee_one,
         }
 
-    # ---- Case 3: generic ERC-20 withdrawal (no unwrap) ----
+    # ---- Case 3: generic ERC-20 withdrawal ----
     if runner is not None and hasattr(runner, "_addr"):
         token_addr = runner._addr(asset)
     else:
@@ -1473,7 +1424,7 @@ def _perform_withdraw(wallet_key: str, asset: str, amount_dec: Decimal) -> Dict[
         data = fn.encode_abi()
 
     gas_price = TE._current_gas_price_wei_capped()
-    base_tx = {
+    tx = {
         "to": Web3.to_checksum_address(token_addr),
         "value": 0,
         "data": data,
@@ -1482,80 +1433,117 @@ def _perform_withdraw(wallet_key: str, asset: str, amount_dec: Decimal) -> Dict[
         "gasPrice": gas_price,
     }
     try:
-        est = TE.w3.eth.estimate_gas({**base_tx, "from": from_addr})
-        gas_limit = max(int(est * 1.2), 150_000)
+        est = TE.w3.eth.estimate_gas({**tx, "from": from_addr})
+        tx["gas"] = max(int(est * 1.2), 150_000)
     except Exception:
-        gas_limit = 200_000
+        tx["gas"] = 200_000
 
-    tx = {**base_tx, "gas": gas_limit}
     signed = acct.sign_transaction(tx)
-    res = _send_and_track(tx, signed.raw_transaction)
-    fee_one = Decimal(total_fee_wei) / Decimal(10**18)
+    txh = TE.w3.eth.send_raw_transaction(signed.raw_transaction).hex()
+    gas_used = 0
+    try:
+        r = TE.w3.eth.wait_for_transaction_receipt(txh, timeout=180)
+        gas_used = int(getattr(r, "gasUsed", 0))
+    except Exception:
+        gas_used = 0
+
+    gas_used_total = gas_used
+    gas_cost_total_one = _gas_cost_one(gas_used, gas_price)
 
     return {
-        "tx_hash": res["tx_hash"],
-        "gas_used": total_gas_used,
-        "fee_one": fee_one,
+        "tx_hash": txh,
+        "gas_used": gas_used_total,
+        "gas_one": gas_cost_total_one,
         "asset": asset_u,
         "amount_wei": amount_wei,
     }
 
 def _wd_handle_send(q, uid):
-    if not is_admin(q.from_user.id):
-        q.answer("Not authorized.", show_alert=True); return
+    # Answer callback *immediately* to avoid "query is too old" errors.
+    try:
+        q.answer("Sending withdrawal...")
+    except Exception as e:
+        log.warning("wd_do_send: q.answer() failed: %s", e)
+
     st = _wd_require_state(uid)
     wallet_key = st["wallet"]
     asset = st["asset"]
     try:
         amount_dec = Decimal(st["amount"])
     except Exception:
-        q.answer("Bad amount.", show_alert=True); return
+        # Amount parse error is a genuine failure
+        q.message.reply_text("❌ Withdrawal failed\nBad amount.")
+        return
 
+    # Do the chain work separately; Telegram failures here should not show as "withdrawal failed"
     try:
         res = _perform_withdraw(wallet_key, asset, amount_dec)
-        txh = res.get("tx_hash", "")
-        unwrap_txh = res.get("unwrap_tx_hash", "")
-        gas_used = res.get("gas_used", 0)
-        fee_one = res.get("fee_one", Decimal("0"))
-        unwrap_gas_used = res.get("unwrap_gas_used", 0)
-        unwrap_fee_one = res.get("unwrap_fee_one", Decimal("0"))
+    except Exception as e:
+        # Real on-chain failure
+        q.message.reply_text(f"❌ Withdrawal failed\n{e}")
+        return
 
-        explorer_main = f"https://explorer.harmony.one/tx/{txh}" if txh else ""
-        explorer_unwrap = f"https://explorer.harmony.one/tx/{unwrap_txh}" if unwrap_txh else ""
+    # Build message
+    txh_raw = res.get("tx_hash", "")
+    unwrap_txh_raw = res.get("unwrap_tx_hash", "")
 
-        lines = []
-        lines.append("✅ Withdrawal sent")
-        lines.append(f"From Wallet : {wallet_key}")
-        lines.append(f"Asset       : {asset}")
-        lines.append(f"Amount      : {st['amount']} {asset}")
-        lines.append(f"To          : {TREASURY_ADDR}")
-        if unwrap_txh:
-            lines.append("")
-            lines.append("Unwrap WONE → ONE:")
-            lines.append(f"  tx: {unwrap_txh}")
-            if explorer_unwrap:
-                lines.append(f"  {explorer_unwrap}")
-            if unwrap_gas_used or unwrap_fee_one:
-                lines.append(
-                    f"  gas used: {unwrap_gas_used} (~{unwrap_fee_one:.6f} ONE)"
-                )
+    txh = _norm_tx_hash(str(txh_raw))
+    unwrap_txh = _norm_tx_hash(str(unwrap_txh_raw))
+
+    gas_used = int(res.get("gas_used", 0) or 0)
+    gas_one = res.get("gas_one", Decimal("0"))
+    try:
+        gas_one = Decimal(str(gas_one))
+    except Exception:
+        gas_one = Decimal("0")
+
+    explorer_main = f"https://explorer.harmony.one/tx/{txh}?shard=0" if txh else ""
+    explorer_unwrap = f"https://explorer.harmony.one/tx/{unwrap_txh}?shard=0" if unwrap_txh else ""
+
+    lines = []
+    lines.append("✅ Withdrawal sent")
+    lines.append(f"From Wallet : {wallet_key}")
+    lines.append(f"Asset       : {asset}")
+    lines.append(f"Amount      : {st['amount']} {asset}")
+    lines.append(f"To          : {TREASURY_ADDR}")
+
+    if unwrap_txh:
         lines.append("")
-        lines.append(f"Gas used    : {gas_used} (~{fee_one:.6f} ONE)")
-        lines.append(f"Tx          : {txh}")
-        if explorer_main:
-            lines.append(explorer_main)
+        lines.append("Unwrap WONE → ONE:")
+        lines.append(f"  tx: {unwrap_txh}")
+        if explorer_unwrap:
+            lines.append(f"  {explorer_unwrap}")
+        # It's useful to also show the unwrap gas separately if res included it; for now we keep summary only.
 
-        msg = "\n".join(lines).strip()
+    lines.append("")
+    lines.append(f"Gas used    : {gas_used} (~{gas_one:.6f} ONE)")
+    lines.append(f"Tx          : {txh}")
+    if explorer_main:
+        lines.append(explorer_main)
+
+    msg = "\n".join(lines).strip()
+
+    # Try to edit original message; if Telegram complains (old query), just send a new message instead.
+    try:
         q.edit_message_text(msg)
-        if ALERT is not None:
-            try:
-                ALERT.send_alert(msg)
-            except Exception:
-                pass
+    except Exception as e:
+        log.warning("wd_do_send: edit_message_text failed: %s", e)
+        try:
+            q.message.reply_text(msg)
+        except Exception as e2:
+            log.warning("wd_do_send: reply_text also failed: %s", e2)
+
+    # Best-effort final answer; ignore errors
+    try:
         q.answer("Sent.")
     except Exception as e:
-        q.edit_message_text(f"❌ Withdrawal failed\n{e}")
-        q.answer("Failed.", show_alert=True)
+        log.warning("wd_do_send: final q.answer() failed: %s", e)
+
+    if ALERT is not None:
+        try:
+            ALERT.send_alert(msg)
+        except Exception:
+            pass
 
 def on_withdraw_callback(update: Update, context: CallbackContext):
     q = update.callback_query
