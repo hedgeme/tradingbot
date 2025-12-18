@@ -236,33 +236,6 @@ def _suppress_alerts_temporarily():
             pass
 
 # -----------------------------------------------------------------------------
-# Callback de-duplication (prevents double-exec when Telegram retries updates)
-# -----------------------------------------------------------------------------
-# Telegram can deliver the same callback update more than once (network hiccups, retries).
-# We keep a short-lived cache of processed callback_query.id values.
-_CB_SEEN: Dict[str, float] = {}
-_CB_TTL_SEC = 90.0
-
-def _cb_seen_recent(cbq_id: str) -> bool:
-    if not cbq_id:
-        return False
-    now = datetime.now(timezone.utc).timestamp()
-    # prune occasionally
-    if len(_CB_SEEN) > 256:
-        for k, ts in list(_CB_SEEN.items()):
-            if (now - ts) > _CB_TTL_SEC:
-                _CB_SEEN.pop(k, None)
-    ts = _CB_SEEN.get(cbq_id)
-    if ts is not None and (now - ts) <= _CB_TTL_SEC:
-        return True
-    _CB_SEEN[cbq_id] = now
-    return False
-
-def _explorer_tx_url(tx_hash: str) -> str:
-    txh = _norm_tx_hash(tx_hash)
-    return f"https://explorer.harmony.one/tx/{txh}?shard=0" if txh else ""
-
-# -----------------------------------------------------------------------------
 # Balances: canonical keys + safe lookups
 # -----------------------------------------------------------------------------
 _ONE_KEY_ORDER = [
@@ -966,15 +939,6 @@ def _tw_render_manual_quote(uid, st):
     min_out  = getattr(mq, "min_out_text", f"? {token_out_ui}")
 
     gas_est  = getattr(mq, "gas_estimate", "—")
-    gas_price_wei = getattr(mq, "gas_price_wei", None)
-    gas_cost_one_est = None
-    try:
-        ge = int(str(gas_est)) if str(gas_est).strip().isdigit() else None
-        gp = int(gas_price_wei) if gas_price_wei is not None else (TE._current_gas_price_wei_capped() if TE is not None and hasattr(TE, "_current_gas_price_wei_capped") else None)
-        if ge is not None and gp is not None:
-            gas_cost_one_est = (Decimal(ge) * Decimal(gp)) / (Decimal(10) ** 18)
-    except Exception:
-        gas_cost_one_est = None
     nonce    = getattr(mq, "nonce", "—")
     allow_ok = getattr(mq, "allowance_ok", False)
     tx_prev  = getattr(mq, "tx_preview_text", "(tx preview)")
@@ -983,30 +947,15 @@ def _tw_render_manual_quote(uid, st):
 
     lines = [
         f"Review Trade — {wallet_key}",
-        f"Route    : {path}",
-        f"You send : {ain_txt}",
-        f"You get  : {qout_txt}",
+        f"Path     : {path}",
+        f"AmountIn : {ain_txt}",
+        f"QuoteOut : {qout_txt}",
         (f"Impact   : {imp_bps:.2f} bps" if imp_bps is not None else "Impact   : —"),
         f"Slippage : {Decimal(slip_bps_val) / Decimal(100):.2f}% max → minOut {min_out}",
-        (f"Gas Est  : {gas_est}  (~{gas_cost_one_est:.6f} ONE)" if gas_cost_one_est is not None else f"Gas Est  : {gas_est}"),
+        f"Gas Est  : {gas_est}",
         f"Nonce    : {nonce}",
         f"Allowance: {'OK' if allow_ok else 'NOT APPROVED'}",
     ]
-    if not allow_ok and need_appr_txt:
-        lines.append(f"Required : approve {need_appr_txt}")
-    if not slip_ok:
-        lines.append("⚠ Price already worse than allowed slippage")
-
-    # Human-readable intent (hide raw calldata)
-    lines += [
-        "",
-        "Action:",
-        f"  Swap {ain_txt} → {token_out_ui}",
-        f"  Minimum receive: {min_out}",
-        "  Deadline: 10 minutes",
-    ]
-    txt = "
-".join(lines)
     if not allow_ok and need_appr_txt:
         lines.append(f"Required : approve {need_appr_txt}")
     if not slip_ok:
@@ -1116,29 +1065,13 @@ def _tw_handle_approve(q, uid):
     except Exception:
         pass
 
-    # De-dupe callback executions (Telegram retries / double taps)
-    try:
-        if _cb_seen_recent(getattr(q, "id", "")):
-            try:
-                q.answer("Already processing.", show_alert=False)
-            except Exception:
-                pass
-            return
-    except Exception:
-        pass
-
     if not is_admin(q.from_user.id):
-        try:
-            q.message.reply_text("Not authorized.")
-        except Exception:
-            pass
+        q.message.reply_text("Not authorized.")
         return
-
     st = _tw_require_state(uid)
     if TE is None or runner is None:
         _tw_reply_edit(q, "Approve backend missing.")
         return
-
     try:
         amt = Decimal(st["amount"])
         sym = st["from"]
@@ -1156,7 +1089,6 @@ def _tw_handle_approve(q, uid):
     except Exception as e:
         _tw_reply_edit(q, f"Approval failed:\n<code>{e}</code>", html=True)
 
-
 def _tw_handle_execute(q, uid):
     # Answer immediately to avoid "query is too old"
     try:
@@ -1164,29 +1096,13 @@ def _tw_handle_execute(q, uid):
     except Exception:
         pass
 
-    # De-dupe callback executions (Telegram retries / double taps)
-    try:
-        if _cb_seen_recent(getattr(q, "id", "")):
-            try:
-                q.answer("Already processing.", show_alert=False)
-            except Exception:
-                pass
-            return
-    except Exception:
-        pass
-
     if not is_admin(q.from_user.id):
-        try:
-            q.message.reply_text("Not authorized.")
-        except Exception:
-            pass
+        q.message.reply_text("Not authorized.")
         return
-
     st = _tw_require_state(uid)
     if runner is None or not hasattr(runner, "execute_manual_quote"):
         _tw_reply_edit(q, "Execution backend missing.")
         return
-
     try:
         amt_dec = Decimal(st["amount"])
     except Exception:
@@ -1203,19 +1119,7 @@ def _tw_handle_execute(q, uid):
                 slippage_bps=int(st["slip_bps"]),
             )
 
-        # Primary swap tx
         txh = _norm_tx_hash(str(txr.get("tx_hash", "")))
-
-        # Optional secondary tx (approval/contract/router call)
-        extra_txh = ""
-        for k in ("approval_tx_hash", "approve_tx_hash", "contract_tx_hash", "router_tx_hash", "tx_hash2", "secondary_tx_hash"):
-            v = txr.get(k)
-            if v:
-                cand = _norm_tx_hash(str(v))
-                if cand and cand != txh:
-                    extra_txh = cand
-                    break
-
         filled = txr.get("filled_text", "")
         gas_used = txr.get("gas_used", None)
 
@@ -1226,8 +1130,9 @@ def _tw_handle_execute(q, uid):
             except Exception:
                 gas_one = None
 
-        explorer_main = txr.get("explorer_url", "") or _explorer_tx_url(txh)
-        explorer_extra = _explorer_tx_url(extra_txh) if extra_txh else ""
+        explorer = txr.get("explorer_url", "")
+        if not explorer and txh:
+            explorer = f"https://explorer.harmony.one/tx/{txh}?shard=0"
 
         lines = [
             "✅ Executed manual trade",
@@ -1236,31 +1141,14 @@ def _tw_handle_execute(q, uid):
         if filled:
             lines.append(str(filled))
         lines.append(_fmt_gas_summary(gas_used, gas_one))
-
         if txh:
-            lines.append(f"Trade Tx: {txh}")
-            if explorer_main:
-                lines.append(explorer_main)
+            lines.append(f"Tx: {txh}")
+        if explorer:
+            lines.append(explorer)
 
-        if extra_txh:
-            lines.append("")
-            lines.append(f"Contract Tx: {extra_txh}")
-            if explorer_extra:
-                lines.append(explorer_extra)
-
-        msg = "\n".join(lines).strip()
-
-        try:
-            q.edit_message_text(msg)
-        except Exception:
-            try:
-                q.message.reply_text(msg)
-            except Exception:
-                pass
-
+        _tw_reply_edit(q, "\n".join(lines).strip())
     except Exception as e:
         _tw_reply_edit(q, f"❌ Execution failed\n{e}")
-
 
 def on_trade_callback(update: Update, context: CallbackContext):
     q = update.callback_query
