@@ -216,6 +216,45 @@ def _fmt_gas_summary(gas_used: Optional[int], gas_one: Optional[Decimal]) -> str
         return f"Gas: used {gu:,}"
     return f"Gas: used {gu:,} · cost ~{cost:.6f} ONE"
 
+def _estimate_gas_cost_one(gas_est: Optional[int]) -> Optional[Decimal]:
+    """Estimate gas cost in ONE using current gas price (best-effort)."""
+    try:
+        ge = int(gas_est or 0)
+    except Exception:
+        ge = 0
+    if ge <= 0:
+        return None
+
+    gas_price_wei = None
+    try:
+        if TE is not None and hasattr(TE, "_current_gas_price_wei_capped"):
+            gas_price_wei = int(TE._current_gas_price_wei_capped())
+        elif W is not None and hasattr(W, "suggest_gas_price_wei"):
+            gas_price_wei = int(W.suggest_gas_price_wei())
+    except Exception:
+        gas_price_wei = None
+
+    if not gas_price_wei or gas_price_wei <= 0:
+        return None
+
+    try:
+        return (Decimal(ge) * Decimal(gas_price_wei)) / (Decimal(10) ** 18)
+    except Exception:
+        return None
+
+def _fmt_gas_est_line(gas_est: Optional[int]) -> str:
+    """Render gas estimate including approximate ONE cost when possible."""
+    try:
+        ge = int(gas_est or 0)
+    except Exception:
+        ge = 0
+    if ge <= 0:
+        return "Gas Est  : —"
+    est_one = _estimate_gas_cost_one(ge)
+    if est_one is None:
+        return f"Gas Est  : {ge:,}"
+    return f"Gas Est  : {ge:,} · cost ~{Decimal(str(est_one)):.6f} ONE"
+
 @contextmanager
 def _suppress_alerts_temporarily():
     """
@@ -821,6 +860,30 @@ def on_exec_cancel(update: Update, context: CallbackContext):
 # -----------------------------------------------------------------------------
 _TRADE_STATE: Dict[int, Dict[str, str]] = {}
 
+
+# Prevent accidental double-execution / double-messaging when Telegram retries callbacks.
+# Keyed by (user_id, callback_data); values are last-seen epoch seconds.
+_CALLBACK_DEDUP: Dict[Tuple[int, str], float] = {}
+
+def _seen_callback_recently(uid: int, data: str, window_s: float = 5.0) -> bool:
+    try:
+        import time as _time
+        now = float(_time.time())
+        key = (int(uid), str(data))
+        last = _CALLBACK_DEDUP.get(key, 0.0)
+        if now - last < window_s:
+            return True
+        _CALLBACK_DEDUP[key] = now
+        # light cleanup
+        if len(_CALLBACK_DEDUP) > 2000:
+            for k, v in list(_CALLBACK_DEDUP.items())[:500]:
+                if now - v > 300:
+                    _CALLBACK_DEDUP.pop(k, None)
+        return False
+    except Exception:
+        return False
+
+
 def cmd_trade(update: Update, context: CallbackContext):
     uid = update.effective_user.id
     _TRADE_STATE[uid] = {
@@ -840,18 +903,25 @@ def cmd_trade(update: Update, context: CallbackContext):
     update.message.reply_text("Select wallet:", reply_markup=InlineKeyboardMarkup(kb))
 
 def _tw_reply_edit(q, text, kb=None, html=False):
+    """Edit the wizard message in-place when possible; fall back to a new message."""
+    rm = InlineKeyboardMarkup(kb) if kb else None
     try:
-        q.edit_message_text(text, parse_mode=(ParseMode.HTML if html else None))
-        if kb:
-            q.edit_message_reply_markup(InlineKeyboardMarkup(kb))
-        else:
-            q.edit_message_reply_markup(None)
-    except Exception:
-        q.message.reply_text(
+        q.edit_message_text(
             text,
-            reply_markup=InlineKeyboardMarkup(kb) if kb else None,
-            parse_mode=(ParseMode.HTML if html else None)
+            reply_markup=rm,
+            parse_mode=(ParseMode.HTML if html else None),
+            disable_web_page_preview=True,
         )
+    except Exception:
+        try:
+            q.message.reply_text(
+                text,
+                reply_markup=rm,
+                parse_mode=(ParseMode.HTML if html else None),
+                disable_web_page_preview=True,
+            )
+        except Exception:
+            pass
 
 def _tw_require_state(uid):
     st = _TRADE_STATE.get(uid)
@@ -952,7 +1022,7 @@ def _tw_render_manual_quote(uid, st):
         f"QuoteOut : {qout_txt}",
         (f"Impact   : {imp_bps:.2f} bps" if imp_bps is not None else "Impact   : —"),
         f"Slippage : {Decimal(slip_bps_val) / Decimal(100):.2f}% max → minOut {min_out}",
-        f"Gas Est  : {gas_est}",
+        _fmt_gas_est_line(gas_est),
         f"Nonce    : {nonce}",
         f"Allowance: {'OK' if allow_ok else 'NOT APPROVED'}",
     ]
@@ -961,7 +1031,8 @@ def _tw_render_manual_quote(uid, st):
     if not slip_ok:
         lines.append("⚠ Price already worse than allowed slippage")
 
-    lines += ["", "Would send:", tx_prev]
+    preview_human = f"Swap: {ain_txt} → ≥ {min_out} via {path} (deadline 10m)"
+    lines += ["", "Would send:", preview_human]
     txt = "\n".join(lines)
 
     kb_rows = []
@@ -1130,9 +1201,23 @@ def _tw_handle_execute(q, uid):
             except Exception:
                 gas_one = None
 
-        explorer = txr.get("explorer_url", "")
-        if not explorer and txh:
-            explorer = f"https://explorer.harmony.one/tx/{txh}?shard=0"
+        # Optional secondary transaction hash (approval / wrap / unwrap / other contract call)
+        secondary_keys = (
+            "contract_tx_hash", "call_tx_hash", "approval_tx_hash", "approve_tx_hash",
+            "unwrap_tx_hash", "wrap_tx_hash", "secondary_tx_hash", "tx_hash_2"
+        )
+        txh2 = ""
+        for k in secondary_keys:
+            if k in txr and txr.get(k):
+                txh2 = _norm_tx_hash(str(txr.get(k)))
+                break
+
+        def _explorer_url(tx_hash: str) -> str:
+            if not tx_hash:
+                return ""
+            return f"https://explorer.harmony.one/tx/{tx_hash}?shard=0"
+
+        explorer = _explorer_url(txh) if txh else ""
 
         lines = [
             "✅ Executed manual trade",
@@ -1141,10 +1226,15 @@ def _tw_handle_execute(q, uid):
         if filled:
             lines.append(str(filled))
         lines.append(_fmt_gas_summary(gas_used, gas_one))
+
         if txh:
-            lines.append(f"Tx: {txh}")
-        if explorer:
-            lines.append(explorer)
+            lines.append(f"Trade tx: {txh}")
+            if explorer:
+                lines.append(explorer)
+
+        if txh2 and txh2 != txh:
+            lines.append(f"Contract tx: {txh2}")
+            lines.append(_explorer_url(txh2))
 
         _tw_reply_edit(q, "\n".join(lines).strip())
     except Exception as e:
@@ -1154,6 +1244,16 @@ def on_trade_callback(update: Update, context: CallbackContext):
     q = update.callback_query
     uid = q.from_user.id
     data = q.data or ""
+
+    # Dedupe high-impact callbacks (Telegram may retry on slow networks)
+    if data in ("tw_do_execute", "tw_do_approve"):
+        if _seen_callback_recently(uid, data, window_s=8.0):
+            try:
+                q.answer("Already processing…")
+            except Exception:
+                pass
+            return
+
 
     # Always answer quickly
     if data not in ("tw_do_approve", "tw_do_execute"):
