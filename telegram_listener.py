@@ -15,6 +15,7 @@ import sys
 import logging
 import subprocess
 import shlex
+import re
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_DOWN
@@ -216,44 +217,56 @@ def _fmt_gas_summary(gas_used: Optional[int], gas_one: Optional[Decimal]) -> str
         return f"Gas: used {gu:,}"
     return f"Gas: used {gu:,} · cost ~{cost:.6f} ONE"
 
-def _estimate_gas_cost_one(gas_est: Optional[int]) -> Optional[Decimal]:
-    """Estimate gas cost in ONE using current gas price (best-effort)."""
+def _fee_bps_to_text(fee_bps: int) -> str:
+    """Uniswap v3 fee tier int (e.g., 500/3000/10000) to human percent text."""
     try:
-        ge = int(gas_est or 0)
+        return f"{Decimal(int(fee_bps)) / Decimal(10_000) * Decimal(100):.2f}%"
     except Exception:
-        ge = 0
-    if ge <= 0:
+        return "—"
+
+def _humanize_path(path_text: str) -> str:
+    """
+    Convert compact path strings like '1USDC@3000→WONE' into a friendlier
+    '1USDC → WONE (fee 0.30%)' form. Leaves multi-hop paths mostly intact.
+    """
+    if not path_text:
+        return "—"
+    s = str(path_text)
+    # single hop: A@fee→B
+    m = re.fullmatch(r"\s*([^@\s]+)@([0-9]+)\s*→\s*([^\s]+)\s*", s)
+    if m:
+        a, fee, b = m.group(1), int(m.group(2)), m.group(3)
+        return f"{a} → {b} (fee {_fee_bps_to_text(fee)})"
+    # multi hop: keep but replace @fee with (fee x)
+    # example: A@500→B@3000→C
+    parts = s.split("→")
+    out = []
+    for p in parts:
+        mm = re.fullmatch(r"\s*([^@\s]+)@([0-9]+)\s*", p)
+        if mm:
+            tok, fee = mm.group(1), int(mm.group(2))
+            out.append(f"{tok} (fee {_fee_bps_to_text(fee)})")
+        else:
+            out.append(p.strip())
+    return " → ".join(out)
+
+def _estimate_gas_cost_one_upper(gas_estimate: Optional[int]) -> Optional[Decimal]:
+    """
+    Best-effort upper bound estimate for gas cost in ONE, using GAS_CAP_GWEI
+    (or current env setting) as a conservative gasPrice.
+    """
+    try:
+        ge = int(gas_estimate or 0)
+        if ge <= 0:
+            return None
+        cap_gwei = int(os.getenv("GAS_CAP_GWEI", str(getattr(C, "GAS_CAP_GWEI", 0) or 0)) or 0)
+        if cap_gwei <= 0:
+            return None
+        gas_price_wei = Decimal(cap_gwei) * (Decimal(10) ** 9)
+        return (Decimal(ge) * gas_price_wei) / (Decimal(10) ** 18)
+    except Exception:
         return None
 
-    gas_price_wei = None
-    try:
-        if TE is not None and hasattr(TE, "_current_gas_price_wei_capped"):
-            gas_price_wei = int(TE._current_gas_price_wei_capped())
-        elif W is not None and hasattr(W, "suggest_gas_price_wei"):
-            gas_price_wei = int(W.suggest_gas_price_wei())
-    except Exception:
-        gas_price_wei = None
-
-    if not gas_price_wei or gas_price_wei <= 0:
-        return None
-
-    try:
-        return (Decimal(ge) * Decimal(gas_price_wei)) / (Decimal(10) ** 18)
-    except Exception:
-        return None
-
-def _fmt_gas_est_line(gas_est: Optional[int]) -> str:
-    """Render gas estimate including approximate ONE cost when possible."""
-    try:
-        ge = int(gas_est or 0)
-    except Exception:
-        ge = 0
-    if ge <= 0:
-        return "Gas Est  : —"
-    est_one = _estimate_gas_cost_one(ge)
-    if est_one is None:
-        return f"Gas Est  : {ge:,}"
-    return f"Gas Est  : {ge:,} · cost ~{Decimal(str(est_one)):.6f} ONE"
 
 @contextmanager
 def _suppress_alerts_temporarily():
@@ -860,30 +873,6 @@ def on_exec_cancel(update: Update, context: CallbackContext):
 # -----------------------------------------------------------------------------
 _TRADE_STATE: Dict[int, Dict[str, str]] = {}
 
-
-# Prevent accidental double-execution / double-messaging when Telegram retries callbacks.
-# Keyed by (user_id, callback_data); values are last-seen epoch seconds.
-_CALLBACK_DEDUP: Dict[Tuple[int, str], float] = {}
-
-def _seen_callback_recently(uid: int, data: str, window_s: float = 5.0) -> bool:
-    try:
-        import time as _time
-        now = float(_time.time())
-        key = (int(uid), str(data))
-        last = _CALLBACK_DEDUP.get(key, 0.0)
-        if now - last < window_s:
-            return True
-        _CALLBACK_DEDUP[key] = now
-        # light cleanup
-        if len(_CALLBACK_DEDUP) > 2000:
-            for k, v in list(_CALLBACK_DEDUP.items())[:500]:
-                if now - v > 300:
-                    _CALLBACK_DEDUP.pop(k, None)
-        return False
-    except Exception:
-        return False
-
-
 def cmd_trade(update: Update, context: CallbackContext):
     uid = update.effective_user.id
     _TRADE_STATE[uid] = {
@@ -903,25 +892,18 @@ def cmd_trade(update: Update, context: CallbackContext):
     update.message.reply_text("Select wallet:", reply_markup=InlineKeyboardMarkup(kb))
 
 def _tw_reply_edit(q, text, kb=None, html=False):
-    """Edit the wizard message in-place when possible; fall back to a new message."""
-    rm = InlineKeyboardMarkup(kb) if kb else None
     try:
-        q.edit_message_text(
-            text,
-            reply_markup=rm,
-            parse_mode=(ParseMode.HTML if html else None),
-            disable_web_page_preview=True,
-        )
+        q.edit_message_text(text, parse_mode=(ParseMode.HTML if html else None))
+        if kb:
+            q.edit_message_reply_markup(InlineKeyboardMarkup(kb))
+        else:
+            q.edit_message_reply_markup(None)
     except Exception:
-        try:
-            q.message.reply_text(
-                text,
-                reply_markup=rm,
-                parse_mode=(ParseMode.HTML if html else None),
-                disable_web_page_preview=True,
-            )
-        except Exception:
-            pass
+        q.message.reply_text(
+            text,
+            reply_markup=InlineKeyboardMarkup(kb) if kb else None,
+            parse_mode=(ParseMode.HTML if html else None)
+        )
 
 def _tw_require_state(uid):
     st = _TRADE_STATE.get(uid)
@@ -1002,6 +984,7 @@ def _tw_render_manual_quote(uid, st):
     )
 
     path     = getattr(mq, "path_text", f"{token_in_ui} → {token_out_ui}")
+    path_h   = _humanize_path(path)
     ain_txt  = getattr(mq, "amount_in_text", f"{amt_str} {token_in_ui}")
     qout_txt = getattr(mq, "quote_out_text", f"? {token_out_ui}")
     imp_bps  = getattr(mq, "impact_bps", None)
@@ -1017,12 +1000,13 @@ def _tw_render_manual_quote(uid, st):
 
     lines = [
         f"Review Trade — {wallet_key}",
-        f"Path     : {path}",
+        f"Path     : {path_h}",
         f"AmountIn : {ain_txt}",
         f"QuoteOut : {qout_txt}",
         (f"Impact   : {imp_bps:.2f} bps" if imp_bps is not None else "Impact   : —"),
         f"Slippage : {Decimal(slip_bps_val) / Decimal(100):.2f}% max → minOut {min_out}",
-        _fmt_gas_est_line(gas_est),
+        (f"Gas Est  : {int(gas_est):,} · cost ≤ {_estimate_gas_cost_one_upper(gas_est):.6f} ONE"
+         if _estimate_gas_cost_one_upper(gas_est) is not None else f"Gas Est  : {gas_est}"),
         f"Nonce    : {nonce}",
         f"Allowance: {'OK' if allow_ok else 'NOT APPROVED'}",
     ]
@@ -1031,15 +1015,20 @@ def _tw_render_manual_quote(uid, st):
     if not slip_ok:
         lines.append("⚠ Price already worse than allowed slippage")
 
-    preview_human = f"Swap: {ain_txt} → ≥ {min_out} via {path} (deadline 10m)"
-    lines += ["", "Would send:", preview_human]
+    ui_send = getattr(mq, "ui_send_text", None)
+    if not ui_send:
+        ui_send = f"Swap: {ain_txt} → ≥ {min_out} via {path_h} (deadline 10m)"
+    lines += ["", "Would send:", ui_send]
     txt = "\n".join(lines)
 
     kb_rows = []
     if not allow_ok and need_appr_txt:
-        kb_rows.append([InlineKeyboardButton("✅ Approve spend first", callback_data="tw_do_approve")])
+        kb_rows.append([InlineKeyboardButton("🔑 Set Allowance (cap)", callback_data="tw_do_approve")])
+        kb_rows.append([InlineKeyboardButton("🧹 Revoke Allowance", callback_data="tw_do_revoke")])
     elif allow_ok and slip_ok:
         kb_rows.append([InlineKeyboardButton("✅ Execute Trade", callback_data="tw_do_execute")])
+        kb_rows.append([InlineKeyboardButton("🔑 Replace Allowance (cap)", callback_data="tw_do_approve")])
+        kb_rows.append([InlineKeyboardButton("🧹 Revoke Allowance", callback_data="tw_do_revoke")])
     else:
         kb_rows.append([InlineKeyboardButton("⚠ Adjust Slippage", callback_data="tw_back_slip")])
 
@@ -1132,7 +1121,75 @@ def _tw_handle_back(q, uid, dest):
 def _tw_handle_approve(q, uid):
     # Answer immediately to avoid "query is too old"
     try:
-        q.answer("Sending approval...")
+        q.answer()
+    except Exception:
+        pass
+
+    if not is_admin(q.from_user.id):
+        q.message.reply_text("Not authorized.")
+        return
+
+    st = _tw_require_state(uid)
+    if TE is None or runner is None:
+        _tw_reply_edit(q, "Approve backend missing.")
+        return
+
+    # Build allowance selection menu (no tx sent yet)
+    try:
+        token_in = st.get("token_in", "")
+        wallet_key = st.get("wallet_key", "")
+        amt_trade = Decimal(st.get("amount", "0") or "0")
+
+        token_addr = runner._addr(token_in)
+        dec = int(TE.get_decimals(token_addr))
+        owner = W.WALLETS.get(wallet_key) or ""
+        current_allow = TE.get_allowance(owner, token_addr, TE.ROUTER_ADDR_ETH)
+        cur_dec = (Decimal(current_allow) / (Decimal(10) ** dec)) if current_allow else Decimal("0")
+
+        # Quick picks: tuned for stables, otherwise smaller set
+        picks = []
+        try:
+            symu = str(token_in).upper()
+        except Exception:
+            symu = ""
+        if symu in ("1USDC", "USDC"):
+            picks = [Decimal("50"), Decimal("100"), Decimal("250"), Decimal("1000")]
+        else:
+            picks = [Decimal("1"), Decimal("5"), Decimal("10"), Decimal("25")]
+
+        # Always include exact trade amount as a button
+        st["step"] = "approve_choose"
+
+        lines = [
+            f"🔑 Allowance for <b>{token_in}</b> (spender: Router)",
+            f"Wallet   : <code>{wallet_key}</code>",
+            f"Current  : {cur_dec:.6f} {token_in}",
+            f"Trade    : {amt_trade:.6f} {token_in}",
+            "",
+            "Select the new allowance cap:",
+        ]
+
+        kb = [
+            [InlineKeyboardButton(f"Exact ({amt_trade:.6f})", callback_data="tw_apr_exact")],
+        ]
+        row = []
+        for p in picks:
+            row.append(InlineKeyboardButton(f"{p.normalize():f}", callback_data=f"tw_apr_{p.normalize():f}"))
+            if len(row) == 4:
+                kb.append(row); row = []
+        if row:
+            kb.append(row)
+        kb.append([InlineKeyboardButton("Custom…", callback_data="tw_apr_custom")])
+        kb.append([InlineKeyboardButton("⬅ Back", callback_data="tw_back_review")])
+
+        _tw_reply_edit(q, "\n".join(lines), kb, html=True)
+    except Exception as e:
+        _tw_reply_edit(q, f"Unable to load allowance menu:\n<code>{e}</code>", html=True)
+
+def _tw_handle_revoke(q, uid):
+    # Answer immediately to avoid "query is too old"
+    try:
+        q.answer("Revoking...")
     except Exception:
         pass
 
@@ -1141,24 +1198,105 @@ def _tw_handle_approve(q, uid):
         return
     st = _tw_require_state(uid)
     if TE is None or runner is None:
-        _tw_reply_edit(q, "Approve backend missing.")
+        _tw_reply_edit(q, "Revoke backend missing.")
         return
-    try:
-        amt = Decimal(st["amount"])
-        sym = st["from"]
-        wallet_key = st["wallet"]
 
-        token_addr = runner._addr(sym)  # resolve symbol -> address
-        dec = TE.get_decimals(token_addr)
-        wei = int((amt * (Decimal(10) ** dec)).to_integral_value(rounding=ROUND_DOWN))
+    try:
+        wallet_key = st.get("wallet_key", "")
+        token_in = st.get("token_in", "")
+        token_addr = runner._addr(token_in)
 
         with _suppress_alerts_temporarily():
-            TE.approve_if_needed(wallet_key, token_addr, TE.ROUTER_ADDR_ETH, wei)
+            info = TE.revoke_allowance(wallet_key, token_addr, TE.ROUTER_ADDR_ETH)
 
-        txt, kb_rows, _ = _tw_render_manual_quote(uid, st)
-        _tw_reply_edit(q, txt, kb_rows)
+        txh = info.get("tx_hash", "")
+        link = _hmy_tx_url(txh) if txh else ""
+        txt = "✅ Allowance revoked (set to 0)\n"
+        if txh:
+            txt += f"Approval tx: <code>{txh}</code>\n{link}\n\n"
+        # Refresh review
+        st["step"] = "review"
+        txt2, kb_rows, _ = _tw_render_manual_quote(uid, st)
+        _tw_reply_edit(q, txt + txt2, kb_rows, html=True)
     except Exception as e:
-        _tw_reply_edit(q, f"Approval failed:\n<code>{e}</code>", html=True)
+        _tw_reply_edit(q, f"Revoke failed:\n<code>{e}</code>", html=True)
+
+
+def _tw_handle_approve_pick(q, uid, data: str):
+    # data is one of: tw_apr_exact, tw_apr_<number>, tw_apr_custom
+    try:
+        q.answer()
+    except Exception:
+        pass
+
+    if not is_admin(q.from_user.id):
+        q.message.reply_text("Not authorized.")
+        return
+
+    st = _tw_require_state(uid)
+    if TE is None or runner is None:
+        _tw_reply_edit(q, "Approve backend missing.")
+        return
+
+    token_in = st.get("token_in", "")
+    wallet_key = st.get("wallet_key", "")
+    amt_trade = Decimal(st.get("amount", "0") or "0")
+
+    if data == "tw_apr_custom":
+        st["step"] = "approve_custom"
+        _tw_reply_edit(
+            q,
+            "Enter the allowance cap you want to set (in token units).\n"
+            "Example: <code>1000</code>\n\n"
+            f"Token: <b>{token_in}</b>",
+            [[InlineKeyboardButton("⬅ Back", callback_data="tw_do_approve")]],
+            html=True,
+        )
+        return
+
+    if data == "tw_apr_exact":
+        cap_amt = amt_trade
+    else:
+        # tw_apr_<number>
+        try:
+            cap_amt = Decimal(data.split("tw_apr_", 1)[1])
+        except Exception:
+            _tw_reply_edit(q, "Invalid allowance selection.")
+            return
+
+    _tw_set_allowance(q, uid, cap_amt)
+
+def _tw_set_allowance(q, uid, cap_amt: Decimal):
+    st = _tw_require_state(uid)
+    token_in = st.get("token_in", "")
+    wallet_key = st.get("wallet_key", "")
+
+    if cap_amt <= 0:
+        _tw_reply_edit(q, "Allowance must be > 0.")
+        return
+
+    try:
+        token_addr = runner._addr(token_in)
+        dec = int(TE.get_decimals(token_addr))
+        cap_wei = int((cap_amt * (Decimal(10) ** dec)).to_integral_value(rounding=ROUND_DOWN))
+        with _suppress_alerts_temporarily():
+            info = TE.set_allowance(wallet_key, token_addr, TE.ROUTER_ADDR_ETH, cap_wei)
+
+        txh = info.get("tx_hash", "")
+        link = _hmy_tx_url(txh) if txh else ""
+        msg = "✅ Allowance updated (cap)\n"
+        msg += f"Token    : <b>{token_in}</b>\n"
+        msg += f"New cap  : {cap_amt:.6f} {token_in}\n"
+        if txh:
+            msg += f"Approval tx: <code>{txh}</code>\n{link}\n"
+        msg += "\n"
+
+        # back to review
+        st["step"] = "review"
+        txt2, kb_rows, _ = _tw_render_manual_quote(uid, st)
+        _tw_reply_edit(q, msg + txt2, kb_rows, html=True)
+    except Exception as e:
+        _tw_reply_edit(q, f"Approve failed:\n<code>{e}</code>", html=True)
 
 def _tw_handle_execute(q, uid):
     # Answer immediately to avoid "query is too old"
@@ -1201,23 +1339,9 @@ def _tw_handle_execute(q, uid):
             except Exception:
                 gas_one = None
 
-        # Optional secondary transaction hash (approval / wrap / unwrap / other contract call)
-        secondary_keys = (
-            "contract_tx_hash", "call_tx_hash", "approval_tx_hash", "approve_tx_hash",
-            "unwrap_tx_hash", "wrap_tx_hash", "secondary_tx_hash", "tx_hash_2"
-        )
-        txh2 = ""
-        for k in secondary_keys:
-            if k in txr and txr.get(k):
-                txh2 = _norm_tx_hash(str(txr.get(k)))
-                break
-
-        def _explorer_url(tx_hash: str) -> str:
-            if not tx_hash:
-                return ""
-            return f"https://explorer.harmony.one/tx/{tx_hash}?shard=0"
-
-        explorer = _explorer_url(txh) if txh else ""
+        explorer = txr.get("explorer_url", "")
+        if not explorer and txh:
+            explorer = f"https://explorer.harmony.one/tx/{txh}?shard=0"
 
         lines = [
             "✅ Executed manual trade",
@@ -1226,15 +1350,10 @@ def _tw_handle_execute(q, uid):
         if filled:
             lines.append(str(filled))
         lines.append(_fmt_gas_summary(gas_used, gas_one))
-
         if txh:
-            lines.append(f"Trade tx: {txh}")
-            if explorer:
-                lines.append(explorer)
-
-        if txh2 and txh2 != txh:
-            lines.append(f"Contract tx: {txh2}")
-            lines.append(_explorer_url(txh2))
+            lines.append(f"Tx: {txh}")
+        if explorer:
+            lines.append(explorer)
 
         _tw_reply_edit(q, "\n".join(lines).strip())
     except Exception as e:
@@ -1244,16 +1363,6 @@ def on_trade_callback(update: Update, context: CallbackContext):
     q = update.callback_query
     uid = q.from_user.id
     data = q.data or ""
-
-    # Dedupe high-impact callbacks (Telegram may retry on slow networks)
-    if data in ("tw_do_execute", "tw_do_approve"):
-        if _seen_callback_recently(uid, data, window_s=8.0):
-            try:
-                q.answer("Already processing…")
-            except Exception:
-                pass
-            return
-
 
     # Always answer quickly
     if data not in ("tw_do_approve", "tw_do_execute"):
@@ -1293,6 +1402,11 @@ def on_trade_callback(update: Update, context: CallbackContext):
 
     if data == "tw_do_approve":
         _tw_handle_approve(q, uid); return
+    if data == "tw_do_revoke":
+        _tw_handle_revoke(q, uid); return
+
+    if data.startswith("tw_apr_"):
+        _tw_handle_approve_pick(q, uid, data); return
     if data == "tw_do_execute":
         _tw_handle_execute(q, uid); return
 
@@ -1310,6 +1424,47 @@ def on_text_amount_capture(update: Update, context: CallbackContext):
 
     # /trade amount capture
     st_trade = _TRADE_STATE.get(uid)
+    # Custom allowance capture (from the Approve menu)
+    if st_trade and st_trade.get("step") == "approve_custom":
+        try:
+            cap_amt = Decimal(txt)
+            if cap_amt <= 0:
+                raise ValueError("Allowance must be > 0")
+        except Exception:
+            update.message.reply_text("Invalid amount. Send a number like 1000")
+            return
+
+        token_in = st_trade.get("token_in", "")
+        wallet_key = st_trade.get("wallet_key", "")
+        if TE is None or runner is None:
+            update.message.reply_text("Approve backend missing.")
+            return
+
+        try:
+            token_addr = runner._addr(token_in)
+            dec = int(TE.get_decimals(token_addr))
+            cap_wei = int((cap_amt * (Decimal(10) ** dec)).to_integral_value(rounding=ROUND_DOWN))
+            with _suppress_alerts_temporarily():
+                info = TE.set_allowance(wallet_key, token_addr, TE.ROUTER_ADDR_ETH, cap_wei)
+
+            txh = info.get("tx_hash", "")
+            link = _hmy_tx_url(txh) if txh else ""
+            msg = "✅ Allowance updated (cap)\n"
+            msg += f"Wallet   : {wallet_key}\n"
+            msg += f"Token    : {token_in}\n"
+            msg += f"New cap  : {cap_amt:.6f} {token_in}\n"
+            if txh:
+                msg += f"Approval tx: {txh}\n{link}\n"
+
+            # Back to review screen (send a new message)
+            st_trade["step"] = "review"
+            txt2, kb_rows, _ = _tw_render_manual_quote(uid, st_trade)
+            update.message.reply_text(msg + "\n" + txt2, reply_markup=InlineKeyboardMarkup(kb_rows), parse_mode=ParseMode.HTML)
+            return
+        except Exception as e:
+            update.message.reply_text(f"Approve failed: {e}")
+            return
+
     if st_trade and st_trade.get("step") == "amount" and st_trade.get("waiting_amount") == "1":
         try:
             amt = Decimal(txt)
