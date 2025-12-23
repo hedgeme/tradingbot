@@ -6,8 +6,8 @@ import time
 import struct
 import subprocess
 from pathlib import Path
-from typing import Dict, Any, List
-from decimal import Decimal  # NEW: for gas cost in ONE
+from typing import Dict, Any, List, Optional
+from decimal import Decimal  # for gas cost in ONE
 
 from dotenv import load_dotenv
 from web3 import Web3
@@ -100,7 +100,7 @@ FALLBACK_TOKENS: Dict[str, str] = {
     "WONE":  "0xcF664087a5bB0237a0BAd6742852ec6c8d69A27a",
     "1ETH":  "0x4cc435d7b9557d54d6ef02d69bbf72634905bf11",
     "1USDC": "0xbc594cabd205bd993e7ffa6f3e9cea75c1110da5",
-    "TEC":   "0x0deb9a1998aae32daacf6de21161c3e942ace074",
+    "TEC":   "0x0deb9a1998aae32daacf6de21161c3E942aCe074",
     "1sDAI": "0xeDEb95D51dBc4116039435379Bd58472A2c09b1f",
     # infra from dev
     "FactoryV3": "0x12d21f5d0Ab768c312E19653Bf3f89917866B8e8",
@@ -235,9 +235,7 @@ def get_allowance(owner_eth: str, token_addr: str, spender_eth: str) -> int:
 
 def get_balance(owner_eth: str, token_addr: str) -> int:
     c = _erc20(token_addr)
-    return int(
-        c.functions.balanceOf(Web3.to_checksum_address(owner_eth)).call()
-    )
+    return int(c.functions.balanceOf(Web3.to_checksum_address(owner_eth)).call())
 
 
 # -----------------------------------------------------------------------------
@@ -258,9 +256,7 @@ def _secret_path_for(wallet_key: str) -> Path:
     override = os.getenv(env_name)
     if override:
         return Path(override)
-    return _SECRET_FILE_BY_WALLET.get(
-        wallet_key, _DEFAULT_SECRET_DIR / f"{wallet_key}.pass.gpg"
-    )
+    return _SECRET_FILE_BY_WALLET.get(wallet_key, _DEFAULT_SECRET_DIR / f"{wallet_key}.pass.gpg")
 
 
 def _gpg_decrypt_file(path: Path) -> str:
@@ -278,9 +274,7 @@ def _gpg_decrypt_file(path: Path) -> str:
         )
         return out.decode().strip()
     except subprocess.CalledProcessError as e:
-        raise RuntimeError(
-            f"GPG decrypt failed for {path}: {e.output.decode().strip()}"
-        ) from e
+        raise RuntimeError(f"GPG decrypt failed for {path}: {e.output.decode().strip()}") from e
 
 
 def _get_account(wallet_key: str):
@@ -304,9 +298,7 @@ def _get_account(wallet_key: str):
                 pk = v.strip()
                 break
         if pk is None:
-            raise RuntimeError(
-                f"Private key unavailable for {wallet_key}: {e}"
-            )
+            raise RuntimeError(f"Private key unavailable for {wallet_key}: {e}")
 
     if not pk:
         raise RuntimeError(f"Private key empty for {wallet_key}")
@@ -322,9 +314,7 @@ def _get_account(wallet_key: str):
         if configured:
             conf = Web3.to_checksum_address(configured)
             if conf != Web3.to_checksum_address(acct.address):
-                print(
-                    f"[trade_executor] WARNING: signer {acct.address} != configured {conf} for {wallet_key}"
-                )
+                print(f"[trade_executor] WARNING: signer {acct.address} != configured {conf} for {wallet_key}")
     except Exception:
         pass
 
@@ -348,15 +338,15 @@ def _v3_path_bytes(token_in: str, fee: int, token_out: str) -> bytes:
 def quote_v3_exact_input(path_bytes: bytes, amount_in_wei: int) -> int:
     """Call Quoter.quoteExactInput(path, amountIn)."""
     quoter = w3.eth.contract(address=QUOTER_V1_ADDR, abi=QUOTER_V1_ABI)
-    return int(
-        quoter.functions.quoteExactInput(path_bytes, int(amount_in_wei)).call()
-    )
+    return int(quoter.functions.quoteExactInput(path_bytes, int(amount_in_wei)).call())
 
 
 # -----------------------------------------------------------------------------
-# Approve-if-needed
+# Allowance management (capped approvals + revoke)
 # -----------------------------------------------------------------------------
-def approve_if_needed(
+_TRANSFER_TOPIC0 = Web3.keccak(text="Transfer(address,address,uint256)").hex()
+
+def set_allowance(
     wallet_key: str,
     token_addr: str,
     spender_eth: str,
@@ -364,20 +354,16 @@ def approve_if_needed(
     gas_limit: int = 120_000,
 ) -> Dict[str, Any]:
     """
-    If allowance < amount_wei, send approve(spender, amount_wei).
-    Returns info dict; sends Telegram alerts on failure.
+    Explicitly set allowance to amount_wei (replaces existing allowance).
+    This is *not* unlimited, unless caller passes 2**256-1.
     """
     acct = _get_account(wallet_key)
     owner_eth = Web3.to_checksum_address(acct.address)
     token = _erc20(token_addr)
 
     current = get_allowance(owner_eth, token_addr, spender_eth)
-    if current >= int(amount_wei):
-        return {"skipped": True, "current_allowance": str(current)}
 
-    fn = token.functions.approve(
-        Web3.to_checksum_address(spender_eth), int(amount_wei)
-    )
+    fn = token.functions.approve(Web3.to_checksum_address(spender_eth), int(amount_wei))
     try:
         data = fn._encode_transaction_data()
     except AttributeError:
@@ -391,7 +377,7 @@ def approve_if_needed(
         "nonce": w3.eth.get_transaction_count(owner_eth),
         "gasPrice": _current_gas_price_wei_capped(),
     }
-    # estimate + headroom
+
     try:
         est = w3.eth.estimate_gas({**tx, "from": owner_eth})
         tx["gas"] = max(min(int(est * 1.5), 600_000), gas_limit)
@@ -405,7 +391,69 @@ def approve_if_needed(
         alert_trade_failure("approve", "erc20.approve", str(e))
         raise
 
-    return {"tx_hash": txh, "allowance_before": str(current)}
+    return {"tx_hash": txh, "allowance_before": str(current), "allowance_set": str(int(amount_wei))}
+
+
+def revoke_allowance(
+    wallet_key: str,
+    token_addr: str,
+    spender_eth: str,
+    gas_limit: int = 120_000,
+) -> Dict[str, Any]:
+    """Revoke (set allowance to 0) for a given token + spender."""
+    return set_allowance(wallet_key, token_addr, spender_eth, 0, gas_limit=gas_limit)
+
+
+def approve_if_needed(
+    wallet_key: str,
+    token_addr: str,
+    spender_eth: str,
+    amount_wei: int,
+    gas_limit: int = 120_000,
+) -> Dict[str, Any]:
+    """
+    If allowance < amount_wei, set allowance to amount_wei (capped).
+    NOTE: This uses a cap equal to the trade amount, not unlimited.
+    """
+    acct = _get_account(wallet_key)
+    owner_eth = Web3.to_checksum_address(acct.address)
+
+    current = get_allowance(owner_eth, token_addr, spender_eth)
+    if current >= int(amount_wei):
+        return {"skipped": True, "current_allowance": str(current)}
+
+    return set_allowance(wallet_key, token_addr, spender_eth, int(amount_wei), gas_limit=gas_limit)
+
+
+def _sum_transfer_out_to_owner(receipt, token_addr: str, owner_eth: str) -> int:
+    """
+    Best-effort: sum ERC20 Transfer logs for token_addr where `to == owner`.
+    Returns amount in wei. If decoding fails, returns 0.
+    """
+    try:
+        token_addr = Web3.to_checksum_address(token_addr)
+        owner_eth = Web3.to_checksum_address(owner_eth)
+        total = 0
+        for log in getattr(receipt, "logs", []) or []:
+            try:
+                if Web3.to_checksum_address(log["address"]) != token_addr:
+                    continue
+                topics = log.get("topics", [])
+                if not topics or topics[0].hex() != _TRANSFER_TOPIC0:
+                    continue
+                # topics[1] = from, topics[2] = to
+                if len(topics) < 3:
+                    continue
+                to_addr = Web3.to_checksum_address("0x" + topics[2].hex()[-40:])
+                if to_addr != owner_eth:
+                    continue
+                val = int(log.get("data", "0x0"), 16)
+                total += val
+            except Exception:
+                continue
+        return int(total)
+    except Exception:
+        return 0
 
 
 # -----------------------------------------------------------------------------
@@ -442,7 +490,7 @@ def swap_exact_tokens_for_tokens(
     # Build bytes path for v3
     path_bytes = _v3_path_bytes(token_in, v3_fee, token_out)
 
-    # Make sure allowance exists
+    # Make sure allowance exists (capped)
     approve_if_needed(wallet_key, token_in, _find_router_address(), amount_in_wei)
 
     router = w3.eth.contract(address=_find_router_address(), abi=ROUTER_EXACT_INPUT_ABI)
@@ -474,17 +522,22 @@ def swap_exact_tokens_for_tokens(
     gas_used = 0
     gas_price = tx.get("gasPrice", 0)
     gas_cost_wei = 0
+    actual_out_wei = 0
 
     try:
         signed = acct.sign_transaction(tx)
         txh = w3.eth.send_raw_transaction(signed.raw_transaction).hex()
+        receipt = None
         try:
             receipt = w3.eth.wait_for_transaction_receipt(txh, timeout=180)
             gas_used = int(getattr(receipt, "gasUsed", 0) or 0)
         except Exception:
+            receipt = None
             gas_used = 0
         if gas_used and gas_price:
             gas_cost_wei = int(gas_price) * gas_used
+        if receipt is not None:
+            actual_out_wei = _sum_transfer_out_to_owner(receipt, token_out, owner_eth)
     except Exception as e:
         alert_trade_failure(
             f"{token_in}->{token_out}",
@@ -515,6 +568,7 @@ def swap_exact_tokens_for_tokens(
         "tx_hash": txh,
         "path": [token_in, token_out],
         "amount_out_min": str(amount_out_min_wei),
+        "amount_out_actual": str(int(actual_out_wei)) if actual_out_wei else "0",
         "gas_used": gas_used,
         "gas_price_wei": int(gas_price) if gas_price else 0,
         "gas_cost_wei": int(gas_cost_wei) if gas_cost_wei else 0,
@@ -561,7 +615,7 @@ def swap_v3_exact_input_once(
 
     min_out = max(1, (quoted * (10_000 - int(slippage_bps))) // 10_000)
 
-    # Ensure allowance
+    # Ensure allowance (capped)
     approve_if_needed(wallet_key, t_in, _find_router_address(), amount_in_wei)
 
     router = w3.eth.contract(address=_find_router_address(), abi=ROUTER_EXACT_INPUT_ABI)
@@ -593,17 +647,22 @@ def swap_v3_exact_input_once(
     gas_used = 0
     gas_price = tx.get("gasPrice", 0)
     gas_cost_wei = 0
+    actual_out_wei = 0
 
     try:
         signed = acct.sign_transaction(tx)
         txh = w3.eth.send_raw_transaction(signed.raw_transaction).hex()
+        receipt = None
         try:
             receipt = w3.eth.wait_for_transaction_receipt(txh, timeout=180)
             gas_used = int(getattr(receipt, "gasUsed", 0) or 0)
         except Exception:
+            receipt = None
             gas_used = 0
         if gas_used and gas_price:
             gas_cost_wei = int(gas_price) * gas_used
+        if receipt is not None:
+            actual_out_wei = _sum_transfer_out_to_owner(receipt, t_out, owner_eth)
     except Exception as e:
         alert_trade_failure(f"{t_in}->{t_out}", "swap", f"sign/send error: {e}")
         raise
@@ -629,6 +688,7 @@ def swap_v3_exact_input_once(
     return {
         "tx_hash": txh,
         "amount_out_min": str(min_out),
+        "amount_out_actual": str(int(actual_out_wei)) if actual_out_wei else "0",
         "path": [t_in, t_out],
         "gas_used": gas_used,
         "gas_price_wei": int(gas_price) if gas_price else 0,
