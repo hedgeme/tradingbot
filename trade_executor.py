@@ -32,14 +32,6 @@ APP_DIR       = Path("/bot/app")
 w3 = Web3(Web3.HTTPProvider(HMY_NODE, request_kwargs={"timeout": 25}))
 
 
-def _explorer_tx_url(tx_hash: str) -> str:
-    """Harmony explorer URL with shard=0."""
-    if not tx_hash:
-        return ""
-    h = tx_hash if tx_hash.startswith("0x") else ("0x" + tx_hash)
-    return f"https://explorer.harmony.one/tx/{h}?shard=0"
-
-
 def _current_gas_price_wei_capped() -> int:
     """Harmony mostly uses legacy gasPrice. Cap by GAS_CAP_GWEI."""
     cap = int(GAS_CAP_GWEI) * 10**9 if int(GAS_CAP_GWEI) > 0 else None
@@ -370,12 +362,9 @@ def approve_if_needed(
     spender_eth: str,
     amount_wei: int,
     gas_limit: int = 120_000,
-    wait_receipt: bool = False,
 ) -> Dict[str, Any]:
     """
     If allowance < amount_wei, send approve(spender, amount_wei).
-    NOTE: ERC-20 approve replaces allowance (it does not add). This matches your "capped allowance" model.
-    If wait_receipt=True, also returns gas_used/gas_price_wei/gas_cost_wei and explorer_url.
     Returns info dict; sends Telegram alerts on failure.
     """
     acct = _get_account(wallet_key)
@@ -416,26 +405,7 @@ def approve_if_needed(
         alert_trade_failure("approve", "erc20.approve", str(e))
         raise
 
-    out: Dict[str, Any] = {"tx_hash": txh, "allowance_before": str(current)}
-    if wait_receipt and txh:
-        gas_used = 0
-        gas_price = int(tx.get("gasPrice", 0) or 0)
-        gas_cost_wei = 0
-        try:
-            receipt = w3.eth.wait_for_transaction_receipt(txh, timeout=180)
-            gas_used = int(getattr(receipt, "gasUsed", 0) or 0)
-            # Harmony usually legacy; keep tx.gasPrice as effective
-        except Exception:
-            gas_used = 0
-        if gas_used and gas_price:
-            gas_cost_wei = gas_used * gas_price
-        out.update({
-            "gas_used": gas_used,
-            "gas_price_wei": gas_price,
-            "gas_cost_wei": gas_cost_wei,
-            "explorer_url": _explorer_tx_url(txh),
-        })
-    return out
+    return {"tx_hash": txh, "allowance_before": str(current)}
 
 
 # -----------------------------------------------------------------------------
@@ -449,7 +419,6 @@ def swap_exact_tokens_for_tokens(
     deadline_ts: int | None = None,
     gas_limit: int = 900_000,
     v3_fee: int = 500,
-    auto_approve: bool = True,
 ) -> Dict[str, Any]:
     """
     Single-hop exactInput swap using SwapRouter02.exactInput (IV3SwapRouter layout).
@@ -473,9 +442,8 @@ def swap_exact_tokens_for_tokens(
     # Build bytes path for v3
     path_bytes = _v3_path_bytes(token_in, v3_fee, token_out)
 
-    # Make sure allowance exists (unless handled by caller)
-    if auto_approve:
-        approve_if_needed(wallet_key, token_in, _find_router_address(), amount_in_wei)
+    # Make sure allowance exists
+    approve_if_needed(wallet_key, token_in, _find_router_address(), amount_in_wei)
 
     router = w3.eth.contract(address=_find_router_address(), abi=ROUTER_EXACT_INPUT_ABI)
 
@@ -551,8 +519,6 @@ def swap_exact_tokens_for_tokens(
         "gas_price_wei": int(gas_price) if gas_price else 0,
         "gas_cost_wei": int(gas_cost_wei) if gas_cost_wei else 0,
     }
-    \"explorer_url\": _explorer_tx_url(txh),
-}
 
 
 def swap_v3_exact_input_once(
@@ -563,7 +529,6 @@ def swap_v3_exact_input_once(
     fee: int = 500,
     slippage_bps: int = 50,
     deadline_s: int = 600,
-    auto_approve: bool = True,
 ) -> Dict[str, Any]:
     """
     High-level single-hop swap helper:
@@ -596,10 +561,8 @@ def swap_v3_exact_input_once(
 
     min_out = max(1, (quoted * (10_000 - int(slippage_bps))) // 10_000)
 
-    # Ensure allowance (unless handled by caller)
-    approve_info: Dict[str, Any] = {}
-    if auto_approve:
-        approve_info = approve_if_needed(wallet_key, t_in, _find_router_address(), amount_in_wei, wait_receipt=False)
+    # Ensure allowance
+    approve_if_needed(wallet_key, t_in, _find_router_address(), amount_in_wei)
 
     router = w3.eth.contract(address=_find_router_address(), abi=ROUTER_EXACT_INPUT_ABI)
     params = (path_bytes, owner_eth, int(amount_in_wei), int(min_out))
@@ -671,10 +634,6 @@ def swap_v3_exact_input_once(
         "gas_price_wei": int(gas_price) if gas_price else 0,
         "gas_cost_wei": int(gas_cost_wei) if gas_cost_wei else 0,
     }
-    \"explorer_url\": _explorer_tx_url(txh),
-    \"approve_tx_hash\": approve_info.get(\"tx_hash\", \"\") if isinstance(approve_info, dict) else \"\",
-    \"approve_skipped\": bool(approve_info.get(\"skipped\")) if isinstance(approve_info, dict) else True,
-}
 
 
 # -----------------------------------------------------------------------------
