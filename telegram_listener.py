@@ -164,52 +164,6 @@ def _norm_tx_hash(txh: str) -> str:
         txh = "0x" + txh
     return txh
 
-
-def _explorer_url(txh: str) -> str:
-    txh = _norm_tx_hash(txh)
-    return f"https://explorer.harmony.one/tx/{txh}?shard=0" if txh else ""
-
-def _extract_tx_hashes(txr: Dict[str, Any]) -> Dict[str, str]:
-    """
-    Best-effort extraction of tx hashes from runner outputs.
-    We try multiple keys because different backends name these differently.
-    """
-    if not isinstance(txr, dict):
-        return {}
-
-    def pick(keys):
-        for k in keys:
-            v = txr.get(k)
-            if v:
-                return _norm_tx_hash(str(v))
-        return ""
-
-    # Explicit keys
-    trade = pick(["trade_tx_hash", "swap_tx_hash", "router_tx_hash", "tx_hash_trade", "tx_hash_swap"])
-    call  = pick(["contract_tx_hash", "call_tx_hash", "tx_hash_call", "contract_call_tx_hash"])
-    appr  = pick(["approve_tx_hash", "approval_tx_hash", "tx_hash_approve", "tx_hash_approval"])
-    primary = _norm_tx_hash(str(txr.get("tx_hash", ""))) if txr.get("tx_hash") else ""
-
-    # If only one hash is present, treat it as trade
-    hashes = [h for h in [trade, call, appr, primary] if h]
-    # Deduplicate while preserving order
-    seen = set()
-    uniq = []
-    for h in hashes:
-        if h not in seen:
-            uniq.append(h); seen.add(h)
-
-    out = {"trade": "", "call": "", "approve": "", "primary": primary}
-    out["trade"] = trade or (uniq[0] if uniq else "")
-    # If we have a second unique hash and no explicit call, use it as "call"
-    if call:
-        out["call"] = call
-    elif len(uniq) >= 2:
-        out["call"] = uniq[1]
-    if appr:
-        out["approve"] = appr
-    return out
-
 def _git_short_rev() -> Optional[str]:
     try:
         out = subprocess.check_output(shlex.split("git rev-parse --short HEAD"), cwd="/bot", stderr=subprocess.DEVNULL)
@@ -262,54 +216,63 @@ def _fmt_gas_summary(gas_used: Optional[int], gas_one: Optional[Decimal]) -> str
         return f"Gas: used {gu:,}"
     return f"Gas: used {gu:,} · cost ~{cost:.6f} ONE"
 
+def _estimate_gas_cost_one(gas_est: Optional[int]) -> Optional[Decimal]:
+    """Estimate gas cost in ONE using current gas price (best-effort)."""
+    try:
+        ge = int(gas_est or 0)
+    except Exception:
+        ge = 0
+    if ge <= 0:
+        return None
+
+    gas_price_wei = None
+    try:
+        if TE is not None and hasattr(TE, "_current_gas_price_wei_capped"):
+            gas_price_wei = int(TE._current_gas_price_wei_capped())
+        elif W is not None and hasattr(W, "suggest_gas_price_wei"):
+            gas_price_wei = int(W.suggest_gas_price_wei())
+    except Exception:
+        gas_price_wei = None
+
+    if not gas_price_wei or gas_price_wei <= 0:
+        return None
+
+    try:
+        return (Decimal(ge) * Decimal(gas_price_wei)) / (Decimal(10) ** 18)
+    except Exception:
+        return None
+
+def _fmt_gas_est_line(gas_est: Optional[int]) -> str:
+    """Render gas estimate including approximate ONE cost when possible."""
+    try:
+        ge = int(gas_est or 0)
+    except Exception:
+        ge = 0
+    if ge <= 0:
+        return "Gas Est  : —"
+    est_one = _estimate_gas_cost_one(ge)
+    if est_one is None:
+        return f"Gas Est  : {ge:,}"
+    return f"Gas Est  : {ge:,} · cost ~{Decimal(str(est_one)):.6f} ONE"
+
 @contextmanager
 def _suppress_alerts_temporarily():
     """
     Prevent duplicate Telegram messages from app.alert during manual wizard flows.
-
-    Why this exists:
-    - Manual /trade and /withdraw already send a human summary from this listener.
-    - Some backends also call app.alert which can send an additional Telegram message.
-
-    Implementation:
-    - Blank TELEGRAM_CHAT_ID when present (common pattern in our alert module).
-    - Additionally monkey-patch common send functions to no-op for the duration.
-      (This avoids surprises if the alert module changed implementation.)
+    We blank TELEGRAM_CHAT_ID so app.alert._send becomes a no-op.
     """
     if ALERTMOD is None:
         yield
         return
-
-    old_chat = None
-    patched: Dict[str, Any] = {}
     try:
-        # 1) Blank chat id (preferred)
-        if hasattr(ALERTMOD, "TELEGRAM_CHAT_ID"):
-            old_chat = getattr(ALERTMOD, "TELEGRAM_CHAT_ID", "")
-            setattr(ALERTMOD, "TELEGRAM_CHAT_ID", "")
-
-        # 2) Patch common send functions
-        for fname in ("_send", "send", "send_telegram", "telegram_send", "send_message"):
-            if hasattr(ALERTMOD, fname):
-                fn = getattr(ALERTMOD, fname)
-                if callable(fn):
-                    patched[fname] = fn
-                    setattr(ALERTMOD, fname, lambda *a, **k: None)
-
+        old_chat = getattr(ALERTMOD, "TELEGRAM_CHAT_ID", "")
+        setattr(ALERTMOD, "TELEGRAM_CHAT_ID", "")
         yield
     finally:
-        # restore patched functions
-        for fname, fn in patched.items():
-            try:
-                setattr(ALERTMOD, fname, fn)
-            except Exception:
-                pass
-        # restore chat id
-        if old_chat is not None:
-            try:
-                setattr(ALERTMOD, "TELEGRAM_CHAT_ID", old_chat)
-            except Exception:
-                pass
+        try:
+            setattr(ALERTMOD, "TELEGRAM_CHAT_ID", old_chat)
+        except Exception:
+            pass
 
 # -----------------------------------------------------------------------------
 # Balances: canonical keys + safe lookups
@@ -378,24 +341,7 @@ def _row_get_token_amount(row: Dict[str, Any], token_symbol: str) -> Decimal:
 def render_plan(actions_by_bot) -> str:
     if not actions_by_bot or not any(actions_by_bot.values()):
         return f"Plan (preview @ {now_iso()})\nNo actions proposed."
-    
-def _tw_humanize_path(path: str) -> str:
-    """Convert internal path like '1USDC@3000→WONE' to a friendlier string."""
-    if not path:
-        return path
-    s = str(path)
-    m = re.match(r"^\s*([^@\s]+)@([0-9]+)→([^\s]+)\s*$", s)
-    if m:
-        a, fee, b = m.group(1), m.group(2), m.group(3)
-        try:
-            fee_i = int(fee)
-            pct = fee_i / 1_000_000 * 100  # 500 => 0.05%, 3000 => 0.30%
-            return f"{a} → {b} (fee {pct:.2f}%)"
-        except Exception:
-            return f"{a} → {b}"
-    return s.replace("→", " → ")
-
-lines = [f"Plan (preview @ {now_iso()})"]
+    lines = [f"Plan (preview @ {now_iso()})"]
     for bot, actions in actions_by_bot.items():
         if not actions:
             continue
@@ -914,38 +860,29 @@ def on_exec_cancel(update: Update, context: CallbackContext):
 # -----------------------------------------------------------------------------
 _TRADE_STATE: Dict[int, Dict[str, str]] = {}
 
-_TW_PENDING_ALLOWANCE: Dict[int, Dict[str, Any]] = {}
-_REVOKE_STATE: Dict[int, Dict[str, str]] = {}
 
-def _allowance_quick_picks(token_sym: str, trade_amount: Decimal):
-    """Return list of (label, amount_str) quick picks in token units."""
-    sym = (token_sym or "").upper()
-    # Exact always present
-    picks = [("Exact", str(trade_amount))]
+# Prevent accidental double-execution / double-messaging when Telegram retries callbacks.
+# Keyed by (user_id, callback_data); values are last-seen epoch seconds.
+_CALLBACK_DEDUP: Dict[Tuple[int, str], float] = {}
+
+def _seen_callback_recently(uid: int, data: str, window_s: float = 5.0) -> bool:
     try:
-        if sym in ("1USDC", "1SDAI", "1SDAI".upper(), "1SDAI"):  # tolerant
-            for v in (50, 100, 250, 1000):
-                picks.append((str(v), str(Decimal(v))))
-        elif sym in ("WONE", "ONE"):
-            for v in (100, 500, 1000, 5000):
-                picks.append((str(v), str(Decimal(v))))
-        elif sym == "1ETH":
-            for v in ("0.05", "0.10", "0.25", "1"):
-                picks.append((v, v))
-        else:
-            # generic: 2x, 5x, 10x
-            picks.append(("2×", str(trade_amount * 2)))
-            picks.append(("5×", str(trade_amount * 5)))
-            picks.append(("10×", str(trade_amount * 10)))
+        import time as _time
+        now = float(_time.time())
+        key = (int(uid), str(data))
+        last = _CALLBACK_DEDUP.get(key, 0.0)
+        if now - last < window_s:
+            return True
+        _CALLBACK_DEDUP[key] = now
+        # light cleanup
+        if len(_CALLBACK_DEDUP) > 2000:
+            for k, v in list(_CALLBACK_DEDUP.items())[:500]:
+                if now - v > 300:
+                    _CALLBACK_DEDUP.pop(k, None)
+        return False
     except Exception:
-        pass
-    # De-dup by amount
-    seen=set(); out=[]
-    for lbl,val in picks:
-        if val in seen: 
-            continue
-        seen.add(val); out.append((lbl,val))
-    return out
+        return False
+
 
 def cmd_trade(update: Update, context: CallbackContext):
     uid = update.effective_user.id
@@ -966,32 +903,25 @@ def cmd_trade(update: Update, context: CallbackContext):
     update.message.reply_text("Select wallet:", reply_markup=InlineKeyboardMarkup(kb))
 
 def _tw_reply_edit(q, text, kb=None, html=False):
-    """
-    Edit the existing wizard message when possible.
-    IMPORTANT: never send a second message just because reply_markup update fails.
-    (That is the main cause of "duplicate" summaries.)
-    """
-    parse = (ParseMode.HTML if html else None)
-    # First try: edit text
+    """Edit the wizard message in-place when possible; fall back to a new message."""
+    rm = InlineKeyboardMarkup(kb) if kb else None
     try:
-        q.edit_message_text(text, parse_mode=parse)
-    except Exception:
-        # Fallback: send a new message once
-        q.message.reply_text(
+        q.edit_message_text(
             text,
-            reply_markup=InlineKeyboardMarkup(kb) if kb else None,
-            parse_mode=parse
+            reply_markup=rm,
+            parse_mode=(ParseMode.HTML if html else None),
+            disable_web_page_preview=True,
         )
-        return
-
-    # Second try (non-fatal): update keyboard
-    try:
-        if kb is None:
-            q.edit_message_reply_markup(None)
-        else:
-            q.edit_message_reply_markup(InlineKeyboardMarkup(kb))
     except Exception:
-        pass
+        try:
+            q.message.reply_text(
+                text,
+                reply_markup=rm,
+                parse_mode=(ParseMode.HTML if html else None),
+                disable_web_page_preview=True,
+            )
+        except Exception:
+            pass
 
 def _tw_require_state(uid):
     st = _TRADE_STATE.get(uid)
@@ -1071,46 +1001,28 @@ def _tw_render_manual_quote(uid, st):
         slippage_bps=slip_bps,
     )
 
-    path        = getattr(mq, "path_text", f"{token_in_ui} → {token_out_ui}")
-    ain_txt     = getattr(mq, "amount_in_text", f"{amt_str} {token_in_ui}")
-    qout_txt    = getattr(mq, "quote_out_text", f"? {token_out_ui}")
-    imp_bps     = getattr(mq, "impact_bps", None)
-    slip_bps_val= getattr(mq, "slippage_bps", slip_bps)
-    min_out_txt = getattr(mq, "min_out_text", f"? {token_out_ui}")
+    path     = getattr(mq, "path_text", f"{token_in_ui} → {token_out_ui}")
+    ain_txt  = getattr(mq, "amount_in_text", f"{amt_str} {token_in_ui}")
+    qout_txt = getattr(mq, "quote_out_text", f"? {token_out_ui}")
+    imp_bps  = getattr(mq, "impact_bps", None)
+    slip_bps_val = getattr(mq, "slippage_bps", slip_bps)
+    min_out  = getattr(mq, "min_out_text", f"? {token_out_ui}")
 
-    gas_est_raw = getattr(mq, "gas_estimate", None)
-    nonce       = getattr(mq, "nonce", "—")
-    allow_ok    = getattr(mq, "allowance_ok", False)
-    slip_ok     = getattr(mq, "slippage_ok", True)
+    gas_est  = getattr(mq, "gas_estimate", "—")
+    nonce    = getattr(mq, "nonce", "—")
+    allow_ok = getattr(mq, "allowance_ok", False)
+    tx_prev  = getattr(mq, "tx_preview_text", "(tx preview)")
+    slip_ok  = getattr(mq, "slippage_ok", True)
     need_appr_txt = getattr(mq, "approval_required_amount_text", None)
-
-    # Gas estimate → add estimated cost in ONE (human readable)
-    gas_est_str = "—"
-    try:
-        gas_est_int = int(gas_est_raw) if gas_est_raw not in (None, "—", "") else 0
-    except Exception:
-        gas_est_int = 0
-
-    if gas_est_int > 0:
-        gas_est_str = f"{gas_est_int:,}"
-        try:
-            if TE is not None and hasattr(TE, "_current_gas_price_wei_capped"):
-                gp = int(TE._current_gas_price_wei_capped())
-                est_one = (Decimal(gas_est_int) * Decimal(gp)) / (Decimal(10) ** 18)
-                gas_est_str = f"{gas_est_int:,} · ~{est_one:.6f} ONE"
-        except Exception:
-            pass
-
-    pct = Decimal(slip_bps_val) / Decimal(100)
 
     lines = [
         f"Review Trade — {wallet_key}",
-        f"Path     : {_tw_humanize_path(path)}",
+        f"Path     : {path}",
         f"AmountIn : {ain_txt}",
         f"QuoteOut : {qout_txt}",
         (f"Impact   : {imp_bps:.2f} bps" if imp_bps is not None else "Impact   : —"),
-        f"Slippage : {pct:.2f}% max → minOut {min_out_txt}",
-        f"Gas Est  : {gas_est_str}",
+        f"Slippage : {Decimal(slip_bps_val) / Decimal(100):.2f}% max → minOut {min_out}",
+        _fmt_gas_est_line(gas_est),
         f"Nonce    : {nonce}",
         f"Allowance: {'OK' if allow_ok else 'NOT APPROVED'}",
     ]
@@ -1119,23 +1031,14 @@ def _tw_render_manual_quote(uid, st):
     if not slip_ok:
         lines.append("⚠ Price already worse than allowed slippage")
 
-    # Replace low-level tx preview with a human summary
-    lines += [
-        "",
-        "Would send:",
-        f"Swap: {ain_txt} → ≥ {min_out_txt} (max slippage {pct:.2f}%) via {_tw_humanize_path(path)}",
-    ]
-
+    preview_human = f"Swap: {ain_txt} → ≥ {min_out} via {path} (deadline 10m)"
+    lines += ["", "Would send:", preview_human]
     txt = "\n".join(lines)
 
     kb_rows = []
-    # Allowance controls (capped allowances, no unlimited approvals)
-    if allow_ok:
-        kb_rows.append([InlineKeyboardButton("✅ Use existing allowance", callback_data="tw_use_allow")])
-    kb_rows.append([InlineKeyboardButton("✏️ Replace allowance…", callback_data="tw_replace_allow")])
-
-    # Trade execution controls
-    if allow_ok and slip_ok:
+    if not allow_ok and need_appr_txt:
+        kb_rows.append([InlineKeyboardButton("✅ Approve spend first", callback_data="tw_do_approve")])
+    elif allow_ok and slip_ok:
         kb_rows.append([InlineKeyboardButton("✅ Execute Trade", callback_data="tw_do_execute")])
     else:
         kb_rows.append([InlineKeyboardButton("⚠ Adjust Slippage", callback_data="tw_back_slip")])
@@ -1267,12 +1170,10 @@ def _tw_handle_execute(q, uid):
     if not is_admin(q.from_user.id):
         q.message.reply_text("Not authorized.")
         return
-
     st = _tw_require_state(uid)
     if runner is None or not hasattr(runner, "execute_manual_quote"):
         _tw_reply_edit(q, "Execution backend missing.")
         return
-
     try:
         amt_dec = Decimal(st["amount"])
     except Exception:
@@ -1280,7 +1181,6 @@ def _tw_handle_execute(q, uid):
         return
 
     try:
-        # Suppress backend alerts so we only send ONE summary from this listener.
         with _suppress_alerts_temporarily():
             txr = runner.execute_manual_quote(
                 wallet_key=st["wallet"],
@@ -1290,11 +1190,10 @@ def _tw_handle_execute(q, uid):
                 slippage_bps=int(st["slip_bps"]),
             )
 
-        if not isinstance(txr, dict):
-            txr = {"tx_hash": str(txr)}
-
-        # Gas
+        txh = _norm_tx_hash(str(txr.get("tx_hash", "")))
+        filled = txr.get("filled_text", "")
         gas_used = txr.get("gas_used", None)
+
         gas_one = None
         if "gas_cost_one" in txr:
             try:
@@ -1302,29 +1201,42 @@ def _tw_handle_execute(q, uid):
             except Exception:
                 gas_one = None
 
-        # Tx hashes (trade + contract call)
-        hashes = _extract_tx_hashes(txr)
-        trade_txh = hashes.get("trade", "")
-        call_txh  = hashes.get("call", "")
+        # Optional secondary transaction hash (approval / wrap / unwrap / other contract call)
+        secondary_keys = (
+            "contract_tx_hash", "call_tx_hash", "approval_tx_hash", "approve_tx_hash",
+            "unwrap_tx_hash", "wrap_tx_hash", "secondary_tx_hash", "tx_hash_2"
+        )
+        txh2 = ""
+        for k in secondary_keys:
+            if k in txr and txr.get(k):
+                txh2 = _norm_tx_hash(str(txr.get(k)))
+                break
 
-        filled = txr.get("filled_text", "") or ""
+        def _explorer_url(tx_hash: str) -> str:
+            if not tx_hash:
+                return ""
+            return f"https://explorer.harmony.one/tx/{tx_hash}?shard=0"
+
+        explorer = _explorer_url(txh) if txh else ""
+
         lines = [
             "✅ Executed manual trade",
             f"Wallet: {st['wallet']}",
         ]
         if filled:
             lines.append(str(filled))
-
         lines.append(_fmt_gas_summary(gas_used, gas_one))
 
-        if trade_txh:
-            lines.append(f"Trade tx: {trade_txh}")
-            lines.append(_explorer_url(trade_txh))
-        if call_txh and call_txh != trade_txh:
-            lines.append(f"Contract call tx: {call_txh}")
-            lines.append(_explorer_url(call_txh))
+        if txh:
+            lines.append(f"Trade tx: {txh}")
+            if explorer:
+                lines.append(explorer)
 
-        _tw_reply_edit(q, "\n".join([ln for ln in lines if ln]).strip())
+        if txh2 and txh2 != txh:
+            lines.append(f"Contract tx: {txh2}")
+            lines.append(_explorer_url(txh2))
+
+        _tw_reply_edit(q, "\n".join(lines).strip())
     except Exception as e:
         _tw_reply_edit(q, f"❌ Execution failed\n{e}")
 
@@ -1332,6 +1244,16 @@ def on_trade_callback(update: Update, context: CallbackContext):
     q = update.callback_query
     uid = q.from_user.id
     data = q.data or ""
+
+    # Dedupe high-impact callbacks (Telegram may retry on slow networks)
+    if data in ("tw_do_execute", "tw_do_approve"):
+        if _seen_callback_recently(uid, data, window_s=8.0):
+            try:
+                q.answer("Already processing…")
+            except Exception:
+                pass
+            return
+
 
     # Always answer quickly
     if data not in ("tw_do_approve", "tw_do_execute"):
@@ -1417,43 +1339,6 @@ def on_text_amount_capture(update: Update, context: CallbackContext):
         except Exception:
             update.message.reply_text("Please send a positive numeric amount (e.g., 10 or 0.5).")
 
-
-def cmd_revoke(update, context):
-    """/revoke <wallet> <token> — set router allowance to 0 (per token)."""
-    uid = update.effective_user.id
-    args = context.args or []
-    if len(args) < 2:
-        wallets = ", ".join(sorted(W.WALLETS.keys()))
-        toks = ", ".join(sorted(getattr(C, "TOKENS", {}).keys())) if hasattr(C, "TOKENS") else "WONE, 1USDC, 1sDAI, 1ETH, TEC"
-        update.message.reply_text(
-            "Usage:\n"
-            "  /revoke <wallet> <token>\n\n"
-            f"Wallets: {wallets}\n"
-            f"Tokens : {toks}\n\n"
-            "This revokes *one* token's allowance for the SwapRouter (it does NOT affect other tokens)."
-        )
-        return
-    wallet_key = args[0].strip()
-    token_sym  = args[1].strip()
-    try:
-        token_addr = TE.get_token_address(token_sym)
-        info = TE.revoke_allowance(wallet_key, token_addr, TE.ROUTER_ADDR_ETH, wait_receipt=True)
-        if info.get("skipped"):
-            update.message.reply_text(
-                f"ℹ️ Allowance already 0\nWallet: {wallet_key}\nToken: {token_sym}"
-            )
-            return
-        txh = info.get("tx_hash", "")
-        update.message.reply_text(
-            "✅ Allowance revoked (set to 0)\n"
-            f"Wallet: {wallet_key}\n"
-            f"Token : {token_sym}\n"
-            + (f"Auth tx: {txh}\n{TE._explorer_tx_url(txh)}" if txh else "")
-        )
-    except Exception as e:
-        update.message.reply_text(f"❌ Revoke failed: {e}")
-
-
 # -----------------------------------------------------------------------------
 # /withdraw wizard
 # -----------------------------------------------------------------------------
@@ -1474,24 +1359,14 @@ def cmd_withdraw(update: Update, context: CallbackContext):
     )
 
 def _wd_reply_edit(q, text, kb=None):
-    """
-    Same anti-duplicate logic as _tw_reply_edit:
-    - Edit message text (or send one fallback message).
-    - Update reply_markup separately and ignore failures.
-    """
     try:
         q.edit_message_text(text)
+        if kb:
+            q.edit_message_reply_markup(InlineKeyboardMarkup(kb))
+        else:
+            q.edit_message_reply_markup(None)
     except Exception:
         q.message.reply_text(text, reply_markup=InlineKeyboardMarkup(kb) if kb else None)
-        return
-
-    try:
-        if kb is None:
-            q.edit_message_reply_markup(None)
-        else:
-            q.edit_message_reply_markup(InlineKeyboardMarkup(kb))
-    except Exception:
-        pass
 
 def _wd_require_state(uid):
     st = _WITHDRAW_STATE.get(uid)
@@ -1811,8 +1686,8 @@ def _wd_handle_send(q, uid):
     except Exception:
         gas_one = None
 
-        explorer_main = _explorer_url(txh)
-        explorer_unwrap = _explorer_url(unwrap_txh)
+    explorer_main = f"https://explorer.harmony.one/tx/{txh}?shard=0" if txh else ""
+    explorer_unwrap = f"https://explorer.harmony.one/tx/{unwrap_txh}?shard=0" if unwrap_txh else ""
 
     lines = [
         "✅ Withdrawal sent",
@@ -1912,7 +1787,6 @@ def main():
 
     # Manual flows
     dp.add_handler(CommandHandler("trade", cmd_trade))
-    dp.add_handler(CommandHandler("revoke", cmd_revoke))
     dp.add_handler(CommandHandler("withdraw", cmd_withdraw))
 
     # Callbacks
