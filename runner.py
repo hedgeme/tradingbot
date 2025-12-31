@@ -77,44 +77,6 @@ from app import wallet as W
 import trade_executor as TE
 from web3 import Web3
 
-
-# ERC-20 Transfer event topic (keccak256)
-_TRANSFER_TOPIC = Web3.keccak(text="Transfer(address,address,uint256)").hex()
-
-def _extract_actual_out_wei(tx_hash: str, token_out_addr: str, recipient: str) -> int:
-    """Sum ERC-20 Transfer logs for token_out where `to` == recipient."""
-    if not tx_hash:
-        return 0
-    try:
-        receipt = TE.w3.eth.get_transaction_receipt(tx_hash)
-    except Exception:
-        return 0
-
-    tok = Web3.to_checksum_address(token_out_addr)
-    to_addr = Web3.to_checksum_address(recipient)
-
-    total = 0
-    for lg in getattr(receipt, "logs", []) or []:
-        try:
-            if Web3.to_checksum_address(lg["address"]) != tok:
-                continue
-            topics = lg.get("topics", [])
-            if not topics or topics[0].hex().lower() != _TRANSFER_TOPIC.lower():
-                continue
-            # topics[2] is indexed 'to' (32 bytes)
-            if len(topics) < 3:
-                continue
-            to_topic = "0x" + topics[2].hex()[-40:]
-            if Web3.to_checksum_address(to_topic) != to_addr:
-                continue
-            # data is value (uint256)
-            val = int(lg.get("data", "0x0"), 16)
-            total += val
-        except Exception:
-            continue
-    return int(total)
-
-
 # ---------- Helpers: token canon / fee / decimals / formatting ----------
 
 def _canon(sym: str) -> str:
@@ -597,7 +559,7 @@ def execute_manual_quote(
         amount_in_wei = int((amount_in * (Decimal(10) ** dec_in)).to_integral_value(rounding=ROUND_DOWN))
 
     # Approve exact if needed (no unlimited)
-    # NOTE: Manual trades do NOT auto-approve. Telegram UI must explicitly set allowance.
+    TE.approve_if_needed(wallet_key, addr_in, router, int(amount_in_wei))
 
     # Single-hop send (current executor supports one hop cleanly)
     fee = _fee_for_pair(token_in, token_out)
@@ -610,8 +572,6 @@ def execute_manual_quote(
         slippage_bps=int(slippage_bps),
         deadline_s=600
     )
-    , auto_approve=False
-)
     txh = res.get("tx_hash", "")
     min_out_wei = int(res.get("amount_out_min", "0") or 0)
     min_out = (Decimal(min_out_wei) / (Decimal(10) ** dec_out)) if min_out_wei > 0 else Decimal("0")
@@ -648,8 +608,7 @@ def execute_manual_quote(
 
     filled = (
         f"Sent {_fmt_amt(token_in, amount_in)} {display_in} → "
-        f"{_fmt_amt(token_out, (Decimal(actual_out_wei) / (Decimal(10) ** dec_out)) if actual_out_wei else min_out)} {display_out}"
-        + (f" (min {_fmt_amt(token_out, min_out)} {display_out})" if actual_out_wei else "")
+        f"min {_fmt_amt(token_out, min_out)} {display_out}"
     )
 
     return {
@@ -659,10 +618,3 @@ def execute_manual_quote(
         "gas_cost_one": f"{gas_cost_one:.6f}",
         "explorer_url": f"https://explorer.harmony.one/tx/{txh}" if txh else "",
     }
-    \"trade_tx_hash\": txh,
-    \"approval_tx_hash\": \"\",  # manual trades should not auto-approve
-    \"actual_out_wei\": str(int(actual_out_wei or 0)),
-    \"min_out_wei\": str(int(min_out_wei or 0)),
-    \"token_out_decimals\": int(dec_out),
-    \"token_out_addr\": (_addr(\"WONE\") if base_out == \"ONE\" else addr_out),
-}
