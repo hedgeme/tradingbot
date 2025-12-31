@@ -502,6 +502,15 @@ def swap_exact_tokens_for_tokens(
         except Exception:
             gas_text = f" · gasUsed={gas_used}"
 
+    # Try to derive actual output amount from ERC-20 Transfer logs (best-effort).
+    wallet_addr = _get_account(wallet_key).address
+    token_out_addr = _normalize_token(token_out)
+    amount_out_actual_wei = 0
+    try:
+        amount_out_actual_wei = _sum_erc20_transfers_to(receipt, token_out_addr, wallet_addr)
+    except Exception:
+        amount_out_actual_wei = 0
+
     action_label = f"swap_exact_tokens (wallet={wallet_key}{gas_text})"
 
     alert_trade_success(
@@ -513,13 +522,66 @@ def swap_exact_tokens_for_tokens(
     )
     return {
         "tx_hash": txh,
+        "explorer_url": _explorer_tx_url(txh),
         "path": [token_in, token_out],
         "amount_out_min": str(amount_out_min_wei),
+        "amount_out": str(amount_out_actual_wei) if amount_out_actual_wei else None,
         "gas_used": gas_used,
         "gas_price_wei": int(gas_price) if gas_price else 0,
         "gas_cost_wei": int(gas_cost_wei) if gas_cost_wei else 0,
     }
 
+
+
+
+def set_allowance(wallet_key: str, token: str, spender: str, allowance_wei: int) -> dict[str, Any]:
+    """Set ERC20 allowance to an exact value (including 0 for revoke).
+
+    Uses ERC20 approve() transactions. Some tokens require setting allowance to 0
+    before changing to a new non-zero value; we handle that safely.
+    """
+    web3 = get_web3("eth")
+    wallet = WALLETS[wallet_key]
+    token_addr = resolve_token_address(token)
+    if not token_addr:
+        raise ValueError(f"Unknown token: {token}")
+    token_addr = Web3.to_checksum_address(token_addr)
+    spender = Web3.to_checksum_address(spender)
+
+    contract = web3.eth.contract(address=token_addr, abi=ERC20_ABI)
+    cur = int(contract.functions.allowance(wallet.address, spender).call())
+
+    if cur == int(allowance_wei):
+        return {
+            "token": token,
+            "token_addr": token_addr,
+            "spender": spender,
+            "previous_allowance_wei": cur,
+            "new_allowance_wei": cur,
+            "tx_hashes": [],
+            "explorer_urls": [],
+        }
+
+    tx_hashes: list[str] = []
+    if cur != 0 and allowance_wei != 0:
+        tx_hashes.append(approve(wallet_key, token_addr, spender, 0))
+
+    tx_hashes.append(approve(wallet_key, token_addr, spender, int(allowance_wei)))
+
+    return {
+        "token": token,
+        "token_addr": token_addr,
+        "spender": spender,
+        "previous_allowance_wei": cur,
+        "new_allowance_wei": int(allowance_wei),
+        "tx_hashes": tx_hashes,
+        "explorer_urls": [_explorer_tx_url(h) for h in tx_hashes],
+    }
+
+
+def revoke_allowance(wallet_key: str, token: str, spender: str = ROUTER_ADDR_ETH) -> dict[str, Any]:
+    """Revoke ERC20 allowance (set to 0) for the given spender."""
+    return set_allowance(wallet_key, token, spender, 0)
 
 def swap_v3_exact_input_once(
     wallet_key: str,
@@ -647,3 +709,77 @@ if __name__ == "__main__":
     except Exception as e:
         alert_preflight_fail(f"trade_executor self-test failed: {e}")
         raise
+
+
+# -----------------------------------------------------------------------------
+# Receipt helpers (for actual amount out)
+# -----------------------------------------------------------------------------
+_TRANSFER_TOPIC0 = Web3.keccak(text="Transfer(address,address,uint256)").hex()
+
+def _topic_addr(t) -> str:
+    # topic is 32 bytes; last 20 bytes are the address
+    if hasattr(t, "hex"):
+        hx = t.hex()
+    else:
+        hx = str(t)
+    hx = hx[2:] if hx.startswith("0x") else hx
+    return Web3.to_checksum_address("0x" + hx[-40:])
+
+def _sum_erc20_transfers_to(receipt, token_addr: str, to_addr: str) -> int:
+    token_addr = Web3.to_checksum_address(token_addr)
+    to_addr = Web3.to_checksum_address(to_addr)
+    total = 0
+    for lg in getattr(receipt, "logs", []) or []:
+        try:
+            if Web3.to_checksum_address(lg["address"]) != token_addr:
+                continue
+            topics = lg.get("topics", [])
+            if not topics:
+                continue
+            topic0 = topics[0].hex() if hasattr(topics[0], "hex") else str(topics[0])
+            if topic0.lower() != _TRANSFER_TOPIC0.lower():
+                continue
+            if len(topics) < 3:
+                continue
+            to_ = _topic_addr(topics[2])
+            if to_ != to_addr:
+                continue
+            data = lg.get("data", "0x0")
+            total += int(data, 16)
+        except Exception:
+            continue
+    return total
+
+def get_v3_router_address() -> str:
+    return Web3.to_checksum_address(_get_contract("v3_router").address)
+
+def set_allowance(wallet_key: str, token: str, spender: str, amount_wei: int) -> Dict[str, Any]:
+    """Set ERC-20 allowance to an exact amount (0 for revoke)."""
+    w3 = _web3()
+    acct = _get_account(wallet_key)
+    token_addr = _normalize_token(token)
+    spender_addr = Web3.to_checksum_address(spender)
+    erc20 = _erc20(token_addr)
+    nonce = w3.eth.get_transaction_count(acct.address)
+    tx = erc20.functions.approve(spender_addr, int(amount_wei)).build_transaction({
+        "from": acct.address,
+        "nonce": nonce,
+        "gas": 200_000,
+        "gasPrice": w3.eth.gas_price,
+    })
+    signed = acct.sign_transaction(tx)
+    txh = w3.eth.send_raw_transaction(signed.raw_transaction).hex()
+    receipt = w3.eth.wait_for_transaction_receipt(txh, timeout=180)
+    return {
+        "tx_hash": txh,
+        "status": int(getattr(receipt, "status", 0) or 0),
+        "spender": spender_addr,
+        "token": token_addr,
+        "amount_wei": int(amount_wei),
+        "explorer_url": _explorer_tx_url(txh),
+    }
+
+def revoke_allowance(wallet_key: str, token: str, spender: Optional[str] = None) -> Dict[str, Any]:
+    """Revoke (set allowance to 0) for a token/spender. Spender defaults to V3 router."""
+    spender_addr = Web3.to_checksum_address(spender) if spender else get_v3_router_address()
+    return set_allowance(wallet_key, token, spender_addr, 0)
